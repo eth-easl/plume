@@ -1,0 +1,22 @@
+diff --git a/src/main/client_context.cpp b/src/main/client_context.cpp
+index 765126f..74e849b 100644
+--- a/src/main/client_context.cpp
++++ b/src/main/client_context.cpp
+@@ -746,11 +746,15 @@ unique_ptr<LogicalOperator> ClientContext::ExtractPlan(const string &query) {
+ 			plan = optimizer.Optimize(std::move(plan));
+ 		}
+ 
++		// Resolve operator types before resolving column bindings, matching the
++		// order in PhysicalPlanGenerator::ResolveAndPlan. The reverse order (the
++		// upstream default) leaves operator types stale for decorrelated subqueries
++		// (DELIM joins), so ColumnBindingResolver throws "inequal num bindings/types".
++		plan->ResolveOperatorTypes();
++
+ 		ColumnBindingResolver resolver;
+ 		resolver.Verify(*plan);
+ 		resolver.VisitOperator(*plan);
+-
+-		plan->ResolveOperatorTypes();
+ 	});
+ 	return plan;
+ }

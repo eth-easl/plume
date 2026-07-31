@@ -1,0 +1,24 @@
+diff --git a/src/main/extension/extension_load.cpp b/src/main/extension/extension_load.cpp
+index 50f95a2..611d2b7 100644
+--- a/src/main/extension/extension_load.cpp
++++ b/src/main/extension/extension_load.cpp
+@@ -154,8 +154,10 @@ static T LoadFunctionFromDLL(void *dll, const string &function_name, const strin
+ 	}
+ 	return (T)function;
+ }
+-#endif
+ 
++// plume extraction patch #5: TryLoadFunctionFromDLL also calls dlsym but is left
++// outside the DUCKDB_DISABLE_EXTENSION_LOAD guard upstream. Its only callers live
++// in the extension-load-enabled branch, so fold it under the same guard.
+ template <class T>
+ static T TryLoadFunctionFromDLL(void *dll, const string &function_name, const string &filename) {
+ 	auto function = dlsym(dll, function_name.c_str());
+@@ -164,6 +166,7 @@ static T TryLoadFunctionFromDLL(void *dll, const string &function_name, const st
+ 	}
+ 	return (T)function;
+ }
++#endif
+ 
+ static void ComputeSHA256Buffer(const char *buffer, const idx_t start, const idx_t end, string *res) {
+ 	// Invoke MbedTls function to actually compute sha256

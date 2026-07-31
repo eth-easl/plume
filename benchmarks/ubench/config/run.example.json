@@ -1,0 +1,12 @@
+{
+    "plan": "query.ub",
+    "threads": 10,
+    "coreOffset": 0,
+    "repartition": 0,
+    "reps": 1,
+    "trace": "query.trace",
+    "quiet": false,
+    "rewrites": {
+        "http://127.0.0.1:7777/": "~/data/"
+    }
+}

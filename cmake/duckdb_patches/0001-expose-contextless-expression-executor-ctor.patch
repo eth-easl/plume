@@ -1,0 +1,17 @@
+diff --git a/src/include/duckdb/execution/expression_executor.hpp b/src/include/duckdb/execution/expression_executor.hpp
+index 18953f3..7e3daf8 100644
+--- a/src/include/duckdb/execution/expression_executor.hpp
++++ b/src/include/duckdb/execution/expression_executor.hpp
+@@ -165,7 +165,11 @@ private:
+ 	//! The vector verification (debug setting)
+ 	DebugVectorVerification debug_vector_verification = DebugVectorVerification::NONE;
+ 
+-private:
++public:
++	// plume extraction patch #1: these context-less constructors are private upstream
++	// ("should be avoided"), but plume runs with NO DuckDB instance by design (TASK.md
++	// A4/R1), so the context-less path is exactly what we need. Access control is
++	// compile-time only; the symbols are already exported (DUCKDB_API) in the archive.
+ 	// it is possible to create an expression executor without a ClientContext - but it should be avoided
+ 	DUCKDB_API ExpressionExecutor();
+ 	DUCKDB_API explicit ExpressionExecutor(const vector<unique_ptr<Expression>> &exprs);

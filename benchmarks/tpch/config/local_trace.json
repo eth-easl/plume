@@ -1,0 +1,29 @@
+{
+    "benchmarkType": "trace",
+    "queryStoragePrefix": "~/plume/benchmarks/tpch/queries",
+
+    "dandelionUrl": "http://localhost:8080",
+    "requestTimeout": 30,
+    "resultsPrefix": "~/plume_results/local_trace",
+    "debugPrints": false,
+    "maxSplits": 12,
+    "targetRowsPerSplit": 131072,
+
+    "benchmarkConfig": {
+        "path": "/users/tstocker/plume/benchmarks/tpch/traces/redshift_1w_10.csv",
+        "scaleFactors": {
+            "sf1": {
+                "tablePathPrefix": "http://127.0.0.1:7777/tpch1",
+                "tablePathSuffix": ".parquet",
+                "tableNumFiles": { "lineitem": 1, "orders": 1, "partsupp": 1 }
+            },
+            "sf10": {
+                "tablePathPrefix": "http://127.0.0.1:7777/tpch10",
+                "tablePathSuffix": ".parquet",
+                "tableNumFiles": { "lineitem": 2, "orders": 2, "partsupp": 2 }
+            }
+        },
+        "closedLoop": false
+    },
+    "checksumFile": "~/plume/benchmarks/tpch/config/checksums.json"
+}

@@ -1,0 +1,398 @@
+{
+  "q1": {
+    "sf1": {
+      "hashSum": "0x6ae12d12f71d392b",
+      "rowCount": 4
+    },
+    "sf10": {
+      "hashSum": "0xfc52cfc073d9dd9c",
+      "rowCount": 4
+    },
+    "sf100": {
+      "hashSum": "0x69a817bd08562c88",
+      "rowCount": 4
+    },
+    "sf30": {
+      "hashSum": "0x152a7e96416b3e1f",
+      "rowCount": 4
+    }
+  },
+  "q10": {
+    "sf1": {
+      "hashSum": "0x4254009d9b5e043b",
+      "rowCount": 20
+    },
+    "sf10": {
+      "hashSum": "0x7f8c0dbc00fdaa3e",
+      "rowCount": 20
+    },
+    "sf100": {
+      "hashSum": "0xe971c38c18eaf353",
+      "rowCount": 20
+    },
+    "sf30": {
+      "hashSum": "0x03453f9db786f54f",
+      "rowCount": 20
+    }
+  },
+  "q11": {
+    "sf1": {
+      "hashSum": "0xf8c4217c3a6df6c6",
+      "rowCount": 1225
+    },
+    "sf10": {
+      "hashSum": "0x0000000000000000",
+      "rowCount": 0
+    },
+    "sf100": {
+      "hashSum": "0x0000000000000000",
+      "rowCount": 0
+    },
+    "sf30": {
+      "hashSum": "0x0000000000000000",
+      "rowCount": 0
+    }
+  },
+  "q12": {
+    "sf1": {
+      "hashSum": "0xd4facdcd5954192f",
+      "rowCount": 2
+    },
+    "sf10": {
+      "hashSum": "0x6aa5be4ae9efbd99",
+      "rowCount": 2
+    },
+    "sf100": {
+      "hashSum": "0xb656f8f5ed560f5c",
+      "rowCount": 2
+    },
+    "sf30": {
+      "hashSum": "0x78f35ff6d8ecae38",
+      "rowCount": 2
+    }
+  },
+  "q13": {
+    "sf1": {
+      "hashSum": "0x2a0460dcfee7d7b4",
+      "rowCount": 42
+    },
+    "sf10": {
+      "hashSum": "0x94870f50dd9da13a",
+      "rowCount": 46
+    },
+    "sf100": {
+      "hashSum": "0x0e73b6f05a39319d",
+      "rowCount": 45
+    },
+    "sf30": {
+      "hashSum": "0x16f59766770e3975",
+      "rowCount": 45
+    }
+  },
+  "q14": {
+    "sf1": {
+      "hashSum": "0xe8393f2ab3e4cac8",
+      "rowCount": 1
+    },
+    "sf10": {
+      "hashSum": "0x0cb5fc17559603d7",
+      "rowCount": 1
+    },
+    "sf100": {
+      "hashSum": "0x2ee749ed5dc91eaf",
+      "rowCount": 1
+    },
+    "sf30": {
+      "hashSum": "0x432c1ba9436392ec",
+      "rowCount": 1
+    }
+  },
+  "q15": {
+    "sf1": {
+      "hashSum": "0x4418536c6919e58d",
+      "rowCount": 1
+    },
+    "sf10": {
+      "hashSum": "0x5bd3c8b005eb1a06",
+      "rowCount": 1
+    },
+    "sf100": {
+      "hashSum": "0xe8b7b16ce67de954",
+      "rowCount": 1
+    },
+    "sf30": {
+      "hashSum": "0x2fefbabc2f9e2398",
+      "rowCount": 1
+    }
+  },
+  "q16": {
+    "sf1": {
+      "hashSum": "0xfe64bb8ed33950d3",
+      "rowCount": 18314
+    },
+    "sf10": {
+      "hashSum": "0xa869aada238b6e61",
+      "rowCount": 27840
+    },
+    "sf100": {
+      "hashSum": "0x545648a77a37d52d",
+      "rowCount": 27840
+    },
+    "sf30": {
+      "hashSum": "0x7c3d0d84572e6416",
+      "rowCount": 27840
+    }
+  },
+  "q17": {
+    "sf1": {
+      "hashSum": "0xfdb831eb9132f9f6",
+      "rowCount": 1
+    },
+    "sf10": {
+      "hashSum": "0x47c0b08771233181",
+      "rowCount": 1
+    },
+    "sf100": {
+      "hashSum": "0x34eb92989c3e454b",
+      "rowCount": 1
+    },
+    "sf30": {
+      "hashSum": "0x946be71b2b60ece0",
+      "rowCount": 1
+    }
+  },
+  "q18": {
+    "sf1": {
+      "hashSum": "0x70ee6471f89a187c",
+      "rowCount": 57
+    },
+    "sf10": {
+      "hashSum": "0x064253291b6aa660",
+      "rowCount": 100
+    },
+    "sf100": {
+      "hashSum": "0xe541ff1aa816cd16",
+      "rowCount": 100
+    },
+    "sf30": {
+      "hashSum": "0x1d010ca5d382096d",
+      "rowCount": 100
+    }
+  },
+  "q19": {
+    "sf1": {
+      "hashSum": "0x5e7449eeddf140ac",
+      "rowCount": 1
+    },
+    "sf10": {
+      "hashSum": "0x61b8b75af27770d2",
+      "rowCount": 1
+    },
+    "sf100": {
+      "hashSum": "0x7ecde58825bcef22",
+      "rowCount": 1
+    },
+    "sf30": {
+      "hashSum": "0x81bcc76df64ad6a9",
+      "rowCount": 1
+    }
+  },
+  "q2": {
+    "sf1": {
+      "hashSum": "0x2a3b1cc140cb50f9",
+      "rowCount": 100
+    },
+    "sf10": {
+      "hashSum": "0x55ea5e88d2c792a9",
+      "rowCount": 100
+    },
+    "sf100": {
+      "hashSum": "0xd60a79db1df21005",
+      "rowCount": 100
+    },
+    "sf30": {
+      "hashSum": "0x599b1ebac4711d9e",
+      "rowCount": 100
+    }
+  },
+  "q20": {
+    "sf1": {
+      "hashSum": "0xc8be857ca2c9a22d",
+      "rowCount": 186
+    },
+    "sf10": {
+      "hashSum": "0x56deda48958c578d",
+      "rowCount": 1804
+    },
+    "sf100": {
+      "hashSum": "0xb8b26267754f7abe",
+      "rowCount": 17971
+    },
+    "sf30": {
+      "hashSum": "0x6b32e2d41f417097",
+      "rowCount": 5404
+    }
+  },
+  "q21": {
+    "sf1": {
+      "hashSum": "0x667cc81f117f494e",
+      "rowCount": 100
+    },
+    "sf10": {
+      "hashSum": "0x6a7ad165511463f9",
+      "rowCount": 100
+    },
+    "sf100": {
+      "hashSum": "0x7ea19375491cdcb2",
+      "rowCount": 100
+    },
+    "sf30": {
+      "hashSum": "0x6751f7708258c170",
+      "rowCount": 100
+    }
+  },
+  "q22": {
+    "sf1": {
+      "hashSum": "0x352182b490ea98be",
+      "rowCount": 7
+    },
+    "sf10": {
+      "hashSum": "0x2bd5145087a491f7",
+      "rowCount": 7
+    },
+    "sf100": {
+      "hashSum": "0x359ab9b0057f2558",
+      "rowCount": 7
+    },
+    "sf30": {
+      "hashSum": "0x2a2f6fdf883a8dd7",
+      "rowCount": 7
+    }
+  },
+  "q3": {
+    "sf1": {
+      "hashSum": "0x20ff9d21ca8bb2b9",
+      "rowCount": 10
+    },
+    "sf10": {
+      "hashSum": "0xb1e6aba068087078",
+      "rowCount": 10
+    },
+    "sf100": {
+      "hashSum": "0x2e323db6e957b6fc",
+      "rowCount": 10
+    },
+    "sf30": {
+      "hashSum": "0x7b37862ffb390813",
+      "rowCount": 10
+    }
+  },
+  "q4": {
+    "sf1": {
+      "hashSum": "0xc4864905ba49e5d0",
+      "rowCount": 5
+    },
+    "sf10": {
+      "hashSum": "0xe95e481bc5e6beb5",
+      "rowCount": 5
+    },
+    "sf100": {
+      "hashSum": "0x87f01f3f44ecd3a3",
+      "rowCount": 5
+    },
+    "sf30": {
+      "hashSum": "0x61255f1a2aeb89fb",
+      "rowCount": 5
+    }
+  },
+  "q5": {
+    "sf1": {
+      "hashSum": "0xd12d9d815faafdc0",
+      "rowCount": 5
+    },
+    "sf10": {
+      "hashSum": "0x66e5a84c529d1b36",
+      "rowCount": 5
+    },
+    "sf100": {
+      "hashSum": "0x3c8b5bb289c07d90",
+      "rowCount": 5
+    },
+    "sf30": {
+      "hashSum": "0x14118d6af8586e0a",
+      "rowCount": 5
+    }
+  },
+  "q6": {
+    "sf1": {
+      "hashSum": "0xc8dd9531210d329f",
+      "rowCount": 1
+    },
+    "sf10": {
+      "hashSum": "0xc47516f5f0197eae",
+      "rowCount": 1
+    },
+    "sf100": {
+      "hashSum": "0x9f839b63f3edf7e3",
+      "rowCount": 1
+    },
+    "sf30": {
+      "hashSum": "0x57d4ef0da8ca4512",
+      "rowCount": 1
+    }
+  },
+  "q7": {
+    "sf1": {
+      "hashSum": "0x01bbe6b358859f7f",
+      "rowCount": 4
+    },
+    "sf10": {
+      "hashSum": "0xb823fc957a453b6b",
+      "rowCount": 4
+    },
+    "sf100": {
+      "hashSum": "0x86e2ddbca268f7ed",
+      "rowCount": 4
+    },
+    "sf30": {
+      "hashSum": "0x425553a52b74d5c6",
+      "rowCount": 4
+    }
+  },
+  "q8": {
+    "sf1": {
+      "hashSum": "0x0758566e0d6b8596",
+      "rowCount": 2
+    },
+    "sf10": {
+      "hashSum": "0x4360a64680d74efc",
+      "rowCount": 2
+    },
+    "sf100": {
+      "hashSum": "0x09d0c6810b47b43c",
+      "rowCount": 2
+    },
+    "sf30": {
+      "hashSum": "0x6e3604bcf8b71c6d",
+      "rowCount": 2
+    }
+  },
+  "q9": {
+    "sf1": {
+      "hashSum": "0xdd7fef4d79b40bca",
+      "rowCount": 175
+    },
+    "sf10": {
+      "hashSum": "0xe71ef1616ccf56f4",
+      "rowCount": 175
+    },
+    "sf100": {
+      "hashSum": "0x8a38ada038829a97",
+      "rowCount": 175
+    },
+    "sf30": {
+      "hashSum": "0xdd6047163e576eec",
+      "rowCount": 175
+    }
+  }
+}

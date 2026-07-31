@@ -1,0 +1,18 @@
+{
+    "benchmarkType": "throughput",
+    "queries": ["q6.sql"],
+    "queryStoragePrefix": "~/plume/benchmarks/tpch/queries",
+
+    "tablePathPrefix": "http://127.0.0.1:7777/tpch1",
+    "tablePathSuffix": ".parquet",
+    "tableNumFiles": { "lineitem": 1 },
+
+    "dandelionUrl": "http://localhost:8080",
+    "requestTimeout": 60,
+    "resultsPrefix": "~/plume_results/local_throughput_q6",
+    "debugPrints": false,
+    "maxSplits": 10,
+    "targetRowsPerSplit": 262144,
+
+    "benchmarkConfig": { "query": "q6.sql", "rpsValues": [0.1, 100], "durationSec": 30 }
+}

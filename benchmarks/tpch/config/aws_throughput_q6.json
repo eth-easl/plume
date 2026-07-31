@@ -1,0 +1,24 @@
+{
+    "benchmarkType": "throughput",
+    "queries": ["q6.sql"],
+    "queryStoragePrefix": "~/plume/benchmarks/tpch/queries",
+
+    "tablePathPrefix": "https://tpc-h-sf-1-ireland.s3.eu-west-1.amazonaws.com",
+    "tablePathSuffix": ".parquet",
+    "tableNumFiles": { "lineitem": 1, "orders": 1, "partsupp": 1 },
+    "scaleFactor": "sf1",
+    "checksumFile": "~/plume/benchmarks/tpch/config/checksums.json",
+
+    "dandelionUrl": "http://<dandelion_url>:8080",
+    "requestTimeout": 10,
+    "resultsPrefix": "~/plume_results/aws_throughput_q6",
+    "debugPrints": false,
+    "maxSplits": 180,
+    "targetRowsPerSplit": 131072,
+
+    "benchmarkConfig": {
+        "query": "q6.sql",
+        "rpsValues": [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140],
+        "durationSec": 60
+    }
+}

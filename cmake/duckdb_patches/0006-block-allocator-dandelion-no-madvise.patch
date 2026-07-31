@@ -1,0 +1,15 @@
+diff --git a/src/storage/block_allocator.cpp b/src/storage/block_allocator.cpp
+index b9159da..1ff9da9 100644
+--- a/src/storage/block_allocator.cpp
++++ b/src/storage/block_allocator.cpp
+@@ -73,6 +73,10 @@ static void OnDeallocation(const data_ptr_t pointer, const idx_t size) {
+ #elif defined(__MVS__)
+ 	// the madvice functionality is not available on z/OS in any form
+ 	success = true;
++#elif defined(__DANDELION__)
++	// plume extraction patch #6: the Dandelion sandbox has no madvise/MADV_DONTNEED;
++	// decommit-on-free is a no-op (memory is reclaimed when the sandbox tears down).
++	success = true;
+ #else
+ 	success = madvise(pointer, size, MADV_DONTNEED) == 0;
+ #endif

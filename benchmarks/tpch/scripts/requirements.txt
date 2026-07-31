@@ -1,0 +1,5 @@
+# Pinned to the DuckDB version plume vendors (external/duckdb, see the
+# top-level CLAUDE.md). generate_checksums.py relies on DuckDB's internal
+# hash() implementation matching plume_bench's C++ side bit-for-bit, which is
+# only guaranteed within the same DuckDB version.
+duckdb==1.5.4

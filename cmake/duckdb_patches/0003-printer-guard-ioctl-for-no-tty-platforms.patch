@@ -1,0 +1,36 @@
+diff --git a/src/common/printer.cpp b/src/common/printer.cpp
+index 115c1ca..d8f5b46 100644
+--- a/src/common/printer.cpp
++++ b/src/common/printer.cpp
+@@ -8,7 +8,13 @@
+ #ifdef DUCKDB_WINDOWS
+ #include <io.h>
+ #else
++// plume extraction patch #3: the Dandelion libc has no <sys/ioctl.h> (no TTY in
++// the sandbox). Gate the include on __has_include so native builds are unchanged
++// and Dandelion falls back to the default terminal width in TerminalWidth().
++#if defined(__has_include) && __has_include(<sys/ioctl.h>)
+ #include <sys/ioctl.h>
++#define DUCKDB_HAS_IOCTL 1
++#endif
+ #include <stdio.h>
+ #include <unistd.h>
+ #endif
+@@ -72,13 +78,16 @@ idx_t Printer::TerminalWidth() {
+ 	GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
+ 	rows = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+ 	return rows;
+-#else
++#elif defined(DUCKDB_HAS_IOCTL)
+ 	struct winsize w = {};
+ 	ioctl(0, TIOCGWINSZ, &w);
+ 	if (w.ws_col == 0) {
+ 		return 120;
+ 	}
+ 	return w.ws_col;
++#else
++	// no ioctl available (e.g. Dandelion): fall back to the default width
++	return 120;
+ #endif
+ #else
+ 	throw InternalException("TerminalWidth called while printing is disabled");

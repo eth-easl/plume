@@ -1,0 +1,27 @@
+diff --git a/src/include/duckdb/common/dl.hpp b/src/include/duckdb/common/dl.hpp
+index 0fe730b..99fdd4f 100644
+--- a/src/include/duckdb/common/dl.hpp
++++ b/src/include/duckdb/common/dl.hpp
+@@ -13,7 +13,13 @@
+ #include "duckdb/common/windows_util.hpp"
+ 
+ #ifndef _WIN32
++// plume extraction patch #4: extension loading is disabled on Dandelion
++// (-DDISABLE_EXTENSION_LOAD), so skip the <dlfcn.h> include. The Dandelion libc
++// header is unusable in C++ anyway, and nothing references dlopen/dlsym when the
++// guard below is set. Upstream leaves this include unconditional.
++#ifndef DUCKDB_DISABLE_EXTENSION_LOAD
+ #include <dlfcn.h>
++#endif
+ #else
+ #define RTLD_NOW   0
+ #define RTLD_LOCAL 0
+@@ -45,7 +51,7 @@ inline void dlclose(void *handle) {
+ 	FreeLibrary((HINSTANCE)handle);
+ }
+ 
+-#else
++#elif !defined(DUCKDB_DISABLE_EXTENSION_LOAD)
+ 
+ inline std::string GetDLError(void) {
+ 	return dlerror();

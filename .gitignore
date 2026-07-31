@@ -1,0 +1,25 @@
+# Full DuckDB checkout used for progressive extraction (not committed).
+# Only the kernel files we actually need get copied into src/third_party/duckdb.
+/external/
+
+# Build output
+/build*/
+*.o
+*.a
+*.so
+
+# Benchmark harness result output
+/benchmarks/results/
+
+# Editor / OS
+.cache/
+compile_commands.json
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Reference-only copy of the old interface (used while building v3, not committed).
+/tmp_old_interface/
+.claude/
