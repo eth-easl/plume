@@ -357,6 +357,9 @@ Result<std::string> RenderChunks(const std::vector<std::unique_ptr<duckdb::DataC
 Result<std::string> ParseAndRenderResponseBody(const dandelion::BinaryData& data, const Schema &schema, 
         std::string* timestamps) {
     TRY(auto sets, dandelion::ParseResponseBody(data, timestamps));
+    if (sets.size() == 0) {
+        return "";
+    }
 
     std::string out;
     bool write_header = true;

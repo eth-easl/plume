@@ -141,14 +141,15 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
     TRY(auto compiled,
         parser::CompileQuery(con_, *catalog_, sql, key, config_.converter_config, config_.fetcher_threads));
     TRY(auto body, dandelion::InvocationBody(compiled.composition, compiled.table_blocks,
-                                                     compiled.remote_info, compiled.remote_requests,
-                                                     /*is_registered=*/false));
+                                             compiled.remote_info, compiled.remote_requests,
+                                             /*is_registered=*/false));
 
     auto now = std::chrono::steady_clock::now();
     int64_t planning_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
 
     if (config_.debug_prints) {
-        LogDebug("   compiled physical plan:\n-------\n", compiled.plan->ToString(), "\n-------");
+        LogDebug("   compiled physical plan:\n===== PHYSICAL PLAN =====\n", 
+                 compiled.plan->ToString(), "===== PHYSICAL PLAN =====");
     }
 
     Invocation inv;
@@ -161,6 +162,7 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
             LogDebug("   no checksum configured for '", checksum_query, "'/'", checksum_scale_factor, "'");
         }
     }
+    inv.out_schema = compiled.plan->output_schema;
     size_t idx = invocations_.size();
     invocations_.push_back(std::move(inv));
     by_key_[key] = idx;
