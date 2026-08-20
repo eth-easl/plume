@@ -53,6 +53,7 @@ int main(int argc, char **argv) {
     std::string out_path = "query.ub";
     std::string name = "Query";
     ConverterConfig config;
+    size_t fetcher_threads = 10;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -74,6 +75,8 @@ int main(int argc, char **argv) {
             config.projection_pushdown = false;
         } else if (a == "--no-filter-pushdown") {
             config.filter_pushdown = false;
+        } else if (a == "--no-optimize-remote-fetching") {
+            config.optimize_remote_fetching = false;
         } else if (a == "--max-splits") {
             if (++i >= argc) {
                 std::cerr << "ubench_export: --max-splits needs an argument\n";
@@ -92,6 +95,12 @@ int main(int argc, char **argv) {
                 return 2;
             }
             config.max_region_bytes = std::stoull(argv[i]);
+        } else if (a == "--fetcher-threads") {
+            if (++i >= argc) {
+                std::cerr << "ubench_export: --fetcher-threads needs an argument\n";
+                return 2;
+            }
+            fetcher_threads = std::stoull(argv[i]);
         } else if (!a.empty() && a[0] == '-') {
             std::cerr << "ubench_export: unknown flag " << a << "\n";
             return 2;
@@ -115,7 +124,7 @@ int main(int argc, char **argv) {
     registry->catalog = catalog;
     RegisterPlumeRemote(con, std::move(registry));
 
-    auto compiled = CompileQuery(con, *catalog, sql, name, config);
+    auto compiled = CompileQuery(con, *catalog, sql, name, config, fetcher_threads);
     if (compiled.is_error()) {
         std::cerr << "ubench_export: compile failed: " << compiled.error().message() << "\n";
         return 1;
@@ -124,8 +133,8 @@ int main(int argc, char **argv) {
 
     ubench::UbPlan plan;
     plan.name = name;
-    plan.root_stage = static_cast<int32_t>(cq.plan.root_idx);
-    plan.stages.reserve(cq.plan.stages.size());
+    plan.root_stage = static_cast<int32_t>(cq.plan->root_idx);
+    plan.stages.reserve(cq.plan->stages.size());
 
     // composition.{table,remote}_inputs, and CompileQuery's parallel materialized
     // {table_blocks,remote_info,remote_requests}, are built by walking plan.stages
@@ -133,7 +142,7 @@ int main(int argc, char **argv) {
     // encountered (see BuildDandelionComposition / CompileQuery in core) — replay
     // that exact walk here to match each leaf stage back to its materialized data.
     size_t table_idx = 0, remote_idx = 0;
-    for (const auto &stage : cq.plan.stages) {
+    for (const auto &stage : cq.plan->stages) {
         ubench::UbStage us;
         us.id = static_cast<int32_t>(stage->idx);
         us.source = MapKind(*stage);

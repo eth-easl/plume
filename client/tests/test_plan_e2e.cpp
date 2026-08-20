@@ -86,7 +86,7 @@ void ExpectMatch(duckdb::Connection &con, const std::string &sql, bool ordered,
                  uint64_t target_rows_per_split = 1u << 20) {
     auto plan = BuildPhysicalPlan(con, sql, sources, Cfg(pre_aggregate, max_splits, target_rows_per_split)).unwrap();
     MockRuntime runtime(con);
-    auto plume_rows = PlumeRows(runtime.Run(plan));
+    auto plume_rows = PlumeRows(runtime.Run(*plan));
     auto duck_rows = DuckRows(con, sql);
 
     if (!ordered) {
@@ -332,10 +332,10 @@ TEST_CASE("composition: structure for a single source stage") {
     duckdb::DuckDB db(nullptr);
     auto con = MakeDb(db);
     auto plan = BuildPhysicalPlan(con, "SELECT o_id, amount FROM orders WHERE amount > 20").unwrap();
-    auto comp = dandelion::BuildDandelionComposition(plan, "Q").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(*plan, "Q").unwrap();
 
     CHECK(comp.table_inputs.size() == 1);             // one base table (orders)
-    CHECK(comp.stage_templates.size() == plan.stages.size());
+    CHECK(comp.stage_templates.size() == plan->stages.size());
     CHECK(comp.table_inputs[0].source->name == "orders");
     CHECK(Contains(comp.dsl, "composition Q ("));
     // The template is broadcast to every invocation (`all`); a LOCAL_TABLE source
@@ -355,10 +355,10 @@ TEST_CASE("composition: three-table join wiring") {
                                   "JOIN customers c ON o.cust = c.c_id "
                                   "JOIN tiers t ON c.tier = t.t_id")
                     .unwrap();
-    auto comp = dandelion::BuildDandelionComposition(plan, "J3").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(*plan, "J3").unwrap();
 
     CHECK(comp.table_inputs.size() == 3);            // orders, customers, tiers
-    CHECK(comp.stage_templates.size() == plan.stages.size());
+    CHECK(comp.stage_templates.size() == plan->stages.size());
     CHECK(Contains(comp.dsl, "inData2 = all"));     // joins wired with a build side
     // Two join stages -> two `inData2` references.
     size_t joins = 0, pos = 0;
@@ -379,7 +379,7 @@ TEST_CASE("composition: data parallelism emits keyed shardings") {
                                   "ON o.cust = c.c_id GROUP BY c.name",
                                   {}, Cfg(true, /*max_splits=*/4, /*target_rows_per_split=*/1))
                     .unwrap();
-    auto comp = dandelion::BuildDandelionComposition(plan, "P").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(*plan, "P").unwrap();
 
     // The join's two inputs are both consumed keyed (co-partitioned on the join key).
     CHECK(ContainsKeyed(comp.dsl, "inData = ", ""));
@@ -391,7 +391,7 @@ TEST_CASE("composition: data parallelism emits keyed shardings") {
 
     // At a single split every edge is a plain gather (`all`), no keyed sharding.
     auto serial = dandelion::BuildDandelionComposition(
-                      BuildPhysicalPlan(con,
+                      *BuildPhysicalPlan(con,
                                         "SELECT c.name, sum(o.amount) FROM orders o JOIN customers c "
                                         "ON o.cust = c.c_id GROUP BY c.name")
                           .unwrap(),
@@ -413,21 +413,21 @@ TEST_CASE("composition: cross join gives the probe side keyed sharding, "
                     .unwrap();
 
     const Stage *join = nullptr;
-    for (const auto &s : plan.stages) {
+    for (const auto &s : plan->stages) {
         if (s->leads_with_join()) {
             join = s.get();
         }
     }
     CHECK(join != nullptr);
     if (join != nullptr) {
-        const auto &probe_split = plan.stages[join->input_stages[0]]->pipeline.output_split;
-        const auto &build_split = plan.stages[join->input_stages[1]]->pipeline.output_split;
+        const auto &probe_split = plan->stages[join->input_stages[0]]->pipeline.output_split;
+        const auto &build_split = plan->stages[join->input_stages[1]]->pipeline.output_split;
         CHECK(probe_split.partitions > 1);        // the bigger side is split...
         CHECK(!probe_split.key_columns.empty());  // ...by (all of) its own real columns
         CHECK(build_split.partitions <= 1);       // the smaller side stays single-partition
     }
 
-    auto comp = dandelion::BuildDandelionComposition(plan, "X").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(*plan, "X").unwrap();
     CHECK(ContainsKeyed(comp.dsl, "inData = ", ""));  // probe: keyed
     CHECK(Contains(comp.dsl, "inData2 = all "));      // build: broadcast to every invocation
     // No pairing clause: a broadcast edge already reaches every invocation, there's
@@ -475,10 +475,10 @@ TEST_CASE("structure: two-phase aggregation splits into partial + final") {
     const char *sql = "SELECT region, sum(amount) FROM orders GROUP BY region";
 
     auto with = BuildPhysicalPlan(con, sql, {}, Cfg(/*pre_aggregate=*/true)).unwrap();
-    CHECK(CountOps(with, exec::OpType::AGGREGATE) == 2); // partial (producing) + final
+    CHECK(CountOps(*with, exec::OpType::AGGREGATE) == 2); // partial (producing) + final
 
     auto without = BuildPhysicalPlan(con, sql, {}, Cfg(/*pre_aggregate=*/false)).unwrap();
-    CHECK(CountOps(without, exec::OpType::AGGREGATE) == 1); // single post-shuffle aggregate
+    CHECK(CountOps(*without, exec::OpType::AGGREGATE) == 1); // single post-shuffle aggregate
 }
 
 TEST_CASE("structure: DISTINCT aggregate parallelism is driven by input, not output, cardinality") {
@@ -503,13 +503,13 @@ TEST_CASE("structure: DISTINCT aggregate parallelism is driven by input, not out
     // shuffle must size off the ~2000-row input estimate (capped at max_splits=100),
     // not the ~5-group output estimate.
     auto distinct_plan = BuildPhysicalPlan(con, "SELECT g, count(DISTINCT v) FROM big GROUP BY g", {}, cfg).unwrap();
-    CHECK(MaxPartitions(distinct_plan) > 5);
+    CHECK(MaxPartitions(*distinct_plan) > 5);
 
     // first(v): also forced single-phase (not in the two-phase whitelist), but with no
     // DISTINCT involved the shuffle must still size off the (small) output-group
     // estimate, same as before this fix — not the 2000-row input.
     auto first_plan = BuildPhysicalPlan(con, "SELECT g, first(v) FROM big GROUP BY g", {}, cfg).unwrap();
-    CHECK(MaxPartitions(first_plan) <= 10);
+    CHECK(MaxPartitions(*first_plan) <= 10);
 }
 
 TEST_CASE("split: data-parallel execution matches DuckDB (mock runtime)") {
@@ -565,7 +565,7 @@ TEST_CASE("split: max_splits=1 leaves every stage unpartitioned") {
                                   "SELECT region, sum(amount) FROM orders o JOIN customers c "
                                   "ON o.cust = c.c_id GROUP BY region ORDER BY region")
                     .unwrap();
-    for (const auto &s : plan.stages) {
+    for (const auto &s : plan->stages) {
         CHECK(s->pipeline.output_split.partitions == 1);
         CHECK(s->pipeline.output_split.key_columns.empty());
     }
@@ -583,15 +583,15 @@ TEST_CASE("split: join inputs co-partition by their join keys") {
                     .unwrap();
 
     const Stage *join = nullptr;
-    for (const auto &s : plan.stages) {
+    for (const auto &s : plan->stages) {
         if (s->leads_with_join()) {
             join = s.get();
         }
     }
     CHECK(join != nullptr);
     if (join != nullptr) {
-        const auto &lp = plan.stages[join->input_stages[0]]->pipeline.output_split;
-        const auto &rp = plan.stages[join->input_stages[1]]->pipeline.output_split;
+        const auto &lp = plan->stages[join->input_stages[0]]->pipeline.output_split;
+        const auto &rp = plan->stages[join->input_stages[1]]->pipeline.output_split;
         // Both inputs partition by a (non-empty) key, into the SAME number of parts.
         CHECK(!lp.key_columns.empty());
         CHECK(!rp.key_columns.empty());
@@ -613,7 +613,7 @@ TEST_CASE("split: grouped aggregate keys by its group columns; sort gathers seri
                                       {}, Cfg(/*pre_aggregate=*/true, cap, 1))
                         .unwrap();
         bool keyed = false;
-        for (const auto &s : plan.stages) {
+        for (const auto &s : plan->stages) {
             const auto &sp = s->pipeline.output_split;
             if (!sp.key_columns.empty()) {
                 keyed = true;
@@ -632,7 +632,7 @@ TEST_CASE("split: grouped aggregate keys by its group columns; sort gathers seri
                                       {}, Cfg(/*pre_aggregate=*/false, cap, 1))
                         .unwrap();
         bool keyed = false;
-        for (const auto &s : plan.stages) {
+        for (const auto &s : plan->stages) {
             const auto &sp = s->pipeline.output_split;
             if (!sp.key_columns.empty()) {
                 keyed = true;
@@ -649,7 +649,7 @@ TEST_CASE("split: grouped aggregate keys by its group columns; sort gathers seri
         auto plan =
             BuildPhysicalPlan(con, "SELECT o_id FROM orders ORDER BY o_id", {}, Cfg(true, cap, 1))
                 .unwrap();
-        for (const auto &s : plan.stages) {
+        for (const auto &s : plan->stages) {
             CHECK(s->pipeline.output_split.partitions == 1);
             CHECK(s->pipeline.output_split.key_columns.empty());
         }
@@ -667,8 +667,8 @@ TEST_CASE("structure: dead join-key columns are pruned before the aggregate shuf
     const char *sql = "SELECT c.name, count(*) FROM orders o JOIN customers c "
                       "ON o.cust = c.c_id GROUP BY c.name";
     auto plan = BuildPhysicalPlan(con, sql, {}, Cfg(/*pre_aggregate=*/true)).unwrap();
-    CHECK(!AnyJoinOutputCarries(plan, "cust"));
-    CHECK(!AnyJoinOutputCarries(plan, "c_id"));
+    CHECK(!AnyJoinOutputCarries(*plan, "cust"));
+    CHECK(!AnyJoinOutputCarries(*plan, "c_id"));
 }
 
 // NOTE: file-source (CSV/parquet, local or remote) tests used to live here. They
@@ -696,7 +696,7 @@ TEST_CASE("composition: uncorrelated scalar subquery comparison gives the "
                     .unwrap();
 
     const Stage *join = nullptr;
-    for (const auto &s : plan.stages) {
+    for (const auto &s : plan->stages) {
         if (s->leads_with_join()) {
             join = s.get();
         }
@@ -706,14 +706,14 @@ TEST_CASE("composition: uncorrelated scalar subquery comparison gives the "
         auto jt = std::static_pointer_cast<exec::JoinTemplate>(join->pipeline.operators[0]);
         CHECK(jt->kind == exec::JoinKind::INNER);
 
-        const auto &probe_split = plan.stages[join->input_stages[0]]->pipeline.output_split;
-        const auto &build_split = plan.stages[join->input_stages[1]]->pipeline.output_split;
+        const auto &probe_split = plan->stages[join->input_stages[0]]->pipeline.output_split;
+        const auto &build_split = plan->stages[join->input_stages[1]]->pipeline.output_split;
         CHECK(probe_split.partitions > 1);        // orders (the bigger side) is split...
         CHECK(!probe_split.key_columns.empty());  // ...by its own real columns, not the dummy join key
         CHECK(build_split.partitions <= 1);       // the one-row avg subquery stays single-partition
     }
 
-    auto comp = dandelion::BuildDandelionComposition(plan, "Y").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(*plan, "Y").unwrap();
     CHECK(ContainsKeyed(comp.dsl, "inData = ", ""));
     CHECK(Contains(comp.dsl, "inData2 = all "));
     CHECK(!Contains(comp.dsl, "by inData"));
@@ -837,7 +837,7 @@ TEST_CASE("composition: CTE/DELIM plan wires stage-output fan-out") {
 
     // Some stage's output is consumed by 2+ downstream stages (fan-out).
     std::map<size_t, int> consumers;
-    for (const auto &stage : plan.stages) {
+    for (const auto &stage : plan->stages) {
         for (size_t in : stage->input_stages) {
             consumers[in]++;
         }
@@ -848,8 +848,8 @@ TEST_CASE("composition: CTE/DELIM plan wires stage-output fan-out") {
     }
     CHECK(fan_out);
 
-    auto comp = dandelion::BuildDandelionComposition(plan, "Q2").unwrap();
-    CHECK(comp.stage_templates.size() == plan.stages.size());
+    auto comp = dandelion::BuildDandelionComposition(*plan, "Q2").unwrap();
+    CHECK(comp.stage_templates.size() == plan->stages.size());
     for (auto &st : comp.stage_templates) {
         CHECK(plume::DeserializePipeline(st.buf).is_ok());
     }

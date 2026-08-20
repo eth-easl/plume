@@ -125,7 +125,8 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
     LogDebug(" > compiling '", key, "' from '", sql_path, "'");
 
     auto start = std::chrono::steady_clock::now();
-    TRY(auto compiled, parser::CompileQuery(con_, *catalog_, sql, key, config_.converter_config));
+    TRY(auto compiled,
+        parser::CompileQuery(con_, *catalog_, sql, key, config_.converter_config, config_.fetcher_threads));
     TRY(auto body, dandelion::InvocationBody(compiled.composition, compiled.table_blocks,
                                                      compiled.remote_info, compiled.remote_requests,
                                                      /*is_registered=*/false));

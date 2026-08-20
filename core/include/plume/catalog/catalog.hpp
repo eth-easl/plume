@@ -56,6 +56,7 @@ struct DataSource {
     DataSource(DataSourceType type) : type(type) {}
     virtual ~DataSource() = default;
     virtual Result<void> Resolve(const RemoteResolver &resolver) = 0;
+    bool IsRemote() const { return type == DataSourceType::REMOTE_PARQUET || type == DataSourceType::REMOTE_CSV; }
 };
 
 class SourceCatalog {

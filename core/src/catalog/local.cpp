@@ -34,7 +34,7 @@ std::shared_ptr<DataSource> CreateTableSource(std::string name, Schema schema) {
 }
 
 Result<dandelion::DataItemVec> MaterializeTable(duckdb::Connection &con, const LocalTableDataSource &src, 
-        const std::vector<uint32_t> &projection, const ExprNode *pushed_filter) {
+        const std::vector<uint32_t> *projection, const ExprNode *pushed_filter) {
     if (!src.schema) {
         return Error("Table has no schema defined.", ErrorKind::RuntimeError);
     }
@@ -43,7 +43,7 @@ Result<dandelion::DataItemVec> MaterializeTable(duckdb::Connection &con, const L
         return Error("Source table '" + src.name + "' has no input columns.", ErrorKind::InvalidInput);
     }
 
-    // TODO: add projection, pushed_filter
+    // TODO: add projection, pushed_filter if they are not a nullptr
     std::string select = "SELECT ";
     for (size_t i = 0; i < schema.columns.size(); i++) {
         select += (i ? ", " : "") + duckdb::KeywordHelper::WriteQuoted(schema.columns[i].name, '"');

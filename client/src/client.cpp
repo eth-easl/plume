@@ -77,7 +77,7 @@ CompiledQuery ToCompiledQuery(parser::CompiledComposition &&cc) {
     out.table_blocks = std::move(cc.table_blocks);
     out.remote_info = std::move(cc.remote_info);
     out.remote_requests = std::move(cc.remote_requests);
-    out.output_schema = std::move(cc.plan.output_schema);
+    out.output_schema = std::move(cc.plan->output_schema);
     return out;
 }
 
@@ -107,25 +107,22 @@ std::string CompiledQuery::ResultToString(const dandelion::BinaryData& data) {
 // Client
 //===----------------------------------------------------------------------===//
 
-Client::Client(parser::ConverterConfig converter_cfg)
+Client::Client(parser::ConverterConfig converter_cfg, size_t fetcher_threads)
     : db_(nullptr), con_(db_), catalog_(std::make_shared<catalog::SourceCatalog>()),
-      converter_cfg_(std::move(converter_cfg)) {
-    // Registered unconditionally (cheap — one catalog entry) so plume_remote(...)
-    // calls bind whether they come from the query text itself or from
-    // DetectFileSources' rewrite of a bare file/URL table reference.
+      converter_cfg_(std::move(converter_cfg)), fetcher_threads_(fetcher_threads) {
     auto registry = duckdb::make_shared_ptr<catalog::PlumeRemoteInfo>();
     registry->catalog = catalog_;
     catalog::RegisterPlumeRemote(con_, std::move(registry));
 }
 
 Result<CompiledQuery> Client::Resolve(const std::string &sql, const std::string &query_name) {
-    TRY(auto cc, parser::CompileQuery(con_, *catalog_, sql, query_name, converter_cfg_));
+    TRY(auto cc, parser::CompileQuery(con_, *catalog_, sql, query_name, converter_cfg_, fetcher_threads_));
     return ToCompiledQuery(std::move(cc));
 }
 
 Result<QueryResponse> Client::Execute(const std::string &sql, const ExecutionConfig &exec_cfg,
         const std::string &query_name) {
-    TRY(auto cc, parser::CompileQuery(con_, *catalog_, sql, query_name, converter_cfg_));
+    TRY(auto cc, parser::CompileQuery(con_, *catalog_, sql, query_name, converter_cfg_, fetcher_threads_));
     TRY(auto body, dandelion::InvocationBody(cc.composition, cc.table_blocks, cc.remote_info, cc.remote_requests,
                                              /*is_registered=*/false));
 
@@ -145,7 +142,7 @@ Result<QueryResponse> Client::Execute(const std::string &sql, const ExecutionCon
 
     QueryResponse response;
     response.data = dandelion::BinaryData(resp.text.begin(), resp.text.end());
-    response.schema = cc.plan.output_schema;
+    response.schema = cc.plan->output_schema;
     return response;
 }
 

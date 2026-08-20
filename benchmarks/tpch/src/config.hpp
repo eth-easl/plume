@@ -67,6 +67,7 @@ struct BenchmarkConfig {
 
     // CompileQuery options.
     parser::ConverterConfig converter_config;
+    size_t fetcher_threads = 10; // remote-source resolver worker pool size
 
     DataSource source; // single scale factor (single + throughput modes)
 
