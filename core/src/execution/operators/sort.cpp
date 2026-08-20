@@ -24,6 +24,10 @@ using duckdb::Vector;
 // SortKey
 //===----------------------------------------------------------------------===//
 
+bool SortKey::Equals(const SortKey &other) const {
+    return order == other.order && null_order == other.null_order && expr.Equals(other.expr);
+}
+
 void SortKey::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(100, "expr", expr);
     s.WriteProperty(101, "order", static_cast<uint8_t>(order));
@@ -41,6 +45,16 @@ SortKey SortKey::Deserialize(duckdb::Deserializer &d) {
 //===----------------------------------------------------------------------===//
 // SortTemplate
 //===----------------------------------------------------------------------===//
+
+bool SortTemplate::Equals(const OperatorTemplate &other) const {
+    if (other.type != type) return false;
+    auto &o = static_cast<const SortTemplate &>(other);
+    if (sort_keys.size() != o.sort_keys.size()) return false;
+    for (size_t i = 0; i < sort_keys.size(); i++) {
+        if (!sort_keys[i].Equals(o.sort_keys[i])) return false;
+    }
+    return true;
+}
 
 void SortTemplate::Serialize(duckdb::Serializer &s) const {
     s.WriteList(101, "sort_keys", sort_keys.size(), [&](duckdb::Serializer::List &list, duckdb::idx_t i) {

@@ -75,14 +75,14 @@ private:
     size_t NewLeafStage(std::shared_ptr<catalog::DataSource> data_src, Schema input_schema);
     size_t MaterializeNode(SharedOpNode node);
 
-    Result<void> RemoteRegistryAdd(size_t stage_idx);
-    std::optional<size_t> RemoteRegistryLookup(std::shared_ptr<catalog::DataSource> data_src, 
+    Result<void> RemoteRegistryAdd(SharedOpNode node);
+    std::optional<SharedOpNode> RemoteRegistryLookup(std::shared_ptr<catalog::DataSource> data_src,
         std::shared_ptr<std::vector<uint32_t>> projection, std::shared_ptr<expr::ExprNode> filter);
 
     std::unique_ptr<PhysicalPlan> plan_ = std::make_unique<PhysicalPlan>();
 
     bool optimize_remote_fetching_ = true;
-    std::unordered_multimap<std::string, size_t> remote_registry_;
+    std::unordered_multimap<std::string, SharedOpNode> remote_registry_;
 };
 
 } // namespace plume::parser

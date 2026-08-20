@@ -52,6 +52,7 @@ struct ExprNode {
     // CAST
     bool try_cast = false;
 
+    bool Equals(const ExprNode &other) const;
     void Serialize(duckdb::Serializer &s) const;
     static ExprNode Deserialize(duckdb::Deserializer &d);
 

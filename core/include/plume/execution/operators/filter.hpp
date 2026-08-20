@@ -15,6 +15,7 @@ struct FilterTemplate : OperatorTemplate {
     FilterTemplate(expr::ExprNode filter) 
         : OperatorTemplate(OpType::FILTER), filter(std::move(filter)) {}
 
+    bool Equals(const OperatorTemplate &other) const override;
     void Serialize(duckdb::Serializer &s) const override;
 };
 

@@ -32,6 +32,17 @@ using duckdb::Vector;
 // AggregateSpec
 //===----------------------------------------------------------------------===//
 
+bool AggregateSpec::Equals(const AggregateSpec &other) const {
+    if (func_name != other.func_name) return false;
+    if (!(return_type == other.return_type)) return false;
+    if (distinct != other.distinct) return false;
+    if (arguments.size() != other.arguments.size()) return false;
+    for (size_t i = 0; i < arguments.size(); i++) {
+        if (!arguments[i].Equals(other.arguments[i])) return false;
+    }
+    return true;
+}
+
 void AggregateSpec::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(100, "func_name", func_name);
     s.WriteProperty(101, "return_type", return_type);
@@ -55,6 +66,20 @@ AggregateSpec AggregateSpec::Deserialize(duckdb::Deserializer &d) {
 //===----------------------------------------------------------------------===//
 // AggregateTemplate
 //===----------------------------------------------------------------------===//
+
+bool AggregateTemplate::Equals(const OperatorTemplate &other) const {
+    if (other.type != type) return false;
+    auto &o = static_cast<const AggregateTemplate &>(other);
+    if (aggregates.size() != o.aggregates.size()) return false;
+    for (size_t i = 0; i < aggregates.size(); i++) {
+        if (!aggregates[i].Equals(o.aggregates[i])) return false;
+    }
+    if (group_keys.size() != o.group_keys.size()) return false;
+    for (size_t i = 0; i < group_keys.size(); i++) {
+        if (!group_keys[i].Equals(o.group_keys[i])) return false;
+    }
+    return true;
+}
 
 void AggregateTemplate::Serialize(duckdb::Serializer &s) const {
     s.WriteList(101, "group_keys", group_keys.size(), [&](duckdb::Serializer::List &list, duckdb::idx_t i) {

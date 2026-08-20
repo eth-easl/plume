@@ -19,6 +19,7 @@ struct TopNTemplate : OperatorTemplate {
     TopNTemplate(std::vector<SortKey> sort_keys, uint64_t limit, uint64_t offset = 0)
         : OperatorTemplate(OpType::TOP_N), sort_keys(std::move(sort_keys)), limit(limit), offset(offset) {}
 
+    bool Equals(const OperatorTemplate &other) const override;
     void Serialize(duckdb::Serializer &s) const override;
 };
 

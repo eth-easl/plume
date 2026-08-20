@@ -5,6 +5,22 @@
 
 namespace plume::expr {
 
+bool ExprNode::Equals(const ExprNode &other) const {
+    if (kind != other.kind) return false;
+    if (!(return_type == other.return_type)) return false;
+    if (ref_index != other.ref_index) return false;
+    if (constant.IsNull() != other.constant.IsNull()) return false;
+    if (!constant.IsNull() && !(constant == other.constant)) return false;
+    if (func_name != other.func_name) return false;
+    if (expr_type != other.expr_type) return false;
+    if (try_cast != other.try_cast) return false;
+    if (children.size() != other.children.size()) return false;
+    for (size_t i = 0; i < children.size(); i++) {
+        if (!children[i].Equals(other.children[i])) return false;
+    }
+    return true;
+}
+
 void ExprNode::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(100, "kind", static_cast<uint8_t>(kind));
     s.WriteProperty(101, "return_type", return_type);

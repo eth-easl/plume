@@ -65,7 +65,7 @@ Status Runner::Run(const uint8_t *pipeline_data, size_t pipeline_size,
             return Status::INVALID_INPUT;
         case ErrorKind::OutOfRange:
             return Status::OUT_OF_RANGE;
-        case ErrorKind::Generic:
+        default:
             return Status::ERROR;
         }
         return Status::ERROR;

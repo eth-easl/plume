@@ -14,6 +14,7 @@ struct LimitTemplate : OperatorTemplate {
     LimitTemplate(uint64_t limit, uint64_t offset = 0) 
         : OperatorTemplate(OpType::LIMIT), limit(limit), offset(offset) {}
 
+    bool Equals(const OperatorTemplate &other) const override;
     void Serialize(duckdb::Serializer &s) const override;
 };
 

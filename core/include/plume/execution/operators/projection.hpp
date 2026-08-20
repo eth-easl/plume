@@ -16,6 +16,7 @@ struct ProjectionTemplate : OperatorTemplate {
     ProjectionTemplate(std::vector<expr::ExprNode> projections)
         : OperatorTemplate(OpType::PROJECTION), projections(std::move(projections)) {}
 
+    bool Equals(const OperatorTemplate &other) const override;
     void Serialize(duckdb::Serializer &s) const override;
 };
 

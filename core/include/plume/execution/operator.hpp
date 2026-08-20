@@ -36,6 +36,7 @@ struct OperatorTemplate {
     explicit OperatorTemplate(OpType t) : type(t) {}
     virtual ~OperatorTemplate() = default;
 
+    virtual bool Equals(const OperatorTemplate &other) const = 0;
     virtual void Serialize(duckdb::Serializer &s) const = 0;
     static std::shared_ptr<OperatorTemplate> DeserializeOperator(OpType type, duckdb::Deserializer &d);
 };

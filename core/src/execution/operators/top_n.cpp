@@ -21,6 +21,17 @@ using duckdb::Value;
 // TopNTemplate
 //===----------------------------------------------------------------------===//
 
+bool TopNTemplate::Equals(const OperatorTemplate &other) const {
+    if (other.type != type) return false;
+    auto &o = static_cast<const TopNTemplate &>(other);
+    if (limit != o.limit || offset != o.offset) return false;
+    if (sort_keys.size() != o.sort_keys.size()) return false;
+    for (size_t i = 0; i < sort_keys.size(); i++) {
+        if (!sort_keys[i].Equals(o.sort_keys[i])) return false;
+    }
+    return true;
+}
+
 void TopNTemplate::Serialize(duckdb::Serializer &s) const {
     s.WriteList(101, "sort_keys", sort_keys.size(), [&](duckdb::Serializer::List &list, duckdb::idx_t i) {
         list.WriteElement(sort_keys[i]);

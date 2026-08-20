@@ -9,6 +9,70 @@ using duckdb::LogicalType;
 using duckdb::LogicalTypeId;
 
 //===----------------------------------------------------------------------===//
+// ColumnType
+//===----------------------------------------------------------------------===//
+
+void ColumnType::Serialize(duckdb::Serializer &s) const {
+    s.WriteProperty(100, "id", static_cast<uint8_t>(id));
+    s.WriteProperty(101, "decimal_width", decimal_width);
+    s.WriteProperty(102, "decimal_scale", decimal_scale);
+}
+
+ColumnType ColumnType::Deserialize(duckdb::Deserializer &d) {
+    ColumnType t;
+    t.id = static_cast<TypeId>(d.ReadProperty<uint8_t>(100, "id"));
+    t.decimal_width = d.ReadProperty<uint8_t>(101, "decimal_width");
+    t.decimal_scale = d.ReadProperty<uint8_t>(102, "decimal_scale");
+    return t;
+}
+
+//===----------------------------------------------------------------------===//
+// Column
+//===----------------------------------------------------------------------===//
+
+void Column::Serialize(duckdb::Serializer &s) const {
+    s.WriteProperty(100, "name", name);
+    s.WriteProperty(101, "type", type);
+    s.WriteProperty(102, "nullable", nullable);
+}
+
+Column Column::Deserialize(duckdb::Deserializer &d) {
+    Column c;
+    c.name = d.ReadProperty<std::string>(100, "name");
+    c.type = d.ReadProperty<ColumnType>(101, "type");
+    c.nullable = d.ReadProperty<bool>(102, "nullable");
+    return c;
+}
+
+//===----------------------------------------------------------------------===//
+// Schema
+//===----------------------------------------------------------------------===//
+
+bool Schema::Equals(const Schema &other) const {
+    if (columns.size() != other.columns.size()) return false;
+    for (size_t i = 0; i < columns.size(); i++) {
+        const Column &ca = columns[i];
+        const Column &cb = other.columns[i];
+        if (ca.name != cb.name || !(ca.type == cb.type) || ca.nullable != cb.nullable) return false;
+    }
+    return true;
+}
+
+void Schema::Serialize(duckdb::Serializer &s) const {
+    s.WriteList(100, "columns", columns.size(), [&](duckdb::Serializer::List &list, duckdb::idx_t i) {
+        list.WriteElement(columns[i]);
+    });
+}
+
+Schema Schema::Deserialize(duckdb::Deserializer &d) {
+    Schema schema;
+    d.ReadList(100, "columns", [&](duckdb::Deserializer::List &list, duckdb::idx_t /*i*/) {
+        schema.columns.push_back(list.ReadElement<Column>());
+    });
+    return schema;
+}
+
+//===----------------------------------------------------------------------===//
 // LogicalType
 //===----------------------------------------------------------------------===//
 
@@ -78,58 +142,5 @@ uint32_t PhysicalWidth(const ColumnType &type) {
     return static_cast<uint32_t>(duckdb::GetTypeIdSize(ToLogicalType(type).InternalType()));
 }
 
-//===----------------------------------------------------------------------===//
-// ColumnType
-//===----------------------------------------------------------------------===//
-
-void ColumnType::Serialize(duckdb::Serializer &s) const {
-    s.WriteProperty(100, "id", static_cast<uint8_t>(id));
-    s.WriteProperty(101, "decimal_width", decimal_width);
-    s.WriteProperty(102, "decimal_scale", decimal_scale);
-}
-
-ColumnType ColumnType::Deserialize(duckdb::Deserializer &d) {
-    ColumnType t;
-    t.id = static_cast<TypeId>(d.ReadProperty<uint8_t>(100, "id"));
-    t.decimal_width = d.ReadProperty<uint8_t>(101, "decimal_width");
-    t.decimal_scale = d.ReadProperty<uint8_t>(102, "decimal_scale");
-    return t;
-}
-
-//===----------------------------------------------------------------------===//
-// Column
-//===----------------------------------------------------------------------===//
-
-void Column::Serialize(duckdb::Serializer &s) const {
-    s.WriteProperty(100, "name", name);
-    s.WriteProperty(101, "type", type);
-    s.WriteProperty(102, "nullable", nullable);
-}
-
-Column Column::Deserialize(duckdb::Deserializer &d) {
-    Column c;
-    c.name = d.ReadProperty<std::string>(100, "name");
-    c.type = d.ReadProperty<ColumnType>(101, "type");
-    c.nullable = d.ReadProperty<bool>(102, "nullable");
-    return c;
-}
-
-//===----------------------------------------------------------------------===//
-// Schema
-//===----------------------------------------------------------------------===//
-
-void Schema::Serialize(duckdb::Serializer &s) const {
-    s.WriteList(100, "columns", columns.size(), [&](duckdb::Serializer::List &list, duckdb::idx_t i) {
-        list.WriteElement(columns[i]);
-    });
-}
-
-Schema Schema::Deserialize(duckdb::Deserializer &d) {
-    Schema schema;
-    d.ReadList(100, "columns", [&](duckdb::Deserializer::List &list, duckdb::idx_t /*i*/) {
-        schema.columns.push_back(list.ReadElement<Column>());
-    });
-    return schema;
-}
 
 } // namespace plume
