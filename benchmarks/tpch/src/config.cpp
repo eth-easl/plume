@@ -11,7 +11,7 @@ namespace {
 
 using json = nlohmann::json;
 
-// Expand a leading `~` to $HOME (mirrors the old python runner's path handling).
+// Expand a leading `~` to $HOME.
 std::string ExpandHome(const std::string &p) {
     if (p.empty() || p[0] != '~') {
         return p;
@@ -23,8 +23,6 @@ std::string ExpandHome(const std::string &p) {
     return std::string(home) + p.substr(1);
 }
 
-// Read a DataSource out of an object carrying tablePathPrefix / tablePathSuffix /
-// tableNumFiles. Used both for the top-level source and for each trace scale factor.
 DataSource ParseDataSource(const json &obj) {
     DataSource src;
     if (obj.contains("tablePathPrefix")) {

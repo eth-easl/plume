@@ -52,4 +52,7 @@ Result<BinaryData> InvocationBody(const DandelionComposition& comp, const DataSe
 Result<DataSetVec> ParseResponseBody(const BinaryData& body,
     std::string* timestamps = nullptr);
 
+Result<std::string> ParseAndRenderResponseBody(const dandelion::BinaryData& data, 
+    const Schema &schema, std::string* timestamps = nullptr);
+
 } // namespace plume::dandelion

@@ -19,8 +19,8 @@ struct ChecksumEntry {
     }
 };
 
-// query name -> scale-factor label -> expected checksum. Loaded once from a
-// JSON file shaped like:
+// Maps query name -> scale-factor label -> expected checksum. 
+// Loaded once from a JSON file shaped like:
 //   { "q1": { "sf1": { "rowCount": 4, "hashSum": "0x..." } } }
 class ChecksumFile {
   public:
@@ -33,10 +33,8 @@ class ChecksumFile {
     std::unordered_map<std::string, std::unordered_map<std::string, ChecksumEntry>> entries_;
 };
 
-// Order-independent checksum of a parsed dandelion result set.
 Result<ChecksumEntry> ComputeChecksum(const dandelion::DataSetVec &sets);
 
-// "row_count=<n> hash_sum=0x<hex>" — for error messages.
 std::string ToString(const ChecksumEntry &entry);
 
 } // namespace plume::bench
