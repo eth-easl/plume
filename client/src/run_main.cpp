@@ -17,6 +17,7 @@ struct Args {
     std::string results_prefix; // empty -> print to console
     uint32_t timeout_secs = 60;
     plume::parser::ConverterConfig config;
+    size_t fetcher_threads = 10;
 };
 
 plume::Result<Args> ParseArgs(int argc, char **argv) {
@@ -43,6 +44,8 @@ plume::Result<Args> ParseArgs(int argc, char **argv) {
             a.config.projection_pushdown = false;
         } else if (arg == "--no-filter-pushdown") {
             a.config.filter_pushdown = false;
+        } else if (arg == "--no-optimize-remote-fetching") {
+            a.config.optimize_remote_fetching = false;
         } else if (arg == "--max-splits") {
             TRY(auto v, next("--max-splits"));
             a.config.max_splits = static_cast<uint32_t>(std::stoul(v));
@@ -52,6 +55,9 @@ plume::Result<Args> ParseArgs(int argc, char **argv) {
         } else if (arg == "--max-region-size") {
             TRY(auto v, next("--max-region-size"));
             a.config.max_region_bytes = std::stoull(v);
+        } else if (arg == "--fetcher-threads") {
+            TRY(auto v, next("--fetcher-threads"));
+            a.fetcher_threads = std::stoull(v);
         } else if (!have_sql && !arg.empty() && arg.rfind("--", 0) != 0) {
             a.sql = arg;
             have_sql = true;
@@ -69,13 +75,14 @@ plume::Result<int> RunMain(int argc, char **argv) {
         fprintf(stderr,
                 "usage: %s [sql] [--url URL] [--results PREFIX] [--timeout SECONDS]\n"
                 "       [--no-pre-aggregate] [--no-projection-pushdown] [--no-filter-pushdown]\n"
-                "       [--max-splits N] [--target-rows-per-split N] [--max-region-size N]\n"
+                "       [--no-optimize-remote-fetching] [--max-splits N] [--target-rows-per-split N]\n"
+                "       [--max-region-size N] [--fetcher-threads N]\n"
                 "       (sql read from stdin if omitted)\n",
                 argv[0]);
         return 2;
     }
 
-    plume::client::Client client(args.config);
+    plume::client::Client client(args.config, args.fetcher_threads);
     plume::client::ExecutionConfig exec_cfg{args.url, args.timeout_secs};
     TRY(auto response, client.Execute(args.sql, exec_cfg));
 

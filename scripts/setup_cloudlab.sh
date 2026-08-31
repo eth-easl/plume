@@ -49,10 +49,10 @@ if has_command "cmake"; then
     msg "CMake already installed" $color_blue
 else
     msg "Installing CMake v${cmake_version}"
-    wget_and_untar "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/cmake-${cmake_version}-linux-x86_64.tar.gz" cmake
-    mv cmake/bin/* $install_dir/bin
-    mv cmake/share/* $install_dir/share
-    cleanup cmake
+    wget_and_untar "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/cmake-${cmake_version}-linux-x86_64.tar.gz" cmake_bin
+    mv cmake_bin/bin/* $install_dir/bin
+    mv cmake_bin/share/* $install_dir/share
+    cleanup cmake_bin
 fi
 
 # install libssl-dev

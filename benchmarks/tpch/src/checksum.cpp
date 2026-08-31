@@ -8,7 +8,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -32,16 +31,6 @@ std::string ToHex64(uint64_t v) {
     return oss.str();
 }
 
-// Independent execution engines (Plume's pipeline vs. the reference DuckDB run
-// scripts/generate_checksums.py uses) can produce bit-different DOUBLE/FLOAT
-// values for the same aggregate — floating-point summation isn't associative,
-// so summing the same numbers in a different order rounds differently in the
-// last couple of bits. hash() is bit-exact, so an unrounded FLOAT/DOUBLE column
-// would make the checksum spuriously fail. Round to 6 decimal places before
-// hashing (generate_checksums.py's compute_checksum applies the identical
-// `round(col, 6)`) — TPC-H's only FLOAT/DOUBLE outputs are AVG() results of
-// modest magnitude, where 1e-6 is many orders of magnitude looser than the
-// ~1e-10..1e-15 noise floor, so this doesn't mask genuine correctness bugs.
 double CanonicalizeDouble(double x) {
     if (!std::isfinite(x)) {
         return x;
@@ -49,9 +38,6 @@ double CanonicalizeDouble(double x) {
     return std::round(x * 1e6) / 1e6;
 }
 
-// Builds the vector to hash for column `c`: the original vector for every
-// non-float type (zero-copy), or a freshly rounded copy for FLOAT/DOUBLE.
-// Owns rounded copies in `storage` so they outlive the hash computation.
 duckdb::Vector &HashableColumn(duckdb::DataChunk &chunk, duckdb::idx_t c, duckdb::idx_t count,
                                std::vector<duckdb::unique_ptr<duckdb::Vector>> &storage) {
     duckdb::Vector &src = chunk.data[c];

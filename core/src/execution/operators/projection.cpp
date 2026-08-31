@@ -19,6 +19,16 @@ using duckdb::unique_ptr;
 // ProjectionTemplate
 //===----------------------------------------------------------------------===//
 
+bool ProjectionTemplate::Equals(const OperatorTemplate &other) const {
+    if (other.type != type) return false;
+    auto &o = static_cast<const ProjectionTemplate &>(other);
+    if (projections.size() != o.projections.size()) return false;
+    for (size_t i = 0; i < projections.size(); i++) {
+        if (!projections[i].Equals(o.projections[i])) return false;
+    }
+    return true;
+}
+
 void ProjectionTemplate::Serialize(duckdb::Serializer &s) const {
     s.WriteList(101, "projections", projections.size(), [&](duckdb::Serializer::List &list, duckdb::idx_t i) {
         list.WriteElement(projections[i]);

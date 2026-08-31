@@ -4,6 +4,7 @@
 #include "plume/common/result.hpp"
 #include "plume/dandelion/api.hpp"
 #include "plume/execution/operators/join.hpp"
+#include "plume/memory/adapter.hpp"
 #include "plume/parser/physical_plan.hpp"
 
 #include <nlohmann/json.hpp>
@@ -324,5 +325,55 @@ Result<DataSetVec> ParseResponseBody(const BinaryData& body, std::string* timest
     return out_sets;
 }
 
+namespace {
+
+Result<std::string> RenderChunks(const std::vector<std::unique_ptr<duckdb::DataChunk>> &chunks,
+                                 const Schema &schema, bool write_header = true) {
+    std::ostringstream out;
+    if (write_header) {
+        std::string header;
+        for (size_t c = 0; c < schema.columns.size(); c++) {
+            if (c) out << "\t";
+            out << schema.columns[c].name;
+        }
+        out << "\n";
+    }
+
+    for (const auto &chunk : chunks) {
+        for (duckdb::idx_t r = 0; r < chunk->size(); r++) {
+            std::string row;
+            for (duckdb::idx_t c = 0; c < chunk->ColumnCount(); c++) {
+                if (c) out << "\t";
+                out << chunk->GetValue(c, r).ToString();
+            }
+            out << "\n";
+        }
+    }
+    return out.str();
+}
+
+} // namespace
+
+Result<std::string> ParseAndRenderResponseBody(const dandelion::BinaryData& data, const Schema &schema, 
+        std::string* timestamps) {
+    TRY(auto sets, dandelion::ParseResponseBody(data, timestamps));
+    if (sets.size() == 0) {
+        return "";
+    }
+
+    std::string out;
+    bool write_header = true;
+    for (auto &block : sets[0]) {
+        plume::Schema block_schema;
+        TRY(auto chunks, memory::ImportBlockChunks(block.data.data(), block.data.size(), block_schema));
+        if (block_schema.columns.size() != schema.columns.size()) {
+            return Error("Block schema does not match given schema.");
+        }
+        TRY(auto chunk_str, RenderChunks(chunks, schema, write_header));
+        out += chunk_str;
+        write_header = false;
+    }
+    return out;
+}
 
 } // namespace plume::dandelion

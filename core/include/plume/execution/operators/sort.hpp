@@ -17,6 +17,7 @@ struct SortKey {
     SortOrder order = SortOrder::ASCENDING;
     NullOrder null_order = NullOrder::NULLS_LAST;
 
+    bool Equals(const SortKey &other) const;
     void Serialize(duckdb::Serializer &s) const;
     static SortKey Deserialize(duckdb::Deserializer &d);
 };
@@ -25,9 +26,10 @@ struct SortTemplate : OperatorTemplate {
     std::vector<SortKey> sort_keys;
 
     SortTemplate() : OperatorTemplate(OpType::ORDER_BY) {}
-    SortTemplate(std::vector<SortKey> sort_keys) 
+    SortTemplate(std::vector<SortKey> sort_keys)
         : OperatorTemplate(OpType::ORDER_BY), sort_keys(std::move(sort_keys)) {}
 
+    bool Equals(const OperatorTemplate &other) const override;
     void Serialize(duckdb::Serializer &s) const override;
 };
 

@@ -18,6 +18,7 @@ struct Args {
     std::string sql;
     std::string output_prefix = "."; // where the composition + buffers are written
     plume::parser::ConverterConfig config;
+    size_t fetcher_threads = 10;
 };
 
 plume::Result<Args> ParseArgs(int argc, char **argv) {
@@ -39,6 +40,8 @@ plume::Result<Args> ParseArgs(int argc, char **argv) {
             a.config.projection_pushdown = false;
         } else if (arg == "--no-filter-pushdown") {
             a.config.filter_pushdown = false;
+        } else if (arg == "--no-optimize-remote-fetching") {
+            a.config.optimize_remote_fetching = false;
         } else if (arg == "--max-splits") {
             TRY(auto v, next("--max-splits"));
             a.config.max_splits = static_cast<uint32_t>(std::stoul(v));
@@ -48,6 +51,9 @@ plume::Result<Args> ParseArgs(int argc, char **argv) {
         } else if (arg == "--max-region-size") {
             TRY(auto v, next("--max-region-size"));
             a.config.max_region_bytes = std::stoull(v);
+        } else if (arg == "--fetcher-threads") {
+            TRY(auto v, next("--fetcher-threads"));
+            a.fetcher_threads = std::stoull(v);
         } else if (!have_sql && !arg.empty() && arg.rfind("--", 0) != 0) {
             a.sql = arg;
             have_sql = true;
@@ -87,7 +93,8 @@ plume::Result<int> RunMain(int argc, char **argv) {
     if (args.sql.empty()) {
         fprintf(stderr,
                 "usage: %s [sql] [--output PREFIX] [--no-pre-aggregate] [--no-projection-pushdown] "
-                "[--no-filter-pushdown] [--max-splits N] [--target-rows-per-split N] [--max-region-size N]\n"
+                "[--no-filter-pushdown] [--no-optimize-remote-fetching] [--max-splits N] "
+                "[--target-rows-per-split N] [--max-region-size N] [--fetcher-threads N]\n"
                 "       (sql read from stdin if omitted)\n",
                 argv[0]);
         return 2;
@@ -96,7 +103,7 @@ plume::Result<int> RunMain(int argc, char **argv) {
     std::error_code ec;
     fs::create_directories(prefix, ec);
 
-    plume::client::Client client(args.config);
+    plume::client::Client client(args.config, args.fetcher_threads);
     TRY(auto compiled, client.Resolve(args.sql, "Query"));
     const auto &comp = compiled.composition;
 

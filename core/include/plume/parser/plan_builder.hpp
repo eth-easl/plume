@@ -15,7 +15,7 @@ constexpr size_t kUnmaterialized = std::numeric_limits<std::size_t>::max();
 
 class PlanBuilder {
 public:
-    PlanBuilder() {}
+    PlanBuilder(bool optimize_remote_fetching) : optimize_remote_fetching_(optimize_remote_fetching) {}
 
     // Intermediate struct representing an operator in the query plan.
     struct OperatorNode {
@@ -53,16 +53,13 @@ public:
     };
     using SharedOpNode = std::shared_ptr<OperatorNode>;
 
-    SharedOpNode Scan(std::shared_ptr<catalog::DataSource> data_src, Schema schema);
+    SharedOpNode Scan(std::shared_ptr<catalog::DataSource> data_src, Schema schema, 
+        std::shared_ptr<std::vector<uint32_t>> pushed_projection, 
+        std::shared_ptr<expr::ExprNode> pushed_filter);
 
     SharedOpNode After(SharedOpNode src, std::shared_ptr<exec::OperatorTemplate> templ, Schema output_schema);
     SharedOpNode Shuffle(SharedOpNode src, std::shared_ptr<exec::OperatorTemplate> templ, Schema output_schema, 
         std::vector<uint32_t> key_columns, uint32_t num_splits);
-    // `probe_num_splits`/`build_num_splits` are independent: a co-partitioned
-    // equi join passes the same value for both, while a broadcast join (see
-    // Converter::BuildCrossProduct) splits only the probe side and pins the
-    // build side at 1 (so it is wired as a broadcast edge to every probe
-    // partition, see composition.cpp).
     SharedOpNode Join(SharedOpNode probe_side_op, SharedOpNode build_side_op,
         std::shared_ptr<exec::OperatorTemplate> templ, Schema output_schema,
         std::vector<uint32_t> probe_key_columns, std::vector<uint32_t> build_key_columns,
@@ -71,14 +68,21 @@ public:
     Stage *StageAt(size_t idx);
     LeafStage *LeafStageAt(size_t idx);
 
-    PhysicalPlan Export(SharedOpNode root);
+    std::unique_ptr<PhysicalPlan> Export(SharedOpNode root);
 
 private:
     size_t NewStage(Schema input_schema);
     size_t NewLeafStage(std::shared_ptr<catalog::DataSource> data_src, Schema input_schema);
     size_t MaterializeNode(SharedOpNode node);
 
-    PhysicalPlan plan_;
+    Result<void> RemoteRegistryAdd(SharedOpNode node);
+    std::optional<SharedOpNode> RemoteRegistryLookup(std::shared_ptr<catalog::DataSource> data_src,
+        std::shared_ptr<std::vector<uint32_t>> projection, std::shared_ptr<expr::ExprNode> filter);
+
+    std::unique_ptr<PhysicalPlan> plan_ = std::make_unique<PhysicalPlan>();
+
+    bool optimize_remote_fetching_ = true;
+    std::unordered_multimap<std::string, SharedOpNode> remote_registry_;
 };
 
 } // namespace plume::parser

@@ -34,6 +34,11 @@ void CollectRefs(const duckdb::Expression &e, std::vector<uint32_t> &out) {
 // FilterTemplate
 //===----------------------------------------------------------------------===//
 
+bool FilterTemplate::Equals(const OperatorTemplate &other) const {
+    if (other.type != type) return false;
+    return filter.Equals(static_cast<const FilterTemplate &>(other).filter);
+}
+
 void FilterTemplate::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(101, "filter", filter);
 }

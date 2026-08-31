@@ -21,6 +21,7 @@
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -153,9 +154,9 @@ std::pair<PlanBuilder::SharedOpNode, uint32_t> AppendColumn(PlanBuilder &builder
 
 } // namespace
 
-Result<PhysicalPlan> Converter::Convert(duckdb::LogicalOperator &root) {
+Result<std::unique_ptr<PhysicalPlan>> Converter::Convert(duckdb::LogicalOperator &root) {
     TRY(auto root_node, Build(root));
-    PhysicalPlan plan = builder_.Export(root_node);
+    std::unique_ptr<PhysicalPlan> plan = builder_.Export(root_node);
     return plan;
 
     // TODO: Refactor projections pruning unused columns.
@@ -178,13 +179,28 @@ uint32_t Converter::SplitCount(uint64_t estimated_rows) const {
 Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
     auto table = get.GetTable();
     std::shared_ptr<DataSource> data_source = nullptr;
+    bool is_remote = false;
     if (!table && get.function.name == kPlumeRemoteName && get.bind_data) {
         data_source = get.bind_data->Cast<PlumeRemoteBindData>().info;
         if (!data_source->schema) {
             return Error("Remote data source should have been resolved by now.", ErrorKind::RuntimeError);
         }
+        is_remote = true;
     }
     const duckdb::vector<duckdb::ColumnIndex> &column_ids = get.GetColumnIds();
+    std::vector<bool> not_null_cols;
+    if (table) {
+        not_null_cols.assign(table->GetColumns().LogicalColumnCount(), false);
+        for (auto &constraint : table->GetConstraints()) {
+            if (constraint->type != duckdb::ConstraintType::NOT_NULL) {
+                continue;
+            }
+            idx_t col_idx = constraint->Cast<duckdb::NotNullConstraint>().index.index;
+            if (col_idx < not_null_cols.size()) {
+                not_null_cols[col_idx] = true;
+            }
+        }
+    }
 
     Schema schema_scanned;
     schema_scanned.columns.reserve(column_ids.size());
@@ -196,58 +212,25 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
         Column col;
         col.name = get.names[idx];
         col.type = FromLogicalType(get.returned_types[idx]);
-        col.nullable = (data_source && idx < data_source->schema->columns.size())
-                       ? data_source->schema->columns[idx].nullable
-                       : true; // TODO: how can we get this from the LogicalGet?
+        if (data_source && idx < data_source->schema->columns.size()) {
+            col.nullable = data_source->schema->columns[idx].nullable;
+        } else if (table && idx < not_null_cols.size()) {
+            col.nullable = !not_null_cols[idx];
+        } else {
+            col.nullable = true;
+        }
         schema_scanned.columns.push_back(std::move(col));
     }
     
-    PlanBuilder::SharedOpNode cur;
-    LeafStage *leaf_stage;
-    bool is_remote = false;
-    if (table) {
-        data_source = CreateTableSource(table->name, schema_scanned);
-        cur = builder_.Scan(data_source, schema_scanned);
-        leaf_stage = builder_.LeafStageAt(cur->stage_idx);
-        leaf_stage->projection = std::make_shared<std::vector<uint32_t>>(schema_scanned.columns.size());
-        std::iota(leaf_stage->projection->begin(), leaf_stage->projection->end(), 0u);
-    } else if (data_source) {
-        is_remote = true;
-        if (cfg_.projection_pushdown) {
-            cur = builder_.Scan(data_source, schema_scanned);
-            leaf_stage = builder_.LeafStageAt(cur->stage_idx);
-            leaf_stage->projection = std::make_shared<std::vector<uint32_t>>();
-            leaf_stage->projection->reserve(column_ids.size());
-            for (auto &cid : column_ids) {
-                leaf_stage->projection->push_back(static_cast<uint32_t>(cid.GetPrimaryIndex()));
-            }
-        } else {
-            Schema schema_full = data_source->schema.value();
-            cur = builder_.Scan(data_source, schema_full);
-            leaf_stage = builder_.LeafStageAt(cur->stage_idx);
-
-            auto proj = std::make_shared<exec::ProjectionTemplate>();
-            for (auto &cid : column_ids) {
-                auto s = cid.GetPrimaryIndex();
-                const Column &col = schema_full.columns[s];
-                proj->projections.push_back(expr::ExprNode::Reference(static_cast<uint32_t>(s), col.type));
-            }
-            cur = builder_.After(std::move(cur), std::move(proj), schema_scanned);
-        }
-    } else {
-        return Error("Get has unknown source.", ErrorKind::NotImplemented);
-    }
-
-    // pushed filters
+    std::vector<expr::ExprNode> filter_preds;                     // pipeline FILTER (scanned-position refs)
+    std::shared_ptr<expr::ExprNode> pushed_filter_pred = nullptr; // reader pruning (storage-index refs)
     if (!get.table_filters.filters.empty()) {
         std::vector<duckdb::idx_t> keys;
         for (auto &kv : get.table_filters.filters) {
             keys.push_back(kv.first);
         }
-        std::sort(keys.begin(), keys.end()); // TODO: why do we need to sort?
 
-        std::vector<expr::ExprNode> filter_preds;         // pipeline FILTER (scanned-position refs)
-        std::vector<expr::ExprNode> pushed_filter_preds;  // reader pruning (storage-index refs)
+        std::vector<expr::ExprNode> pushed_filter_preds;
         for (auto storage_idx : keys) {
             const auto &filter = *get.table_filters.filters.at(storage_idx);
             
@@ -288,26 +271,54 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
             }
         }
 
-        if (!filter_preds.empty()) { // all filters may have been accelerator-only
-            expr::ExprNode filter = filter_preds.size() == 1 ? std::move(filter_preds[0])
-                : expr::ExprNode::Conjunction(duckdb::ExpressionType::CONJUNCTION_AND, std::move(filter_preds));
-            auto t = std::make_shared<exec::FilterTemplate>(std::move(filter));
-            cur = builder_.After(std::move(cur), std::move(t), schema_scanned); // filter preserves schema
-        }
-
         if (!pushed_filter_preds.empty()) {
             if (pushed_filter_preds.size() == 1) {
-                leaf_stage->pushed_filter = std::make_shared<ExprNode>(std::move(pushed_filter_preds[0]));
+                pushed_filter_pred = std::make_shared<ExprNode>(std::move(pushed_filter_preds[0]));
             } else {
-                leaf_stage->pushed_filter = std::make_shared<ExprNode>(
+                pushed_filter_pred = std::make_shared<ExprNode>(
                     expr::ExprNode::Conjunction(duckdb::ExpressionType::CONJUNCTION_AND, std::move(pushed_filter_preds)));
             }
         }
     }
 
-    // data parallel reads
-    if (is_remote) {
+    PlanBuilder::SharedOpNode cur;
+    if (table) {
+        data_source = CreateTableSource(table->name, schema_scanned);
+        // TODO: do we need to push a projection if not all columns are to be read here?
+        cur = builder_.Scan(data_source, schema_scanned, nullptr, nullptr);
+    } else if (data_source) {
+        LeafStage *leaf_stage;
+        if (cfg_.projection_pushdown) {
+            auto projection = std::make_shared<std::vector<uint32_t>>();
+            projection->reserve(column_ids.size());
+            for (auto &cid : column_ids) {
+                projection->push_back(static_cast<uint32_t>(cid.GetPrimaryIndex()));
+            }
+            cur = builder_.Scan(data_source, schema_scanned, std::move(projection), pushed_filter_pred);
+            leaf_stage = builder_.LeafStageAt(cur->stage_idx);
+        } else {
+            Schema schema_full = data_source->schema.value();
+            cur = builder_.Scan(data_source, schema_full, nullptr, pushed_filter_pred);
+            leaf_stage = builder_.LeafStageAt(cur->stage_idx);
+
+            auto proj = std::make_shared<exec::ProjectionTemplate>();
+            for (auto &cid : column_ids) {
+                auto s = cid.GetPrimaryIndex();
+                const Column &col = schema_full.columns[s];
+                proj->projections.push_back(expr::ExprNode::Reference(static_cast<uint32_t>(s), col.type));
+            }
+            cur = builder_.After(std::move(cur), std::move(proj), schema_scanned);
+        }
         leaf_stage->source_splits = SplitCount(data_source->cardinality_total);
+    } else {
+        return Error("Get has unknown source.", ErrorKind::NotImplemented);
+    }
+
+    if (!filter_preds.empty()) { // all filters may have been accelerator-only
+        expr::ExprNode filter = filter_preds.size() == 1 ? std::move(filter_preds[0])
+            : expr::ExprNode::Conjunction(duckdb::ExpressionType::CONJUNCTION_AND, std::move(filter_preds));
+        auto t = std::make_shared<exec::FilterTemplate>(std::move(filter));
+        cur = builder_.After(std::move(cur), std::move(t), schema_scanned); // filter preserves schema
     }
 
     // TODO: check if this is needed -> should prune unused filter columns away but no need for 
@@ -325,16 +336,6 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
     return cur;
 }
 
-// A CHUNK_GET (`duckdb::LogicalColumnDataGet`) scans an in-memory constant set the
-// optimizer built directly on the logical operator — e.g. `InClauseRewriter` turns
-// a large `col IN (const, const, ...)` into a MARK join against one of these
-// instead of a chain of ORs. The constants live in a `ColumnDataCollection`
-// attached to the operator, not in any table the connection knows about, so there
-// is nothing for the existing (name-based) TABLE_BLOCKS materialization path to
-// query. Rather than plumb a second, bytes-already-in-hand source kind through the
-// catalog/composition/materialization pipeline, materialize the collection into a
-// real (uniquely named) table on `con_` right here — the rest of the pipeline then
-// treats it exactly like any other host-materialized base table.
 Result<PlanBuilder::SharedOpNode> Converter::BuildChunkGet(duckdb::LogicalColumnDataGet &get) {
     if (!get.collection) {
         return Error("CHUNK_GET has no backing collection.", ErrorKind::NotImplemented);
@@ -388,7 +389,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildChunkGet(duckdb::LogicalColumn
 
     auto blocks_source = CreateTableSource(table_name, schema);
     blocks_source->cardinality_total = static_cast<uint64_t>(num_rows);
-    return builder_.Scan(std::move(blocks_source), schema);
+    return builder_.Scan(std::move(blocks_source), schema, nullptr, nullptr);
 }
 
 Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggregate &agg, 
@@ -427,6 +428,15 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggre
 
     // single-phase aggregate (no early-aggregation)
     if (!two_phase) {
+        // AVG on a DECIMAL requires a AverageDecimalBindData to descale its result. Since we always
+        // use a null bind_data we sidestep this issue by casting to a DOUBLE.
+        for (auto &spec : aggs) {
+            if (spec.func_name == "avg" && spec.arguments.size() == 1 &&
+                spec.arguments[0].return_type.id == TypeId::DECIMAL) {
+                spec.arguments[0] =
+                    expr::ExprNode::Cast(std::move(spec.arguments[0]), ColumnType{TypeId::DOUBLE}, /*try_cast=*/false);
+            }
+        }
         std::vector<uint32_t> split_keys;
         uint32_t partitions = 1;
         bool bare_columns = num_groups > 0;
@@ -986,8 +996,8 @@ void NameOutputColumns(duckdb::LogicalOperator &root, Schema &schema) {
 
 } // namespace
 
-Result<PhysicalPlan> BuildPhysicalPlan(duckdb::Connection &con, const std::string &sql,
-                                       const SourceCatalog &sources, const ConverterConfig &config) {
+Result<std::unique_ptr<PhysicalPlan>> BuildPhysicalPlan(duckdb::Connection &con, 
+        const std::string &sql, const SourceCatalog &sources, const ConverterConfig &config) {
     auto disable = con.Query("SET disabled_optimizers='compressed_materialization'");
     if (disable->HasError()) {
         return Error("Failed to configure optimizer: " + disable->GetError(), ErrorKind::InvalidInput);
@@ -998,7 +1008,7 @@ Result<PhysicalPlan> BuildPhysicalPlan(duckdb::Connection &con, const std::strin
     Converter converter(con, sources, config);
     TRY(auto physical, converter.Convert(*plan));
 
-    NameOutputColumns(*plan, physical.output_schema);
+    NameOutputColumns(*plan, physical->output_schema);
     return physical;
 }
 

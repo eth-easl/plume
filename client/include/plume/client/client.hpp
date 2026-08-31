@@ -40,7 +40,7 @@ struct ExecutionConfig {
 
 class Client {
 public:
-    explicit Client(parser::ConverterConfig converter_cfg);
+    explicit Client(parser::ConverterConfig converter_cfg, size_t fetcher_threads = 10);
 
     Result<CompiledQuery> Resolve(const std::string &sql, const std::string &query_name = "Query");
 
@@ -56,6 +56,7 @@ private:
     std::shared_ptr<catalog::SourceCatalog> catalog_;
 
     parser::ConverterConfig converter_cfg_;
+    size_t fetcher_threads_;
 };
     
 } // namespace plume::client

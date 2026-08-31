@@ -18,11 +18,22 @@ using duckdb::idx_t;
 using duckdb::LogicalType;
 using duckdb::PhysicalType;
 using duckdb::string_t;
-using duckdb::Vector;
 
 //===----------------------------------------------------------------------===//
 // JoinTemplate
 //===----------------------------------------------------------------------===//
+
+bool JoinTemplate::Equals(const OperatorTemplate &other) const {
+    if (other.type != type) return false;
+    auto &o = static_cast<const JoinTemplate &>(other);
+    if (left_keys != o.left_keys) return false;
+    if (right_keys != o.right_keys) return false;
+    if (!right_schema.Equals(o.right_schema)) return false;
+    if (kind != o.kind) return false;
+    if (has_residual != o.has_residual) return false;
+    if (has_residual && !residual.Equals(o.residual)) return false;
+    return true;
+}
 
 void JoinTemplate::Serialize(duckdb::Serializer &s) const {
     s.WriteList(101, "left_keys", left_keys.size(), [&](duckdb::Serializer::List &list, idx_t i) {

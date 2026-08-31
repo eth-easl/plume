@@ -62,6 +62,7 @@ struct JoinTemplate : OperatorTemplate {
         , left_keys(std::move(left_keys)), right_keys(std::move(right_keys))
         , right_schema(std::move(right_schema)), kind(kind) {}
 
+    bool Equals(const OperatorTemplate &other) const override;
     void Serialize(duckdb::Serializer &s) const override;
 };
 

@@ -15,6 +15,12 @@ using duckdb::SelectionVector;
 // LimitTemplate
 //===----------------------------------------------------------------------===//
 
+bool LimitTemplate::Equals(const OperatorTemplate &other) const {
+    if (other.type != type) return false;
+    auto &o = static_cast<const LimitTemplate &>(other);
+    return has_limit == o.has_limit && limit == o.limit && offset == o.offset;
+}
+
 void LimitTemplate::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(101, "has_limit", has_limit);
     s.WriteProperty(102, "limit", limit);

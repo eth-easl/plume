@@ -3,7 +3,7 @@
 
 #include "plume/catalog/plume_remote.hpp"
 #include "plume/dandelion/api.hpp"
-#include "plume/memory/adapter.hpp"
+#include "plume/dandelion/composition.hpp"
 #include "plume/parser/compile.hpp"
 
 #include <cpr/cpr.h>
@@ -45,9 +45,6 @@ std::string Trim(const std::string &s) {
     return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
 }
 
-// The SQL expression a `[table]` placeholder resolves to for `source`: a single
-// quoted URL for an un-split table, or a bracket-list of quoted URLs for a table
-// split into N files.
 std::string SourceExpr(const std::string &table, const DataSource &source) {
     auto it = source.num_files.find(table);
     const std::string base = source.path_prefix + "/" + table + "/" + table;
@@ -66,7 +63,6 @@ std::string SourceExpr(const std::string &table, const DataSource &source) {
     return expr;
 }
 
-// Replace every `[table]` placeholder in `sql` with its resolved source expression.
 std::string ResolvePlaceholders(const std::string &sql, const DataSource &source) {
     std::string out;
     out.reserve(sql.size());
@@ -91,21 +87,38 @@ std::string QueryStem(const std::string &query_file) {
     return fs::path(query_file).stem().string();
 }
 
-int64_t MillisSince(std::chrono::steady_clock::time_point start) {
-    auto now = std::chrono::steady_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-}
-
 } // namespace
 
 Runner::Runner(BenchmarkConfig config) : config_(std::move(config)), db_(nullptr), con_(db_),
         catalog_(std::make_shared<catalog::SourceCatalog>()) {
-    // Registered unconditionally (cheap — one catalog entry) so a plume_remote(...)
-    // call binds whether it comes from the query text itself or from
-    // DetectFileSources' rewrite of a [table]-resolved bare URL.
     auto registry = duckdb::make_shared_ptr<catalog::PlumeRemoteInfo>();
     registry->catalog = catalog_;
     catalog::RegisterPlumeRemote(con_, std::move(registry));
+}
+
+Result<void> Runner::Run() {
+    if (!config_.checksum_path.empty()) {
+        TRY(auto cf, ChecksumFile::FromJsonFile(config_.checksum_path));
+        checksum_file_ = std::move(cf);
+        LogInfo("Loaded checksums from '", config_.checksum_path, "'");
+    }
+
+    Result<void> status = Ok();
+    switch (config_.type) {
+    case BenchmarkConfig::Type::kSingle:
+        status = RunSingle(std::get<SingleConfig>(config_.bench));
+        break;
+    case BenchmarkConfig::Type::kThroughput:
+        status = RunThroughput(std::get<ThroughputConfig>(config_.bench));
+        break;
+    case BenchmarkConfig::Type::kTrace:
+        status = RunTrace(std::get<TraceConfig>(config_.bench));
+        break;
+    }
+
+    TRYV(ExportResults());
+
+    return status;
 }
 
 Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string &query_file,
@@ -125,11 +138,19 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
     LogDebug(" > compiling '", key, "' from '", sql_path, "'");
 
     auto start = std::chrono::steady_clock::now();
-    TRY(auto compiled, parser::CompileQuery(con_, *catalog_, sql, key, config_.converter_config));
+    TRY(auto compiled,
+        parser::CompileQuery(con_, *catalog_, sql, key, config_.converter_config, config_.fetcher_threads));
     TRY(auto body, dandelion::InvocationBody(compiled.composition, compiled.table_blocks,
-                                                     compiled.remote_info, compiled.remote_requests,
-                                                     /*is_registered=*/false));
-    int64_t planning_ms = MillisSince(start);
+                                             compiled.remote_info, compiled.remote_requests,
+                                             /*is_registered=*/false));
+
+    auto now = std::chrono::steady_clock::now();
+    int64_t planning_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+
+    if (config_.debug_prints) {
+        LogDebug("   compiled physical plan:\n===== PHYSICAL PLAN =====\n", 
+                 compiled.plan->ToString(), "===== PHYSICAL PLAN =====");
+    }
 
     Invocation inv;
     inv.name = key;
@@ -141,6 +162,7 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
             LogDebug("   no checksum configured for '", checksum_query, "'/'", checksum_scale_factor, "'");
         }
     }
+    inv.out_schema = compiled.plan->output_schema;
     size_t idx = invocations_.size();
     invocations_.push_back(std::move(inv));
     by_key_[key] = idx;
@@ -148,39 +170,7 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
     return idx;
 }
 
-// Decode one result set's blocks into header + rows of tab-joined cell strings.
-plume::Result<std::vector<std::string>> RenderSet(const dandelion::DataSetVec &sets) {
-    std::vector<std::string> lines;
-    bool wrote_header = false;
-    for (const auto &set : sets) {
-        for (const auto &block : set) {
-            // ImportBlockChunks mutates the buffer (varchar swizzle); copy first.
-            std::vector<uint8_t> buf = block.data;
-            plume::Schema schema;
-            TRY(auto chunks, plume::memory::ImportBlockChunks(buf.data(), buf.size(), schema));
-            if (!wrote_header) {
-                std::string header;
-                for (size_t c = 0; c < schema.columns.size(); c++) {
-                    header += (c ? "\t" : "") + schema.columns[c].name;
-                }
-                lines.push_back(header);
-                wrote_header = true;
-            }
-            for (auto &chunk : chunks) {
-                for (duckdb::idx_t r = 0; r < chunk->size(); r++) {
-                    std::string row;
-                    for (duckdb::idx_t c = 0; c < chunk->ColumnCount(); c++) {
-                        row += (c ? "\t" : "") + chunk->GetValue(c, r).ToString();
-                    }
-                    lines.push_back(row);
-                }
-            }
-        }
-    }
-    return lines;
-}
-
-Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp) {
+Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp, std::string *resp_string) {
     if (resp.error && resp.error.code != cpr::ErrorCode::OK) {
         return Error("dandelion request failed: " + resp.error.message, ErrorKind::Generic);
     }
@@ -188,18 +178,15 @@ Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp) {
         return Error("dandelion returned HTTP " + std::to_string(resp.status_code) + ": " + resp.text,
                      ErrorKind::Generic);
     }
+    Invocation &inv = invocations_[idx];
 
     dandelion::BinaryData resp_body(resp.text.begin(), resp.text.end());
     std::string timestamps;
-    TRY(auto sets, dandelion::ParseResponseBody(resp_body, &timestamps));
-    if (config_.debug_prints) {
-        TRY(auto lines, RenderSet(sets));
-        for (const auto &line : lines) {
-            std::cout << line << "\n";
-        }
+    if (resp_string) {
+        TRY(*resp_string, dandelion::ParseAndRenderResponseBody(resp_body, inv.out_schema));
     }
 
-    Invocation &inv = invocations_[idx];
+    TRY(auto sets, dandelion::ParseResponseBody(resp_body, &timestamps));
     if (inv.expected_checksum) {
         TRY(auto actual, ComputeChecksum(sets));
         if (!(actual == *inv.expected_checksum)) {
@@ -214,19 +201,8 @@ Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp) {
     return Ok();
 }
 
-Result<void> Runner::Invoke(size_t idx) {
-    Invocation &inv = invocations_[idx];
-    inv.num_invocations++;
-    cpr::Response resp = cpr::Post(
-        cpr::Url{DandelionUrl(config_.dandelion_url)},
-        cpr::Body{reinterpret_cast<const char *>(inv.body.data()), inv.body.size()},
-        cpr::Header{{"Content-Type", "application/octet-stream"}},
-        cpr::Timeout{std::chrono::milliseconds(config_.request_timeout_s * 1000)});
-    return HandleResponse(idx, resp);
-}
-
 Result<void> Runner::RunSingle(const SingleConfig &sc) {
-    // Build (and time the planning of) every query once.
+    LogInfo("Compiling queries...");
     for (const auto &qf : config_.queries) {
         const std::string stem = QueryStem(qf);
         auto idx = BuildInvocation(stem, qf, config_.source, stem, config_.scale_factor);
@@ -234,20 +210,30 @@ Result<void> Runner::RunSingle(const SingleConfig &sc) {
             std::cerr << "error: failed to compile '" << qf << "': " << idx.error().message() << "\n";
         }
     }
+
     if (config_.dandelion_url.empty()) {
-        LogInfo("No dandelionUrl set —> compiled only, skipping invocation.");
+        LogInfo("No dandelion url set —> compiled only, skipping invocation.");
         return Ok();
     }
-
     for (size_t r = 0; r < sc.repetitions; r++) {
         LogInfo("Round ", (r + 1), "/", sc.repetitions);
         for (size_t idx = 0; idx < invocations_.size(); idx++) {
             std::cout << " > " << invocations_[idx].name << std::flush;
-            auto status = Invoke(idx);
+            Invocation &inv = invocations_[idx];
+            inv.num_invocations++;
+            cpr::Response resp = cpr::Post(
+                cpr::Url{DandelionUrl(config_.dandelion_url)},
+                cpr::Body{reinterpret_cast<const char *>(inv.body.data()), inv.body.size()},
+                cpr::Header{{"Content-Type", "application/octet-stream"}},
+                cpr::Timeout{std::chrono::milliseconds(config_.request_timeout_s * 1000)});
+
+            std::string result_str;
+            auto status = HandleResponse(idx, resp, config_.debug_prints ? &result_str : nullptr);
             if (status.is_error()) {
                 std::cout << " -> ERROR: " << status.error().message() << "\n";
             } else {
                 std::cout << " -> " << invocations_[idx].latencies_ms.back() << " ms\n";
+                LogDebug("   Result:\n", std::move(result_str));
             }
         }
     }
@@ -255,10 +241,11 @@ Result<void> Runner::RunSingle(const SingleConfig &sc) {
 }
 
 Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
+    LogInfo("Compiling queries...");
     const std::string stem = QueryStem(tc.query);
     TRY(size_t idx, BuildInvocation(stem, tc.query, config_.source, stem, config_.scale_factor));
     if (config_.dandelion_url.empty()) {
-        LogInfo("No dandelionUrl set —> compiled only, skipping invocation.");
+        LogInfo("No dandelion url set —> compiled only, skipping invocation.");
         return Ok();
     }
 
@@ -339,10 +326,11 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
 }
 
 Result<void> Runner::RunTrace(const TraceConfig &trc) {
+    LogInfo("Loading trace...");
     TRY(auto trace, LoadTrace(trc.path));
     LogInfo("Trace: ", trace.size(), " entries from '", trc.path, "'");
 
-    // Pre-compile every unique (query, scale factor) pair the trace references.
+    LogInfo("Compiling queries...");
     std::vector<size_t> entry_idx(trace.size(), SIZE_MAX);
     for (size_t i = 0; i < trace.size(); i++) {
         const auto &e = trace[i];
@@ -360,7 +348,7 @@ Result<void> Runner::RunTrace(const TraceConfig &trc) {
         entry_idx[i] = idx.unwrap();
     }
     if (config_.dandelion_url.empty()) {
-        LogInfo("No dandelionUrl set —> compiled only, skipping invocation.");
+        LogInfo("No dandelion url set —> compiled only, skipping invocation.");
         return Ok();
     }
 
@@ -526,9 +514,7 @@ Result<void> Runner::ExportResults() {
         return Error("Could not create results dir '" + config_.results_prefix + "': " + ec.message());
     }
 
-    // timings.txt — one line per query: "Query <name>: l1,l2,...". When an
-    // invocation spans multiple runs (e.g. a throughput rps sweep), latencies
-    // are instead grouped one line per run under the query's header line.
+    // timings.txt
     {
         std::ofstream f(config_.results_prefix + "/timings.txt", std::ios::trunc);
         for (const auto &inv : invocations_) {
@@ -553,14 +539,16 @@ Result<void> Runner::ExportResults() {
             }
         }
     }
-    // planning.txt — one line per query: "Query <name>: <planning_ms>".
+
+    // planning.txt
     {
         std::ofstream f(config_.results_prefix + "/planning.txt", std::ios::trunc);
         for (const auto &inv : invocations_) {
             f << "Query " << inv.name << ": " << inv.planning_ms << "\n";
         }
     }
-    // timestamps.txt — the dandelion timestamps returned per invocation.
+
+    // timestamps.txt
     {
         std::ofstream f(config_.results_prefix + "/timestamps.txt", std::ios::trunc);
         for (const auto &inv : invocations_) {
@@ -572,32 +560,9 @@ Result<void> Runner::ExportResults() {
             f << "\n]\n";
         }
     }
+
     LogInfo("Wrote timings.txt, planning.txt, timestamps.txt to ", config_.results_prefix);
     return Ok();
-}
-
-Result<void> Runner::Run() {
-    if (!config_.checksum_path.empty()) {
-        TRY(auto cf, ChecksumFile::FromJsonFile(config_.checksum_path));
-        checksum_file_ = std::move(cf);
-        LogInfo("Loaded checksums from '", config_.checksum_path, "'");
-    }
-
-    Result<void> status = Ok();
-    switch (config_.type) {
-    case BenchmarkConfig::Type::kSingle:
-        status = RunSingle(std::get<SingleConfig>(config_.bench));
-        break;
-    case BenchmarkConfig::Type::kThroughput:
-        status = RunThroughput(std::get<ThroughputConfig>(config_.bench));
-        break;
-    case BenchmarkConfig::Type::kTrace:
-        status = RunTrace(std::get<TraceConfig>(config_.bench));
-        break;
-    }
-    // Export whatever was collected even if the run reported an error.
-    TRYV(ExportResults());
-    return status;
 }
 
 } // namespace plume::bench

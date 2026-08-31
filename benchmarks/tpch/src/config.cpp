@@ -11,7 +11,7 @@ namespace {
 
 using json = nlohmann::json;
 
-// Expand a leading `~` to $HOME (mirrors the old python runner's path handling).
+// Expand a leading `~` to $HOME.
 std::string ExpandHome(const std::string &p) {
     if (p.empty() || p[0] != '~') {
         return p;
@@ -23,8 +23,6 @@ std::string ExpandHome(const std::string &p) {
     return std::string(home) + p.substr(1);
 }
 
-// Read a DataSource out of an object carrying tablePathPrefix / tablePathSuffix /
-// tableNumFiles. Used both for the top-level source and for each trace scale factor.
 DataSource ParseDataSource(const json &obj) {
     DataSource src;
     if (obj.contains("tablePathPrefix")) {
@@ -91,6 +89,9 @@ Result<BenchmarkConfig> BenchmarkConfig::FromJsonFile(const std::string &path) {
         if (data.contains("filterPushdown")) {
             cfg.converter_config.filter_pushdown = data.at("filterPushdown").get<bool>();
         }
+        if (data.contains("optimizeRemoteFetching")) {
+            cfg.converter_config.optimize_remote_fetching = data.at("optimizeRemoteFetching").get<bool>();
+        }
         if (data.contains("maxSplits")) {
             cfg.converter_config.max_splits = data.at("maxSplits").get<uint32_t>();
         }
@@ -99,6 +100,9 @@ Result<BenchmarkConfig> BenchmarkConfig::FromJsonFile(const std::string &path) {
         }
         if (data.contains("maxRegionSize")) {
             cfg.converter_config.max_region_bytes = data.at("maxRegionSize").get<uint64_t>();
+        }
+        if (data.contains("fetcherThreads")) {
+            cfg.fetcher_threads = data.at("fetcherThreads").get<size_t>();
         }
 
         cfg.source = ParseDataSource(data);

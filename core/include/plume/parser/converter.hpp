@@ -29,8 +29,10 @@ struct ConverterConfig {
     // Enables filter pushdown into the reader, allowing the prepare function to prune row groups
     // based on statistics.
     bool filter_pushdown = true;
-    // Enablees two-phase aggregation: a partial aggregate in the producing stage + a final aggregate.
+    // Enables two-phase aggregation: a partial aggregate in the producing stage + a final aggregate.
     bool early_aggregation = true;
+    // Enables plan builder to optimize remote data fetching.
+    bool optimize_remote_fetching = true;
 
     // Upper limit on the number of output splits produced.
     uint32_t max_splits = 1;
@@ -48,9 +50,9 @@ struct ConverterConfig {
 class Converter {
 public:
     Converter(duckdb::Connection &con, const catalog::SourceCatalog &sources, ConverterConfig cfg)
-        : con_(con), catalog_(sources), cfg_(cfg) {}
+        : con_(con), catalog_(sources), cfg_(cfg), builder_(PlanBuilder(cfg.optimize_remote_fetching)) {}
 
-    Result<PhysicalPlan> Convert(duckdb::LogicalOperator &root);
+    Result<std::unique_ptr<PhysicalPlan>> Convert(duckdb::LogicalOperator &root);
 
 private:
     uint32_t SplitCount(uint64_t estimated_rows) const;
@@ -77,7 +79,7 @@ private:
     std::vector<PlanBuilder::SharedOpNode> delim_stack_;
 };
 
-Result<PhysicalPlan> BuildPhysicalPlan(duckdb::Connection &con, const std::string &sql,
-    const catalog::SourceCatalog &sources = {}, const ConverterConfig &config = {});
+Result<std::unique_ptr<PhysicalPlan>> BuildPhysicalPlan(duckdb::Connection &con, 
+    const std::string &sql, const catalog::SourceCatalog &sources = {}, const ConverterConfig &config = {});
 
 } // namespace plume::parser

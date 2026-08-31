@@ -20,6 +20,7 @@ struct AggregateSpec {
     std::vector<expr::ExprNode> arguments; // input expressions
     bool distinct = false;          // whether this aggregate is distinct (dedup before aggregation)
 
+    bool Equals(const AggregateSpec &other) const;
     void Serialize(duckdb::Serializer &s) const;
     static AggregateSpec Deserialize(duckdb::Deserializer &d);
 };
@@ -33,6 +34,7 @@ struct AggregateTemplate : OperatorTemplate {
         : OperatorTemplate(OpType::AGGREGATE)
         , aggregates(std::move(aggregates)), group_keys(std::move(group_keys)) {}
 
+    bool Equals(const OperatorTemplate &other) const override;
     void Serialize(duckdb::Serializer &s) const override;
 };
 

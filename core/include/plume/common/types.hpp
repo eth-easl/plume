@@ -55,6 +55,7 @@ struct Schema {
 
     size_t size() const { return columns.size(); }
 
+    bool Equals(const Schema &other) const;
     void Serialize(duckdb::Serializer &s) const;
     static Schema Deserialize(duckdb::Deserializer &d);
 };

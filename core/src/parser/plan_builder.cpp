@@ -17,7 +17,7 @@ namespace {
 PlanBuilder::SharedOpNode AddShuffle(PlanBuilder::SharedOpNode n, std::vector<uint32_t> key_columns, uint32_t num_splits) {
     // Make sure number of splits is at least set to one which indicates a shuffle.
     num_splits = num_splits == 0 ? 1 : num_splits;
-    
+
     if (n->CanSplit()) {
         n->key_columns = std::move(key_columns);
         n->num_splits = num_splits;
@@ -27,13 +27,11 @@ PlanBuilder::SharedOpNode AddShuffle(PlanBuilder::SharedOpNode n, std::vector<ui
         return n;
     }
 
-    if (n->num_splits > 0) {
-        // Need to insert new dummy node that only does the shuffle that's already assigned to
-        // the previous node.
+    if (!n->consumers.empty()) {
         auto prev_splitter = std::make_shared<PlanBuilder::OperatorNode>();
         prev_splitter->output_schema = n->output_schema;
         prev_splitter->key_columns = std::move(n->key_columns);
-        prev_splitter->num_splits = n->num_splits;
+        prev_splitter->num_splits = n->num_splits > 0 ? n->num_splits : 1;
         prev_splitter->sources[0] = n;
         n->num_splits = 0;
         for (auto &c : n->consumers) {
@@ -55,18 +53,54 @@ PlanBuilder::SharedOpNode AddShuffle(PlanBuilder::SharedOpNode n, std::vector<ui
     return new_splitter;
 }
 
+PlanBuilder::SharedOpNode FindEquivalentConsumer(const PlanBuilder::SharedOpNode &src,
+        const exec::OperatorTemplate &templ, const Schema &output_schema) {
+    for (auto &c : src->consumers) {
+        if (c->templ) {
+            if (c->templ->Equals(templ) && c->output_schema.Equals(output_schema)) {
+                return c;
+            }
+        } else if (auto found = FindEquivalentConsumer(c, templ, output_schema)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
 
-PlanBuilder::SharedOpNode PlanBuilder::Scan(std::shared_ptr<DataSource> data_src, Schema schema) {
+PlanBuilder::SharedOpNode PlanBuilder::Scan(std::shared_ptr<DataSource> data_src, Schema schema,
+        std::shared_ptr<std::vector<uint32_t>> pushed_projection, std::shared_ptr<expr::ExprNode> pushed_filter) {
+    bool use_registry = optimize_remote_fetching_ && data_src->IsRemote();
+    if (use_registry) {
+        std::optional<SharedOpNode> cached = RemoteRegistryLookup(data_src, pushed_projection, pushed_filter);
+        if (cached.has_value()) {
+            return cached.value();
+        }
+    }
+
     auto n = std::make_shared<PlanBuilder::OperatorNode>();
-    n->stage_idx = NewLeafStage(std::move(data_src), schema);
     n->output_schema = schema;
+    n->stage_idx = NewLeafStage(std::move(data_src), schema);
+    LeafStage *leaf_stage = LeafStageAt(n->stage_idx);
+    leaf_stage->projection = std::move(pushed_projection);
+    leaf_stage->pushed_filter = std::move(pushed_filter);
+
+    if (use_registry) {
+        // ignoring any error here
+        RemoteRegistryAdd(n);
+    }
+
     return n;
 }
 
 PlanBuilder::SharedOpNode PlanBuilder::After(PlanBuilder::SharedOpNode src,
         std::shared_ptr<exec::OperatorTemplate> templ, Schema output_schema) {
     if (!src->consumers.empty()) {
+        if (templ) {
+            auto equiv_consumer = FindEquivalentConsumer(src, *templ, output_schema);
+            if (equiv_consumer) { return equiv_consumer; }
+        }
         src = AddShuffle(std::move(src), {}, 1);
     }
     auto n = std::make_shared<PlanBuilder::OperatorNode>();
@@ -113,10 +147,10 @@ PlanBuilder::SharedOpNode PlanBuilder::Join(PlanBuilder::SharedOpNode probe_side
 }
 
 Stage *PlanBuilder::StageAt(size_t idx) {
-    if (idx >= plan_.stages.size()) {
+    if (idx >= plan_->stages.size()) {
         return nullptr;
     }
-    return plan_.stages[idx].get();
+    return plan_->stages[idx].get();
 }
 
 LeafStage *PlanBuilder::LeafStageAt(size_t idx) {
@@ -127,28 +161,28 @@ LeafStage *PlanBuilder::LeafStageAt(size_t idx) {
     return static_cast<LeafStage*>(s);
 }
 
-PhysicalPlan PlanBuilder::Export(PlanBuilder::SharedOpNode root) {
+std::unique_ptr<PhysicalPlan> PlanBuilder::Export(PlanBuilder::SharedOpNode root) {
     size_t root_idx = MaterializeNode(root);
     Stage *root_stage = StageAt(root_idx);
-    plan_.root_idx = root_idx;
-    plan_.output_schema = root_stage->output_schema;
+    plan_->root_idx = root_idx;
+    plan_->output_schema = root_stage->output_schema;
     return std::move(plan_);
 }
 
 size_t PlanBuilder::NewStage(Schema input_schema) {
-    size_t idx = plan_.stages.size();
+    size_t idx = plan_->stages.size();
     auto s = std::make_unique<Stage>(StageType::COMMON, idx);
     s->pipeline.input_schema = std::move(input_schema);
-    plan_.stages.push_back(std::move(s));
+    plan_->stages.push_back(std::move(s));
     return idx;
 }
 
 size_t PlanBuilder::NewLeafStage(std::shared_ptr<DataSource> data_src, Schema input_schema) {
-    size_t idx = plan_.stages.size();
+    size_t idx = plan_->stages.size();
     auto s = std::make_unique<LeafStage>(idx);
     s->data_source = std::move(data_src);
     s->pipeline.input_schema = std::move(input_schema);
-    plan_.stages.push_back(std::move(s));
+    plan_->stages.push_back(std::move(s));
     return idx;
 }
 
@@ -172,32 +206,72 @@ size_t PlanBuilder::MaterializeNode(SharedOpNode node) {
 
     size_t cur_id;
     if (node->sources[0]->num_splits > 0) {
-        plan_.stages[left_id]->pipeline.output_split =
+        plan_->stages[left_id]->pipeline.output_split =
             make_split(node->sources[0]->key_columns, node->sources[0]->num_splits);
-        Schema left_out = plan_.stages[left_id]->output_schema;
+        Schema left_out = plan_->stages[left_id]->output_schema;
         cur_id = NewStage(left_out);
-        Stage *cur = plan_.stages[cur_id].get();
+        Stage *cur = plan_->stages[cur_id].get();
         cur->input_stages.push_back(left_id);
         cur->output_schema = node->output_schema;
     } else {
         cur_id = left_id;
-        plan_.stages[cur_id]->output_schema = node->output_schema;
+        plan_->stages[cur_id]->output_schema = node->output_schema;
     }
 
     if (right_id != kUnmaterialized) {
-        plan_.stages[right_id]->pipeline.output_split =
+        plan_->stages[right_id]->pipeline.output_split =
             make_split(node->sources[1]->key_columns, node->sources[1]->num_splits);
-        Stage *cur = plan_.stages[cur_id].get();
+        Stage *cur = plan_->stages[cur_id].get();
         cur->type = StageType::JOIN;
         cur->input_stages.push_back(right_id);
     }
 
     if (node->templ) {
-        plan_.stages[cur_id]->pipeline.operators.push_back(node->templ);
+        plan_->stages[cur_id]->pipeline.operators.push_back(node->templ);
     }
     node->stage_idx = cur_id;
 
     return cur_id;
+}
+
+Result<void> PlanBuilder::RemoteRegistryAdd(SharedOpNode node) {
+    LeafStage *leaf_stage = LeafStageAt(node->stage_idx);
+    if (!leaf_stage) {
+        return Error("Invalid stage_idx.", ErrorKind::InvalidInput);
+    }
+    remote_registry_.insert({leaf_stage->data_source->name, std::move(node)});
+    return Ok();
+}
+
+std::optional<PlanBuilder::SharedOpNode> PlanBuilder::RemoteRegistryLookup(std::shared_ptr<catalog::DataSource> data_src,
+        std::shared_ptr<std::vector<uint32_t>> projection, std::shared_ptr<expr::ExprNode> filter) {
+    auto same_projection = [](const std::shared_ptr<std::vector<uint32_t>> &a,
+                              const std::shared_ptr<std::vector<uint32_t>> &b) {
+        if (a == b) return true; // covers pointer identity and both-nullptr
+        if (!a || !b) return false;
+        return *a == *b;
+    };
+    auto same_filter = [](const std::shared_ptr<expr::ExprNode> &a, const std::shared_ptr<expr::ExprNode> &b) {
+        if (a == b) return true; // covers pointer identity and both-nullptr
+        if (!a || !b) return false;
+        return a->Equals(*b);
+    };
+
+    auto [begin, end] = remote_registry_.equal_range(data_src->name);
+    for (auto it = begin; it != end; it++) {
+        LeafStage *leaf_stage = LeafStageAt(it->second->stage_idx);
+        if (!leaf_stage || leaf_stage->data_source != data_src) {
+            continue;
+        }
+        if (!same_projection(leaf_stage->projection, projection)) {
+            continue;
+        }
+        if (!same_filter(leaf_stage->pushed_filter, filter)) {
+            continue;
+        }
+        return it->second;
+    }
+    return std::nullopt;
 }
 
 } // namespace plume::parser

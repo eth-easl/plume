@@ -19,6 +19,7 @@ plume_add_test(test_top_n             test_top_n.cpp)
 plume_add_test(test_runner            test_runner.cpp)
 plume_add_test(test_large_input       test_large_input.cpp)
 plume_add_test(test_streaming         test_streaming.cpp)
+plume_add_test(test_plan_builder      test_plan_builder.cpp)
 
 # Runner (runner.hpp/.cpp): the noexcept host-boundary entry point. No
 # production caller drives the host boundary this way (that lives in
