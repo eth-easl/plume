@@ -193,6 +193,23 @@ TEST_CASE("structure: decimal aggregate decompositions build (pre-aggregate on a
     }
 }
 
+// avg(DECIMAL) must come out correctly scaled even without pre-aggregation. The
+// single-phase aggregate resolves DuckDB's native decimal avg via the physical
+// storage-type fallback in ResolveAggregateFunction, which needs an
+// AverageDecimalBindData (the decimal's scale) at Finalize time; Plume's aggregate
+// operator never runs DuckDB's bind step (a null AggregateInputData), so without
+// special-casing this the result comes back unscaled (10^scale too large).
+TEST_CASE("e2e: decimal avg (pre-aggregate on and off)") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE li(flag VARCHAR, qty DECIMAL(15,2))");
+    con.Query("INSERT INTO li VALUES ('A', 17.50), ('A', 22.00), ('A', 8.25), "
+              "('B', 5.00), ('B', 100.00)");
+    const char *sql = "SELECT flag, avg(qty), sum(qty), count(*) FROM li GROUP BY flag";
+    ExpectMatch(con, sql, /*ordered=*/false, {}, /*pre_aggregate=*/true);
+    ExpectMatch(con, sql, /*ordered=*/false, {}, /*pre_aggregate=*/false);
+}
+
 // count(*) references no column; DuckDB keeps a dummy column for it, but Plume's
 // pre-aggregation makes it a partial count so nothing extra crosses the shuffle.
 TEST_CASE("e2e: count(*) over a join, group by (pre-aggregate on and off)") {

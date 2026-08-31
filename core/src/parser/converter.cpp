@@ -428,6 +428,15 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggre
 
     // single-phase aggregate (no early-aggregation)
     if (!two_phase) {
+        // AVG on a DECIMAL requires a AverageDecimalBindData to descale its result. Since we always
+        // use a null bind_data we sidestep this issue by casting to a DOUBLE.
+        for (auto &spec : aggs) {
+            if (spec.func_name == "avg" && spec.arguments.size() == 1 &&
+                spec.arguments[0].return_type.id == TypeId::DECIMAL) {
+                spec.arguments[0] =
+                    expr::ExprNode::Cast(std::move(spec.arguments[0]), ColumnType{TypeId::DOUBLE}, /*try_cast=*/false);
+            }
+        }
         std::vector<uint32_t> split_keys;
         uint32_t partitions = 1;
         bool bare_columns = num_groups > 0;
