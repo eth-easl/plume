@@ -29,7 +29,7 @@ jobs:
     - run: ./scripts/build_client.sh
     - name: upload client
       shell: bash
-      run: gh release upload client build/plume/benchmarks/tpch/plume_bench --clobber
+      run: gh release upload client build/plume/benchmarks/plume_bench --clobber
       env:
         GH_REPO: ${{ github.repository }}
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

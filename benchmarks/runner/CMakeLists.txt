@@ -9,3 +9,5 @@ add_executable(plume_bench
 target_include_directories(plume_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(plume_bench PRIVATE plume cpr::cpr nlohmann_json::nlohmann_json)
 target_link_options(plume_bench PRIVATE -static-libgcc -static-libstdc++)
+set_target_properties(plume_bench PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/..)
