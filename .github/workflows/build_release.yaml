@@ -1,0 +1,63 @@
+name: Build release
+
+# Builds a new, immutable release whenever a version tag (v1.0, v2.3.1, ...) is pushed. 
+# Refuses to run if a release for that tag already exists.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  create_release:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v3
+    - name: verify the tag doesn't already have a release, then create it
+      shell: bash
+      run: |
+        if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          echo "::error::Release '$GITHUB_REF_NAME' already exists — refusing to overwrite a tagged release."
+          exit 1
+        fi
+        gh release create "$GITHUB_REF_NAME" \
+          --title "Plume $GITHUB_REF_NAME" \
+          --notes "Release build for tag $GITHUB_REF_NAME."
+      env:
+        GH_REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build_operators:
+    needs: create_release
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v3
+    - run: sudo apt install lld
+    - run: ./scripts/build_dandelion.sh
+    - name: upload operators
+      shell: bash
+      run: gh release upload "$GITHUB_REF_NAME" build_dandelion/functions/plume_* --clobber
+      env:
+        GH_REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build_client:
+    needs: create_release
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v3
+    - run: ./scripts/build_client.sh
+    - name: upload client binaries
+      shell: bash
+      run: |
+        gh release upload "$GITHUB_REF_NAME" \
+          build/plume/client/plume \
+          build/plume/client/plume_export \
+          build/plume/benchmarks/plume_bench \
+          --clobber
+      env:
+        GH_REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
