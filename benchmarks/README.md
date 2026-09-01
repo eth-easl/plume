@@ -7,7 +7,7 @@ binary.
 
 ```bash
 # run from build directory
-./benchmarks/tpch/plume_bench <path-to-config>
+./benchmarks/plume_bench <path-to-config>
 ```
 
 Multiple configs run in sequence. A config with no `dandelionUrl` compiles every query (planning time only) and skips invocation.
@@ -46,8 +46,8 @@ With `checksumFile` set, every result is checked against a precomputed, order-in
 Generate checksums offline, against the exact DuckDB version `external/duckdb` pins (`hash()` has no cross-version stability guarantee):
 
 ```bash
-pip install -r tpch/scripts/requirements.txt
-python3 tpch/scripts/generate_checksums.py tpch/config/local_single_sf10.json
+pip install -r runner/scripts/requirements.txt
+python3 runner/scripts/generate_checksums.py tpch/config/local_single_sf10.json
 ```
 
 ## Output

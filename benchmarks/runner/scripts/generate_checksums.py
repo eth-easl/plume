@@ -5,7 +5,7 @@ correctness.
 Runs each (query, scale factor) combination named by one or more
 plume_bench-style config JSON files through a real DuckDB instance and
 computes, per row, the same `hash(col1, col2, ...)` DuckDB uses internally for
-joins/group-by (see benchmarks/tpch/src/checksum.hpp) — summed mod 2**64
+joins/group-by (see benchmarks/runner/src/checksum.hpp) — summed mod 2**64
 (order-independent) across all rows, paired with the row count. plume_bench
 computes the identical checksum from a query's dandelion result and compares.
 
