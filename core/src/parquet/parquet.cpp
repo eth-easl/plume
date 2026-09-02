@@ -13,6 +13,7 @@ void ParquetConfig::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(103, "has_pushed_filter", has_pushed_filter);
     s.WriteProperty(104, "pushed_filter", pushed_filter);
     s.WriteProperty(105, "max_region_size", max_region_size);
+    s.WriteProperty(106, "dynamic_filter_column", dynamic_filter_column);
 }
 
 ParquetConfig ParquetConfig::Deserialize(duckdb::Deserializer &d) {
@@ -25,6 +26,7 @@ ParquetConfig ParquetConfig::Deserialize(duckdb::Deserializer &d) {
     c.has_pushed_filter = d.ReadProperty<bool>(103, "has_pushed_filter");
     c.pushed_filter = d.ReadProperty<expr::ExprNode>(104, "pushed_filter");
     c.max_region_size = d.ReadProperty<uint64_t>(105, "max_region_size");
+    c.dynamic_filter_column = d.ReadPropertyWithExplicitDefault<int32_t>(106, "dynamic_filter_column", -1);
     return c;
 }
 

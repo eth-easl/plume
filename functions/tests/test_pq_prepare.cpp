@@ -6,6 +6,7 @@
 #include "test_util.hpp"
 
 #include "plume/common/serial.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/expression/expression.hpp"
 #include "plume/functions/parquet.hpp"
 #include "plume/parquet/metadata.hpp"
@@ -16,6 +17,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -395,6 +397,134 @@ TEST_CASE("RowGroupMayMatch: comparison decisions against INT32 [min,max] stats"
     CHECK(may(ExpressionType::COMPARE_GREATERTHANOREQUALTO, 999)); // v >= 999
     CHECK(may(ExpressionType::COMPARE_EQUAL, 50));                 // v = 50, in range
     CHECK(may(ExpressionType::COMPARE_LESSTHAN, 0));               // v < 0, min -7
+}
+
+// --- dynamic filter (runtime row-group pruning) ----------------------------
+
+namespace {
+
+DataBuffer EncodeBounds(bool valid, duckdb::Value min, duckdb::Value max) {
+    exec::DynamicFilterBounds b;
+    b.valid = valid;
+    b.min = std::move(min);
+    b.max = std::move(max);
+    return SerializeToBuffer(b);
+}
+
+// Wires config/footer/url as usual (set 0/1/2); `dyn_filter`, if present, is wired as the
+// (optional, at most one item) dynamic filter input at set 3 -- nullopt leaves set 3 entirely
+// unwired, exercising the "caller doesn't know about it" (out-of-range) path.
+void RunprepareWithDynFilter(parquet::ParquetConfig cfg, DataBuffer footer, std::optional<DataBuffer> dyn_filter) {
+    mock::Reset();
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(SerializeToBuffer(cfg));
+        return v;
+    }());
+    mock::SetInput(1, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(std::move(footer));
+        return v;
+    }());
+    mock::SetInput(2, [&] {
+        std::vector<DataBuffer> v;
+        const char *url = "s3://b/f.parquet";
+        v.push_back(mock::MakeBuffer(url, std::char_traits<char>::length(url)));
+        return v;
+    }());
+    if (dyn_filter) {
+        std::vector<DataBuffer> v;
+        v.push_back(std::move(*dyn_filter));
+        mock::SetInput(3, std::move(v));
+    }
+    CHECK(fn::RunParquetPrepare().is_ok());
+}
+
+} // namespace
+
+TEST_CASE("pq_prepare: no dynamic filter input set behaves exactly as before") {
+    // EncodeStatsFooter's single INT32 column ("v"); set as the dynamic filter's target
+    // column, but set 3 is never wired -- must not error, must not prune.
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    RunprepareWithDynFilter(cfg, EncodeStatsFooter(), std::nullopt);
+    CHECK(mock::OutputsForSet(0).size() == 1);
+}
+
+TEST_CASE("pq_prepare: an explicitly empty dynamic filter set behaves as no filter") {
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    mock::Reset();
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(SerializeToBuffer(cfg));
+        return v;
+    }());
+    mock::SetInput(1, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(EncodeStatsFooter());
+        return v;
+    }());
+    mock::SetInput(2, [&] {
+        std::vector<DataBuffer> v;
+        const char *url = "s3://b/f.parquet";
+        v.push_back(mock::MakeBuffer(url, std::char_traits<char>::length(url)));
+        return v;
+    }());
+    mock::SetInput(3, std::vector<DataBuffer>{}); // set present, zero items
+    CHECK(fn::RunParquetPrepare().is_ok());
+    CHECK(mock::OutputsForSet(0).size() == 1);
+}
+
+TEST_CASE("pq_prepare: dynamic filter with invalid bounds is a no-op") {
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    RunprepareWithDynFilter(cfg, EncodeStatsFooter(), EncodeBounds(/*valid=*/false, Value(), Value()));
+    CHECK(mock::OutputsForSet(0).size() == 1);
+}
+
+TEST_CASE("pq_prepare: dynamic filter prunes a row group its range excludes") {
+    // EncodeStatsFooter's only row group has min=-7, max=999; a [2000,3000] dynamic
+    // range can't overlap it.
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
+                            EncodeBounds(true, Value::INTEGER(2000), Value::INTEGER(3000)));
+    CHECK(mock::OutputsForSet(0).empty());
+    CHECK(mock::OutputsForSet(1).empty());
+}
+
+TEST_CASE("pq_prepare: dynamic filter keeps a row group its range overlaps") {
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
+                            EncodeBounds(true, Value::INTEGER(-100), Value::INTEGER(100)));
+    CHECK(mock::OutputsForSet(0).size() == 1);
+}
+
+TEST_CASE("pq_prepare: dynamic filter still prunes alongside a (non-pruning) static filter") {
+    // Static filter alone (v > 0) keeps the row group (stats are [-7, 999]); the dynamic
+    // filter alone is provably empty ([2000, 3000]) -- the AND must still prune, i.e. the
+    // dynamic clause isn't dropped just because a static pushed_filter is also present.
+    parquet::ParquetConfig cfg;
+    cfg.has_pushed_filter = true;
+    cfg.pushed_filter = VCompare(duckdb::ExpressionType::COMPARE_GREATERTHAN, 0);
+    cfg.dynamic_filter_column = 0;
+    RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
+                            EncodeBounds(true, Value::INTEGER(2000), Value::INTEGER(3000)));
+    CHECK(mock::OutputsForSet(0).empty());
+}
+
+TEST_CASE("pq_prepare: static filter still prunes alongside a (non-pruning) dynamic filter") {
+    // Mirror of the above: static filter alone is provably empty (v > 2000), dynamic
+    // filter alone overlaps the stats -- the AND must still prune via the static clause.
+    parquet::ParquetConfig cfg;
+    cfg.has_pushed_filter = true;
+    cfg.pushed_filter = VCompare(duckdb::ExpressionType::COMPARE_GREATERTHAN, 2000);
+    cfg.dynamic_filter_column = 0;
+    RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
+                            EncodeBounds(true, Value::INTEGER(-100), Value::INTEGER(100)));
+    CHECK(mock::OutputsForSet(0).empty());
 }
 
 int main() { return plume_test::RunAll(); }

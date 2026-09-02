@@ -4,6 +4,8 @@
 #include "abi_mock.hpp"
 #include "test_util.hpp"
 
+#include "plume/common/serial.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/expression/expression.hpp"
@@ -305,6 +307,76 @@ TEST_CASE("SplitOutput: varchar heap gather round-trips") {
         }
     }
     CHECK(got == expected); // strings survive the heap gather intact
+}
+
+// --- dynamic filter build output --------------------------------------------
+
+TEST_CASE("plume_stage: emits dynamic filter bounds when the pipeline builds one") {
+    mock::Reset();
+    Allocator alloc;
+
+    // Pipeline: no row-shaping operators, just a DynamicFilterBuildTemplate over "amount"
+    // (column 1) -- a pure passthrough with the min/max side effect.
+    PipelineTemplate desc;
+    desc.input_schema = RegionAmount();
+    auto dyn_build = std::make_shared<DynamicFilterBuildTemplate>(/*column=*/1);
+    desc.operators = {dyn_build};
+    auto blob = plume::SerializePipeline(desc);
+
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(mock::MakeBuffer(blob.data(), blob.size()));
+        return v;
+    }());
+    mock::SetInput(1, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(MakeBlock(alloc, {1, 2, 1}, {100, 50, -5}));
+        return v;
+    }());
+
+    CHECK(fn::RunStage().is_ok());
+
+    auto dyn_outs = mock::OutputsForSet(1);
+    CHECK(dyn_outs.size() == 1);
+    auto bounds =
+        DeserializeFromBytes<DynamicFilterBounds>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
+    CHECK(bounds.valid);
+    CHECK(bounds.min == Value::INTEGER(-5));
+    CHECK(bounds.max == Value::INTEGER(100));
+
+    // The normal row output (set 0) is unaffected -- all 3 rows pass through unchanged.
+    int total = 0;
+    for (auto *out : mock::OutputsForSet(0)) {
+        Schema schema;
+        auto chunks = ImportBlockChunks(const_cast<uint8_t *>(out->buffer.data()), out->buffer.size(), schema).unwrap();
+        for (auto &c : chunks) {
+            total += c->size();
+        }
+    }
+    CHECK(total == 3);
+}
+
+TEST_CASE("plume_stage: no dynamic filter output when the pipeline builds none") {
+    mock::Reset();
+    Allocator alloc;
+
+    PipelineTemplate desc; // no operators at all
+    desc.input_schema = RegionAmount();
+    auto blob = plume::SerializePipeline(desc);
+
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(mock::MakeBuffer(blob.data(), blob.size()));
+        return v;
+    }());
+    mock::SetInput(1, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(MakeBlock(alloc, {1}, {10}));
+        return v;
+    }());
+
+    CHECK(fn::RunStage().is_ok());
+    CHECK(mock::OutputsForSet(1).empty());
 }
 
 int main() { return plume_test::RunAll(); }

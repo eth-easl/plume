@@ -26,6 +26,10 @@ struct ParquetConfig {
     bool has_pushed_filter = false;
     expr::ExprNode pushed_filter;
 
+    // Dynamic filter: file column index a runtime-computed DynamicFilterBounds input applies to.
+    // -1 means this scan doesn't take a dynamic filter.
+    int32_t dynamic_filter_column = -1;
+
     void Serialize(duckdb::Serializer &s) const;
     static ParquetConfig Deserialize(duckdb::Deserializer &d);
 };
