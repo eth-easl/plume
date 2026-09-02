@@ -2,6 +2,7 @@
 
 #include "plume/execution/operator.hpp"
 #include "plume/execution/operators/aggregate.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/operators/join.hpp"
 #include "plume/execution/operators/limit.hpp"
@@ -99,6 +100,12 @@ Result<void> Executor::Build(const PipelineTemplate &pipeline, std::unique_ptr<P
         case OpType::TOP_N: {
             auto top_n_templ = std::dynamic_pointer_cast<TopNTemplate>(op_templ);
             TRY(op, BuildTopNTemplate(top_n_templ, cur_types, alloc_));
+            // schema unchanged
+            break;
+        }
+        case OpType::DYNAMIC_FILTER_BUILD: {
+            auto dynamic_filter_templ = std::dynamic_pointer_cast<DynamicFilterBuildTemplate>(op_templ);
+            TRY(op, BuildDynamicFilterBuildTemplate(dynamic_filter_templ, cur_types));
             // schema unchanged
             break;
         }
@@ -201,6 +208,16 @@ Result<FilterOperator *> Executor::TakeLeadingScanFilter() {
     operators_.erase(operators_.begin());
     chain_head_ = ChainHead();
     return filter;
+}
+
+DynamicFilterBuildOperator *Executor::FindDynamicFilterBuild() const {
+    // assumes only one DynamicFilterBuildOperator in the pipeline
+    for (auto &op : operators_) {
+        if (auto *df = dynamic_cast<DynamicFilterBuildOperator *>(op.get())) {
+            return df;
+        }
+    }
+    return nullptr;
 }
 
 } // namespace plume::exec

@@ -1,6 +1,7 @@
 #include "plume/execution/operator.hpp"
 
 #include "plume/execution/operators/aggregate.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/operators/join.hpp"
 #include "plume/execution/operators/limit.hpp"
@@ -83,8 +84,14 @@ std::shared_ptr<OperatorTemplate> OperatorTemplate::DeserializeOperator(OpType t
         t->offset = d.ReadProperty<uint64_t>(103, "offset");
         return t;
     }
+    case OpType::DYNAMIC_FILTER_BUILD: {
+        auto t = std::make_shared<DynamicFilterBuildTemplate>();
+        t->type = type;
+        t->column = d.ReadProperty<uint32_t>(101, "column");
+        return t;
+    }
     default:
-        throw duckdb::InvalidInputException("Plume: unknown operator type %d in pipeline blob",
+        throw duckdb::InvalidInputException("Unknown operator type %d in pipeline blob",
                                             static_cast<int>(type));
     }
 }
