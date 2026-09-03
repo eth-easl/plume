@@ -3,6 +3,7 @@
 #include "test_util.hpp"
 
 #include "plume/catalog/catalog.hpp"
+#include "plume/catalog/parquet.hpp"
 #include "plume/catalog/plume_remote.hpp"
 #include "plume/dandelion/composition.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
@@ -128,11 +129,17 @@ duckdb::Connection MakeDb(duckdb::DuckDB &db) {
 
 // A resolved (schema + cardinality already set) fake REMOTE_PARQUET source, so tests can
 // exercise Converter's dynamic-filter attachment without a real remote fetch/resolve.
-struct FakeRemoteOrders : DataSource {
-    explicit FakeRemoteOrders(uint64_t card) : DataSource(DataSourceType::REMOTE_PARQUET) {
+struct FakeRemoteOrders : RemoteParquetDataSource {
+    explicit FakeRemoteOrders(uint64_t card) {
         name = "remote_orders";
         schema = Schema{{{"o_id", {TypeId::INT32}, false}, {"cust", {TypeId::INT32}, false}}};
         cardinality_total = card;
+        // Never actually parsed by these tests (Resolve() is stubbed out below), but
+        // BuildParquetPrepareInputs/BuildParquetStageInputs index into paths/footer_bytes
+        // 1:1, so they need to be present and the same size.
+        paths = {"fake://remote_orders.parquet"};
+        footer_bytes = {{0}};
+        metadata.push_back({});
     }
     Result<void> Resolve(const RemoteResolver &) override { return Ok(); }
 };
@@ -1004,6 +1011,39 @@ TEST_CASE("dynamic filter: attaches to an INNER join's build side, marks the rem
     // The producer -> consumer link is the reverse of the consumer -> producer one.
     CHECK(build_stage.ProducesDynFilter());
     CHECK(build_stage.dynamic_filter_consumer_stage == orders->idx);
+}
+
+// Regression test: the dynamic filter's build side above is a plain local table, so the
+// producing stage is a LOCAL_TABLE *leaf* stage, not a COMMON/JOIN one -- the common
+// case, not an edge case (a join's build side isn't restricted to any particular
+// stage type). BuildDandelionComposition must still bind that stage's dynFilter
+// output: every leaf-stage branch used to skip the ProducesDynFilter() check (only the
+// non-leaf branch did it), so plume_pq_prepare's `dynFilter = all dfltr_N` referenced a
+// variable nothing in the composition body ever produced.
+TEST_CASE("dynamic filter: producing leaf stage's dynFilter output is actually bound in the dsl") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
+    auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                       "JOIN customers c ON o.cust = c.cust")
+                    .unwrap();
+
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    CHECK(orders != nullptr);
+    CHECK(orders->HasDynFilter());
+    const Stage &build_stage = *plan->stages[orders->dynamic_filter_source_stage];
+    CHECK(build_stage.ProducesDynFilter());
+    CHECK(build_stage.IsLeaf()); // the case this regression test targets
+
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", ConverterConfig{}).unwrap();
+
+    const std::string dyn_var = "dfltr_" + std::to_string(build_stage.idx);
+    // plume_pq_prepare consumes it by name...
+    CHECK(Contains(comp.dsl, "dynFilter = all " + dyn_var));
+    // ...and the producing stage's own function application must actually bind it as an
+    // output, or the reference above is dangling.
+    CHECK(Contains(comp.dsl, dyn_var + " = dynFilter"));
+    // The function it's declared on must expose the output at all.
+    CHECK(Contains(comp.dsl, "=> (outData, dynFilter"));
 }
 
 TEST_CASE("dynamic filter: disabled via ConverterConfig -> leaf isn't marked") {

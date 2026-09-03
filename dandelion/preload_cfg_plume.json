@@ -15,7 +15,7 @@
         "binaryPath": "~/plume_functions/plume_pq_prepare",
         "metadata": {
             "inputSets": ["config", "footer", "url", "dynFilter"],
-            "outputSets": ["region", "chunkReq"]
+            "outputSets": ["region", "chunkReq", "stdio"]
         }
     },{
         "name": "plume_pq_stage",

@@ -53,23 +53,27 @@ std::string OutVar(int stage) { return "out_" + std::to_string(stage); }
 std::string DynFilterVar(int stage) { return "dfltr_" + std::to_string(stage); }
 
 struct DeclarationTracker {
-    bool using_http = false;  // -> the runtime-provided HTTP function (file fetches)
-    bool using_stage = false; // -> plume_stage (BLOCKS / join / compute stages)
-    bool using_csv = false;   // -> plume_csv_stage
-    bool using_pq = false;    // -> plume_pq_stage
+    bool using_http = false;    // -> the runtime-provided HTTP function (file fetches)
+    bool using_stage = false;   // -> plume_stage (BLOCKS / join / compute stages)
+    bool using_csv = false;     // -> plume_csv_stage
+    bool using_pq_prep = false; // -> plume_pq_prepare
+    bool using_pq = false;      // -> plume_pq_stage
 
     void AppendDeclarations(std::ostringstream &out) const {
         if (using_http) {
             out << "function HTTP (requests) => (headers, bodies);\n";
         }
         if (using_stage) {
-            out << "function plume_stage (template, inData, inData2) => (outData" EXTRA_OUT_SET ");\n";
+            out << "function plume_stage (template, inData, inData2) => (outData, dynFilter" EXTRA_OUT_SET ");\n";
         }
         if (using_csv) {
-            out << "function plume_csv_stage (template, chunkInfo, inBuffers) => (outData" EXTRA_OUT_SET ");\n";
+            out << "function plume_csv_stage (template, chunkInfo, inBuffers) => (outData, dynFilter" EXTRA_OUT_SET ");\n";
+        }
+        if (using_pq_prep) {
+            out << "function plume_pq_prepare (config, footer, url, dynFilter) => (region, chunkReq" EXTRA_OUT_SET ");\n";
         }
         if (using_pq) {
-            out << "function plume_pq_stage (template, regionInfo, inBuffers) => (outData" EXTRA_OUT_SET ");\n";
+            out << "function plume_pq_stage (template, regionInfo, inBuffers) => (outData, dynFilter" EXTRA_OUT_SET ");\n";
         }
     }
 };
@@ -87,6 +91,9 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
     auto add_input = [&comp, &comp_input](DataItemVec &&set, const std::string &in_name) {
         comp.in_sets.push_back(set);
         comp_input << in_name << ", ";
+    };
+    auto dyn_filter_output = [](const parser::Stage &s) -> std::string {
+        return s.ProducesDynFilter() ? ", " + DynFilterVar(static_cast<int>(s.idx)) + " = dynFilter" : "";
     };
     for (const auto &stage : plan.stages) {
         std::string st_var = StageTemplVar(stage->idx);
@@ -109,7 +116,8 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
                 add_input(std::move(materialized), data_var);
 
                 fappls << "  plume_stage (template = all " << st_var << ", inData = keyed "
-                       << data_var << ") => (" << OutVar(stage->idx) << " = outData);\n";
+                       << data_var << ") => (" << OutVar(stage->idx) << " = outData"
+                       << dyn_filter_output(*stage) << ");\n";
                 break;
             }
             case DataSourceType::REMOTE_PARQUET:
@@ -125,6 +133,7 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
 
                     auto pq_src = std::static_pointer_cast<RemoteParquetDataSource>(leaf_stage->data_source);
                     if (leaf_stage->HasDynFilter()) {
+                        dt.using_pq_prep = true;
                         std::string cfg_var = "cfg_" + std::to_string(stage->idx);
                         std::string footer_var = "ftr_" + std::to_string(stage->idx);
                         std::string url_var = "url_" + std::to_string(stage->idx);
@@ -149,8 +158,8 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
 
                     fappls << "  HTTP (requests = each " << req_var << ") => (" << data << " = bodies);\n";
                     fappls << "  plume_pq_stage (template = all " << st_var << ", regionInfo = keyed " << info_var
-                           << ", inBuffers = keyed " << data << ") => (" << OutVar(stage->idx) 
-                           << " = outData) by regionInfo inner inBuffers;\n";
+                           << ", inBuffers = keyed " << data << ") => (" << OutVar(stage->idx)
+                           << " = outData" << dyn_filter_output(*stage) << ") by regionInfo inner inBuffers;\n";
                 } else {
                     dt.using_csv = true;
 
@@ -162,8 +171,8 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
 
                     fappls << "  HTTP (requests = each " << req_var << ") => (" << data << " = bodies);\n";
                     fappls << "  plume_csv_stage (template = all " << st_var << ", chunkInfo = keyed " << info_var
-                           << ", inBuffers = keyed " << data << ") => (" << OutVar(stage->idx) 
-                           << " = outData) by chunkInfo inner inBuffers;\n";
+                           << ", inBuffers = keyed " << data << ") => (" << OutVar(stage->idx)
+                           << " = outData" << dyn_filter_output(*stage) << ") by chunkInfo inner inBuffers;\n";
                 }
                 break;
             }
@@ -185,11 +194,7 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
                        << OutVar(stage->input_stages[1]);
             }
     
-            fappls << ") => (" << OutVar(stage->idx) << " = outData";
-            if (stage->ProducesDynFilter()) {
-                fappls << ", " << DynFilterVar(stage->idx) << " = dynFilter";
-            }
-            fappls << ")";
+            fappls << ") => (" << OutVar(stage->idx) << " = outData" << dyn_filter_output(*stage) << ")";
             if (stage->LeadsWithJoin() && in_parallel && in2_parallel) {
                 auto join_template = std::static_pointer_cast<exec::JoinTemplate>(stage->pipeline.operators[0]);
                 const char *join_strategy;
