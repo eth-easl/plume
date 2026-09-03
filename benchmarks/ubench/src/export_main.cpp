@@ -22,7 +22,7 @@ using namespace plume::parser;
 namespace {
 
 ubench::UbSourceKind MapKind(const Stage &stage) {
-    if (!stage.is_leaf()) {
+    if (!stage.IsLeaf()) {
         return ubench::UbSourceKind::STAGE_OUTPUT;
     }
     switch (static_cast<const LeafStage &>(stage).data_source->type) {
@@ -136,44 +136,76 @@ int main(int argc, char **argv) {
     plan.root_stage = static_cast<int32_t>(cq.plan->root_idx);
     plan.stages.reserve(cq.plan->stages.size());
 
-    // composition.{table,remote}_inputs, and CompileQuery's parallel materialized
-    // {table_blocks,remote_info,remote_requests}, are built by walking plan.stages
-    // in order and appending one entry per LOCAL_TABLE / REMOTE_* leaf stage
-    // encountered (see BuildDandelionComposition / CompileQuery in core) — replay
-    // that exact walk here to match each leaf stage back to its materialized data.
-    size_t table_idx = 0, remote_idx = 0;
+    // CompileQuery no longer hands back per-stage materialized data separately
+    // (table_blocks/remote_info/remote_requests) -- BuildDandelionComposition now
+    // materializes everything itself, interleaved into one flat comp.in_sets, in the
+    // exact order it walks plan.stages: one set per stage for its serialized pipeline
+    // template, then (for a leaf stage only) the sets for its materialized/precomputed
+    // source data. Replay that same walk here to pull each stage's data back out.
+    const auto &in_sets = cq.composition.in_sets;
+    size_t set_idx = 0;
+    // Pulls the next set off in_sets in walk order, or prints an error and returns
+    // nullptr if the composition ran out (a bug in this replay, or a mismatched core).
+    auto next_set = [&](const char *what, int32_t stage_id) -> const dandelion::DataItemVec * {
+        if (set_idx >= in_sets.size()) {
+            std::cerr << "ubench_export: missing " << what << " input set for stage " << stage_id << "\n";
+            return nullptr;
+        }
+        return &in_sets[set_idx++];
+    };
+
     for (const auto &stage : cq.plan->stages) {
         ubench::UbStage us;
         us.id = static_cast<int32_t>(stage->idx);
         us.source = MapKind(*stage);
         us.partitions = stage->pipeline.output_split.partitions == 0 ? 1 : stage->pipeline.output_split.partitions;
-        us.leads_with_join = stage->leads_with_join();
+        us.leads_with_join = stage->LeadsWithJoin();
         for (size_t up : stage->input_stages) {
             us.input_stages.push_back(static_cast<int32_t>(up));
         }
         us.pipeline_blob = SerializePipeline(stage->pipeline);
 
-        if (us.source == ubench::UbSourceKind::TABLE_BLOCKS) {
-            if (table_idx >= cq.table_blocks.size()) {
-                std::cerr << "ubench_export: no materialized blocks for stage " << us.id << "\n";
+        // The stage's own pipeline template set (BuildDandelionComposition pushes this
+        // for every stage, leaf or not).
+        if (!next_set("template", us.id)) {
+            return 1;
+        }
+
+        if (stage->IsLeaf()) {
+            const auto &leaf = static_cast<const LeafStage &>(*stage);
+            if (leaf.data_source->type == DataSourceType::LOCAL_TABLE) {
+                const auto *blocks = next_set("table blocks", us.id);
+                if (!blocks) {
+                    return 1;
+                }
+                for (const auto &blk : *blocks) {
+                    us.table_blocks.push_back(FromDataItem(blk));
+                }
+            } else if (leaf.data_source->type == DataSourceType::REMOTE_PARQUET && leaf.HasDynFilter()) {
+                // Runtime-dynamic-filter parquet leaves consume 3 sets (cfg/footer/url)
+                // and are prepared server-side via plume_pq_prepare at invocation time --
+                // there's no precomputed region/chunk-info for ubench to replay yet.
+                std::cerr << "ubench_export: stage " << us.id
+                          << " is a dynamic-filter parquet leaf, which ubench does not yet support\n";
                 return 1;
+            } else {
+                // REMOTE_PARQUET (no dynamic filter) or REMOTE_CSV: region/chunk-info,
+                // then the byte-range fetch requests.
+                const auto *info = next_set("source info", us.id);
+                if (!info) {
+                    return 1;
+                }
+                for (const auto &item : *info) {
+                    us.source_info.push_back(FromDataItem(item));
+                }
+                const auto *reqs = next_set("source requests", us.id);
+                if (!reqs) {
+                    return 1;
+                }
+                for (const auto &item : *reqs) {
+                    us.source_reqs.push_back(FromDataItem(item));
+                }
             }
-            for (const auto &blk : cq.table_blocks[table_idx]) {
-                us.table_blocks.push_back(FromDataItem(blk));
-            }
-            table_idx++;
-        } else if (us.source == ubench::UbSourceKind::CSV || us.source == ubench::UbSourceKind::PARQUET) {
-            if (remote_idx >= cq.remote_info.size() || remote_idx >= cq.remote_requests.size()) {
-                std::cerr << "ubench_export: no file inputs for source stage " << us.id << "\n";
-                return 1;
-            }
-            for (const auto &info : cq.remote_info[remote_idx]) {
-                us.source_info.push_back(FromDataItem(info));
-            }
-            for (const auto &req : cq.remote_requests[remote_idx]) {
-                us.source_reqs.push_back(FromDataItem(req));
-            }
-            remote_idx++;
         }
 
         plan.stages.push_back(std::move(us));

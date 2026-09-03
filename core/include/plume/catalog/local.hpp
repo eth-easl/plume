@@ -20,7 +20,7 @@ struct LocalTableDataSource : public DataSource {
 std::shared_ptr<DataSource> CreateTableSource(std::string name, Schema schema);
 
 Result<dandelion::DataItemVec> MaterializeTable(duckdb::Connection &con, const LocalTableDataSource &src,
-    const std::vector<uint32_t> *projection, const ExprNode *pushed_filter);
+    const std::vector<uint32_t> &projection, const ExprNode *pushed_filter);
 
 Result<void> LoadDataFile(duckdb::Connection &con, const std::string &table_name,
     const std::vector<std::string> &paths);

@@ -476,6 +476,35 @@ TEST_CASE("pq_prepare: an explicitly empty dynamic filter set behaves as no filt
     CHECK(mock::OutputsForSet(0).size() == 1);
 }
 
+TEST_CASE("pq_prepare: a dynamic filter set with more than one item is an error") {
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    mock::Reset();
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(SerializeToBuffer(cfg));
+        return v;
+    }());
+    mock::SetInput(1, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(EncodeStatsFooter());
+        return v;
+    }());
+    mock::SetInput(2, [&] {
+        std::vector<DataBuffer> v;
+        const char *url = "s3://b/f.parquet";
+        v.push_back(mock::MakeBuffer(url, std::char_traits<char>::length(url)));
+        return v;
+    }());
+    mock::SetInput(3, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(EncodeBounds(true, Value::INTEGER(0), Value::INTEGER(1)));
+        v.push_back(EncodeBounds(true, Value::INTEGER(0), Value::INTEGER(1)));
+        return v;
+    }());
+    CHECK(!fn::RunParquetPrepare().is_ok());
+}
+
 TEST_CASE("pq_prepare: dynamic filter with invalid bounds is a no-op") {
     parquet::ParquetConfig cfg;
     cfg.dynamic_filter_column = 0;

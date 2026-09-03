@@ -9,6 +9,15 @@
             "outputSets": ["outData", "stdio"]
         }
     },{
+        "name": "plume_pq_prepare",
+        "engineType": "Kvm",
+        "ctxSize": 134217728,
+        "binaryPath": "~/plume_functions/plume_pq_prepare",
+        "metadata": {
+            "inputSets": ["config", "footer", "url", "dynFilter"],
+            "outputSets": ["region", "chunkReq"]
+        }
+    },{
         "name": "plume_pq_stage",
         "engineType": "Kvm",
         "ctxSize": 1073741824,
@@ -24,7 +33,7 @@
         "binaryPath": "~/plume_functions/plume_stage",
         "metadata": {
             "inputSets": ["template", "inData", "inData2"],
-            "outputSets": ["outData", "stdio"]
+            "outputSets": ["outData", "dynFilter", "stdio"]
         }
     }],
     "compositions": []

@@ -37,13 +37,10 @@ Result<void> RunParquetPrepare() {
     const uint32_t num_splits = config.num_splits == 0 ? 1 : config.num_splits;
 
     std::optional<exec::DynamicFilterBounds> dyn_filter_bounds = std::nullopt;
-    auto maybe_dyn_filter_item = abi::GetInputSingleton(SET_IDX_IN_DYNAMIC_FILTER);
-    if (maybe_dyn_filter_item.is_ok()) {
-        auto dyn_filter_item = std::move(maybe_dyn_filter_item).unwrap();
+    TRY(auto dyn_filter_item, abi::GetOptionalInputSingleton(SET_IDX_IN_DYNAMIC_FILTER));
+    if (dyn_filter_item) {
         dyn_filter_bounds = std::make_optional(DeserializeFromBytes<exec::DynamicFilterBounds>(
-            dyn_filter_item.buffer.data(), dyn_filter_item.buffer.size()));
-    } else if (maybe_dyn_filter_item.error().kind() != ErrorKind::OutOfRange) {
-        return maybe_dyn_filter_item.error();
+            dyn_filter_item->buffer.data(), dyn_filter_item->buffer.size()));
     }
 
     TRY(auto footer_itms, abi::GetInputSet(SET_IDX_IN_FOOTER));

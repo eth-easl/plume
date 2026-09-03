@@ -155,7 +155,7 @@ Stage *PlanBuilder::StageAt(size_t idx) {
 
 LeafStage *PlanBuilder::LeafStageAt(size_t idx) {
     Stage *s = StageAt(idx);
-    if (!s || !s->is_leaf()) {
+    if (!s || !s->IsLeaf()) {
         return nullptr;
     }
     return static_cast<LeafStage*>(s);

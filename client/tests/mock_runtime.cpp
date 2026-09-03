@@ -164,7 +164,7 @@ uint32_t MockRuntime::ProducerPartitions(size_t stage_idx) const {
 }
 
 PartitionedBlocks MockRuntime::RunStage(const Stage &stage) {
-    if (stage.is_leaf()) {
+    if (stage.IsLeaf()) {
         const auto &leaf = static_cast<const LeafStage &>(stage);
         switch (leaf.data_source->type) {
         case DataSourceType::REMOTE_CSV:
@@ -188,7 +188,7 @@ PartitionedBlocks MockRuntime::InvokeBlockStage(const Stage &stage, const BlockS
     templ.push_back(mock::MakeBuffer(blob.data(), blob.size()));
     mock::SetInput(0, std::move(templ));
     mock::SetInput(1, AsBuffers(left));
-    if (stage.leads_with_join()) {
+    if (stage.LeadsWithJoin()) {
         mock::SetInput(2, AsBuffers(right));
     }
 
@@ -213,7 +213,7 @@ PartitionedBlocks MockRuntime::InvokeBlockStage(const Stage &stage, const BlockS
 PartitionedBlocks MockRuntime::RunBlockStage(const Stage &stage) {
     PartitionedBlocks out;
 
-    if (stage.is_leaf()) {
+    if (stage.IsLeaf()) {
         const auto &leaf = static_cast<const LeafStage &>(stage);
         auto it = provided_table_blocks_.find(stage.idx);
         BlockSet table = (it != provided_table_blocks_.end()) ? it->second : MaterializeTable(leaf);
@@ -223,10 +223,10 @@ PartitionedBlocks MockRuntime::RunBlockStage(const Stage &stage) {
 
     const PartitionedBlocks &lprod = stage_outputs_.at(stage.input_stages.at(0));
     const PartitionedBlocks *rprod =
-        stage.leads_with_join() ? &stage_outputs_.at(stage.input_stages.at(1)) : nullptr;
+        stage.LeadsWithJoin() ? &stage_outputs_.at(stage.input_stages.at(1)) : nullptr;
     const uint32_t parts = ProducerPartitions(stage.input_stages.at(0));
     const bool right_broadcast =
-        stage.leads_with_join() && ProducerPartitions(stage.input_stages.at(1)) <= 1;
+        stage.LeadsWithJoin() && ProducerPartitions(stage.input_stages.at(1)) <= 1;
 
     for (uint32_t p = 0; p < parts; p++) {
         BlockSet left = PartitionOf(lprod, p);

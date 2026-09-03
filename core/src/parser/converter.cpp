@@ -5,6 +5,7 @@
 #include "plume/catalog/plume_remote.hpp"
 #include "plume/common/result.hpp"
 #include "plume/execution/operators/aggregate.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/operators/join.hpp"
 #include "plume/execution/operators/limit.hpp"
@@ -152,11 +153,54 @@ std::pair<PlanBuilder::SharedOpNode, uint32_t> AppendColumn(PlanBuilder &builder
     return std::make_pair(builder.After(std::move(node), std::move(t), std::move(out)), new_idx);
 }
 
+std::optional<std::pair<LeafStage *, uint32_t>> TraceLeafFileColumn(PlanBuilder &builder,
+        const PlanBuilder::SharedOpNode &node, uint32_t col_idx) {
+    if (!node->templ) {
+        // Scan() immediately produces a leaf node unlike every other node, whose stage_idx stays 
+        // kUnmaterialized until Export().
+        LeafStage *leaf = builder.LeafStageAt(node->stage_idx);
+        if (!leaf) {
+            return std::nullopt; // not a remote-scan leaf (e.g. a materialized local table)
+        }
+        uint32_t file_idx = col_idx;
+        if (leaf->projection && !leaf->projection->empty()) {
+            if (col_idx >= leaf->projection->size()) {
+                return std::nullopt;
+            }
+            file_idx = (*leaf->projection)[col_idx];
+        }
+        return std::make_pair(leaf, file_idx);
+    }
+    if (dynamic_cast<exec::FilterTemplate *>(node->templ.get())) {
+        return TraceLeafFileColumn(builder, node->sources[0], col_idx); // passthrough, same columns
+    }
+    if (auto *proj = dynamic_cast<exec::ProjectionTemplate *>(node->templ.get())) {
+        if (col_idx >= proj->projections.size()) {
+            return std::nullopt;
+        }
+        const expr::ExprNode &e = proj->projections[col_idx];
+        if (e.kind != expr::ExprKind::REFERENCE) {
+            return std::nullopt; // a computed column -- can't trace a value back through it
+        }
+        return TraceLeafFileColumn(builder, node->sources[0], e.ref_index);
+    }
+    return std::nullopt; // anything else (join, aggregate, limit, sort, ...) -- not chased in v1
+}
+
 } // namespace
 
 Result<std::unique_ptr<PhysicalPlan>> Converter::Convert(duckdb::LogicalOperator &root) {
     TRY(auto root_node, Build(root));
     std::unique_ptr<PhysicalPlan> plan = builder_.Export(root_node);
+
+    // Dynamic filter build nodes only get a final stage_idx once Export() materializes the
+    // whole plan. Set both directions of the (producer stage <-> consumer leaf) link now.
+    for (auto &[build_node, leaf] : pending_dynamic_filters_) {
+        const uint32_t source_stage = static_cast<uint32_t>(build_node->stage_idx);
+        leaf->dynamic_filter_source_stage = source_stage;
+        plan->stages[source_stage]->dynamic_filter_consumer_stage = static_cast<uint32_t>(leaf->idx);
+    }
+
     return plan;
 
     // TODO: Refactor projections pruning unused columns.
@@ -623,6 +667,19 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
         }
         left_keys.push_back(lk);
         right_keys.push_back(rk);
+    }
+
+    if (cfg_.dynamic_filter && kind == exec::JoinKind::INNER && left_keys.size() == 1 &&
+        residual_conditions.empty() &&
+        static_cast<double>(right_card) <= static_cast<double>(left_card) * cfg_.dynamic_filter_selectivity_threshold) {
+        auto probe_leaf = TraceLeafFileColumn(builder_, left, left_keys[0]);
+        if (probe_leaf && probe_leaf->first->data_source->type == catalog::DataSourceType::REMOTE_PARQUET) {
+            auto dyn_templ = std::make_shared<exec::DynamicFilterBuildTemplate>(right_keys[0]);
+            Schema build_schema = right->output_schema; // passthrough: schema unchanged
+            right = builder_.After(std::move(right), std::move(dyn_templ), std::move(build_schema));
+            probe_leaf->first->dynamic_filter_column = static_cast<int32_t>(probe_leaf->second);
+            pending_dynamic_filters_.push_back({right, probe_leaf->first});
+        }
     }
 
     bool is_broadcast_join = false;

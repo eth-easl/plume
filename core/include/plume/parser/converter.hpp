@@ -33,6 +33,8 @@ struct ConverterConfig {
     bool early_aggregation = true;
     // Enables plan builder to optimize remote data fetching.
     bool optimize_remote_fetching = true;
+    // Enables attaching a runtime dynamic filter.
+    bool dynamic_filter = true;
 
     // Upper limit on the number of output splits produced.
     uint32_t max_splits = 1;
@@ -44,6 +46,9 @@ struct ConverterConfig {
 
     // Maximum gap to coalesce requests over.
     uint64_t coalesce_distance = 1 << 10;
+    // A dynamic filter is only attached when the build side's estimated cardinality is at
+    // most this fraction of the probe side's
+    double dynamic_filter_selectivity_threshold = 0.2;
 };
 
 // Converts a bound + optimized DuckDB logical plan into Plume PhysicalPlan.
@@ -77,6 +82,8 @@ private:
 
     std::map<uint64_t, PlanBuilder::SharedOpNode> cte_subs_;
     std::vector<PlanBuilder::SharedOpNode> delim_stack_;
+
+    std::vector<std::pair<PlanBuilder::SharedOpNode, LeafStage *>> pending_dynamic_filters_;
 };
 
 Result<std::unique_ptr<PhysicalPlan>> BuildPhysicalPlan(duckdb::Connection &con, 

@@ -1,4 +1,5 @@
 #include "plume/client/client.hpp"
+#include "plume/common/serial.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -75,15 +76,12 @@ void WriteText(const fs::path &path, const std::string &text) {
     f << text;
 }
 
-// Dumps one keyed set of items (block/region/request buffers) to files named
-// `var_K.ext`, returning the manifest entries describing them.
-json DumpItems(const fs::path &prefix, const std::string &var, const plume::dandelion::DataItemVec &items,
-               const char *ext) {
+json DumpItems(const fs::path &prefix, const std::string &name, const plume::dandelion::DataItemVec &items) {
     json files = json::array();
-    for (size_t k = 0; k < items.size(); k++) {
-        const std::string file = var + "_" + std::to_string(k) + "." + ext;
-        WriteBytes(prefix / file, items[k].data.data(), items[k].data.size());
-        files.push_back({{"file", file}, {"key", items[k].key}, {"identifier", items[k].identifier}});
+    for (size_t i = 0; i < items.size(); i++) {
+        const std::string file = name + "_" + std::to_string(i) + ".bin";
+        WriteBytes(prefix / file, items[i].data.data(), items[i].data.size());
+        files.push_back({{"file", file}, {"key", items[i].key}, {"identifier", items[i].identifier}});
     }
     return files;
 }
@@ -110,42 +108,29 @@ plume::Result<int> RunMain(int argc, char **argv) {
     json manifest;
     manifest["name"] = comp.name;
 
-    // Composition DSL.
+    // composition DSL
     WriteText(prefix / "composition.dwf", comp.dsl);
     manifest["composition"] = "composition.dwf";
 
-    // Per-stage pipeline templates.
-    for (const auto &st : comp.stage_templates) {
-        const std::string file = st.var + ".tmpl";
-        WriteBytes(prefix / file, st.buf.data(), st.buf.size());
-        manifest["stage_templates"].push_back({{"var", st.var}, {"file", file}});
-    }
+    // output schema
+    auto schema_buf = plume::SerializeToBuffer(compiled.output_schema);
+    WriteBytes(prefix / "schema.bin", schema_buf.data(), schema_buf.size());
+    manifest["schema"] = "schema.bin";
 
-    // Base-table block inputs (materialized data).
-    for (size_t i = 0; i < comp.table_inputs.size(); i++) {
-        const auto &ti = comp.table_inputs[i];
-        manifest["table_inputs"].push_back({{"var", ti.var},
-                                             {"source_table", ti.source->name},
-                                             {"blocks", DumpItems(prefix, ti.var, compiled.table_blocks[i], "blk")}});
+    // every composition input
+    TRY(auto names, plume::dandelion::ParseCompositionInputNames(comp));
+    if (names.size() != comp.in_sets.size()) {
+        return plume::Error("composition has " + std::to_string(comp.in_sets.size()) +
+                            " input set(s) but the dsl names " + std::to_string(names.size()),
+                            plume::ErrorKind::RuntimeError);
     }
-
-    // Remote (CSV/parquet) inputs: the client-precomputed region/chunk infos and the
-    // byte-range fetch requests the composition feeds to the stage + HTTP functions.
-    for (size_t i = 0; i < comp.remote_inputs.size(); i++) {
-        const auto &ri = comp.remote_inputs[i];
-        manifest["remote_inputs"].push_back(
-            {{"var_info", ri.var_info},
-             {"var_req", ri.var_req},
-             {"format", ri.source->type == plume::catalog::DataSourceType::REMOTE_PARQUET ? "PARQUET" : "CSV"},
-             {"paths", ri.source->paths},
-             {"info_items", DumpItems(prefix, ri.var_info, compiled.remote_info[i], "bin")},
-             {"req_items", DumpItems(prefix, ri.var_req, compiled.remote_requests[i], "bin")}});
+    for (size_t i = 0; i < comp.in_sets.size(); i++) {
+        manifest["inputs"].push_back({{"name", names[i]}, {"items", DumpItems(prefix, names[i], comp.in_sets[i])}});
     }
 
     WriteText(prefix / "manifest.json", manifest.dump(2));
 
-    printf("wrote composition '%s' (%zu stage(s), %zu table input(s), %zu remote input(s)) to %s\n",
-           comp.name.c_str(), comp.stage_templates.size(), comp.table_inputs.size(), comp.remote_inputs.size(),
+    printf("wrote composition '%s' (%zu input set(s)) to %s\n", comp.name.c_str(), comp.in_sets.size(),
            prefix.string().c_str());
     return 0;
 }

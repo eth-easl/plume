@@ -2,6 +2,7 @@
 
 #include "plume/catalog/catalog.hpp"
 #include "plume/catalog/remote_resolver.hpp"
+#include "plume/common/serial.hpp"
 #include "plume/dandelion/api.hpp"
 #include "plume/dandelion/s3.hpp"
 #include "plume/parquet/metadata.hpp"
@@ -121,6 +122,7 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
     if (schema.has_value()) return Ok();
 
     metadata.assign(paths.size(), parquet::FileMeta());
+    footer_bytes.assign(paths.size(), {});
     cardinalities.assign(paths.size(), 0);
     cardinality_total = 0;
 
@@ -142,6 +144,14 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
                 if (need > probe) {
                     TRY(tail, fetch.range(url, -need, need));
                     parsed = parquet::ParseFooter(tail.data(), tail.size());
+                }
+            } else if (parsed.is_ok()) {
+                // Trim the probe buffer down to exactly the footer (length + metadata + magic).
+                uint32_t meta_len = 0;
+                std::memcpy(&meta_len, tail.data() + tail.size() - 8, 4);
+                const size_t footer_start = tail.size() - 8 - static_cast<size_t>(meta_len);
+                if (footer_start > 0) {
+                    tail.erase(tail.begin(), tail.begin() + static_cast<std::ptrdiff_t>(footer_start));
                 }
             }
 
@@ -190,6 +200,7 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
             }
             cardinalities[i] = rows;
             metadata[i] = std::move(meta);
+            footer_bytes[i] = std::move(tail);
             return Ok();
         });
     }
@@ -243,7 +254,6 @@ Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource
         const uint32_t region_splits = i < rounding_files ? base_splits + 1: base_splits;
         auto regions = parquet::DefineRegions(meta, region_splits, coalesce_distance, projection, keep_row_groups, max_region_bytes);
 
-        
         for (size_t r = 0; r < regions.size(); r++) {
             const uint64_t key = region_key++;
             auto region_buf = regions[r].Serialize();
@@ -265,5 +275,33 @@ Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource
     }
     return out;
 }
+
+ParquetPrepareInputs BuildParquetPrepareInputs(const RemoteParquetDataSource &src,
+        std::vector<uint32_t> projection, const ExprNode *pushed_filter, int32_t dyn_filter_col,
+        uint32_t num_splits, uint64_t coalesce_distance, uint64_t max_region_bytes) {
+    ParquetPrepareInputs out;
+    parquet::ParquetConfig cfg;
+    cfg.num_splits = num_splits;
+    cfg.coalesce_distance = coalesce_distance;
+    cfg.max_region_size = max_region_bytes;
+    cfg.projection = std::move(projection);
+    if (pushed_filter) {
+        cfg.has_pushed_filter = true;
+        cfg.pushed_filter = *pushed_filter;
+    }
+    cfg.dynamic_filter_column = dyn_filter_col;
+    auto cfg_buf = SerializeToBuffer(cfg);
+    out.cfg.push_back({0, "config", dandelion::BinaryData(cfg_buf.data(), cfg_buf.data() + cfg_buf.size())});
+
+    for (uint64_t i = 0; i < src.footer_bytes.size(); i++) {
+        const auto &footer = src.footer_bytes[i];
+        out.footers.push_back({i, "footer", dandelion::BinaryData(footer.data(), footer.data() + footer.size())});
+        const std::string &url = src.paths[i];
+        out.urls.push_back({i, "url", dandelion::BinaryData(url.begin(), url.end())});
+    }
+
+    return out;
+}
+
 
 } // namespace plume::catalog

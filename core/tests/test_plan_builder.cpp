@@ -102,7 +102,7 @@ TEST_CASE("plan_builder: differing residual filters over a shared leaf fork into
     const Stage *leaf_stage = nullptr;
     int leaf_count = 0;
     for (auto &s : plan->stages) {
-        if (s->is_leaf()) {
+        if (s->IsLeaf()) {
             leaf_stage = s.get();
             leaf_count++;
         }
@@ -132,7 +132,7 @@ TEST_CASE("plan_builder: an identical residual filter over a shared leaf is dedu
     int leaf_count = 0;
     int filter_stage_count = 0;
     for (auto &s : plan->stages) {
-        if (s->is_leaf()) leaf_count++;
+        if (s->IsLeaf()) leaf_count++;
         if (s->pipeline.operators.size() == 1 &&
             dynamic_cast<FilterTemplate *>(s->pipeline.operators[0].get())) {
             filter_stage_count++;

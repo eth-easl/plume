@@ -154,6 +154,58 @@ Result<InputItem> GetInputItem(size_t set_idx, size_t item_idx) {
     return InputItem{std::move(buffer), itm.path, itm.key};
 }
 
+std::optional<std::vector<InputItem>> GetOptionalInputSet(size_t set_idx) {
+    if (set_idx >= g_inputs.size()) {
+        return std::nullopt;
+    }
+
+    std::vector<InputItem> out;
+    out.reserve(g_inputs[set_idx].size());
+    for (auto& itm : g_inputs[set_idx]) {
+        std::ifstream in_file(itm.path);
+        if (!in_file.good()) {
+            return std::nullopt;
+        }
+
+        in_file.seekg(0, std::ios::end);
+        size_t buf_size = in_file.tellg();
+        in_file.seekg(0, std::ios::beg);
+
+        DataBuffer buffer(buf_size);
+        in_file.read((char*)buffer.mutable_data(), buf_size);
+        
+        out.push_back(InputItem{std::move(buffer), itm.path, itm.key});
+    }
+
+    return std::make_optional(std::move(out));
+}
+
+Result<std::optional<InputItem>> GetOptionalInputSingleton(size_t set_idx) {
+    if (set_idx >= g_inputs.size()) {
+        return std::nullopt;
+    }
+    if (g_inputs[set_idx].size() == 0) {
+        return std::nullopt;
+    } else if (g_inputs[set_idx].size() > 1) {
+        return Error("Set with index " + std::to_string(set_idx) + " contains more than a single item.");
+    }
+
+    auto& itm = g_inputs[set_idx][0];
+    std::ifstream in_file(itm.path);
+    if (!in_file.good()) {
+        return Error("Failed to open file: " + itm.path);
+    }
+    
+    in_file.seekg(0, std::ios::end);
+    size_t buf_size = in_file.tellg();
+    in_file.seekg(0, std::ios::beg);
+
+    DataBuffer buffer(buf_size);
+    in_file.read((char*)buffer.mutable_data(), buf_size);
+    
+    return std::make_optional(InputItem{std::move(buffer), itm.path, itm.key});
+}
+
 void AddOutput(const std::string &ident, size_t set_idx, DataBuffer buffer, size_t key) {
     if (set_idx >= g_outputs.size()) {
         g_outputs.resize(set_idx+1, {});
