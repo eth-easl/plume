@@ -44,7 +44,6 @@ namespace {
 
 std::string StageTemplVar(int stage) { return "st_" + std::to_string(stage); }
 std::string TableInVar(int stage) { return "tin_" + std::to_string(stage); }
-std::string RemoteVar(int stage) { return "info_" + std::to_string(stage); }
 std::string RemoteInfoVar(int stage) { return "info_" + std::to_string(stage); }
 std::string RemoteReqVar(int stage) { return "req_" + std::to_string(stage); }
 std::string OutVar(int stage) { return "out_" + std::to_string(stage); }
