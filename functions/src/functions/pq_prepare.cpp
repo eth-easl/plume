@@ -13,20 +13,20 @@
 #include <string>
 #include <vector>
 
-/// The first input set (index 0) should have one item containing the parquet reading configuration.
+// The first input set (index 0) should have one item containing the parquet reading configuration.
 #define SET_IDX_IN_CONFIG 0
-/// The second input set (index 1) should have items containing the parquet footers which are
-/// expected to contain the entire metadata of the parquet.
+// The second input set (index 1) should have items containing the parquet footers which are
+// expected to contain the entire metadata of the parquet.
 #define SET_IDX_IN_FOOTER 1
-/// The third input set (index 2) should have items containing source urls of the parquet.
+// The third input set (index 2) should have items containing source urls of the parquet.
 #define SET_IDX_IN_URL 2
-/// The fourth input set (index 3) is optional and holds zero or one DynamicFilterBounds computed by
-/// an upstream stage's join build side.
+// The fourth input set (index 3) is optional and holds zero or one DynamicFilterBounds computed by
+// an upstream stage's join build side.
 #define SET_IDX_IN_DYNAMIC_FILTER 3
 
-/// The first output set (index 0) contains the region infos.
+// The first output set (index 0) contains the region infos.
 #define SET_IDX_OUT_REGION 0
-/// The second output set (index 1) contains the data chunk requests to load the data.
+// The second output set (index 1) contains the data chunk requests to load the data.
 #define SET_IDX_OUT_CHUNK_REQ 1
 
 namespace plume::fn {

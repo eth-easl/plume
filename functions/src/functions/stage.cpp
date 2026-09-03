@@ -11,17 +11,17 @@
 #include <cstdint>
 #include <vector>
 
-/// The first input set (index 0) should have one item containing the pipeline template.
+// The first input set (index 0) should have one item containing the pipeline template.
 #define SET_IDX_IN_PIPELINE_TEMPL 0
-/// The second input set (index 1) should have the items containing the data chunks.
+// The second input set (index 1) should have the items containing the data chunks.
 #define SET_IDX_IN_DATA_CHUNKS 1
-/// The third input set (index 2) should have the items containing the data chunks for the right
-/// side of the join.
+// The third input set (index 2) should have the items containing the data chunks for the right
+// side of the join.
 #define SET_IDX_IN_DATA_CHUNKS_RIGHT 2
 
-/// The first output set (index 0) contains the normal row output.
-/// The second output set (index 1) optionally contains a single serialized DynamicFilterBounds item,
-/// emitted only if the pipeline contains a DynamicFilterBuildTemplate operator.
+// The first output set (index 0) contains the normal row output.
+// The second output set (index 1) optionally contains a single serialized DynamicFilterBounds item,
+// emitted only if the pipeline contains a DynamicFilterBuildTemplate operator.
 #define SET_IDX_OUT_DYNAMIC_FILTER 1
 
 namespace plume::fn {

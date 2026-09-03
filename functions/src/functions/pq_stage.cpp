@@ -19,11 +19,11 @@
 #include <utility>
 #include <vector>
 
-/// The first input set (index 0) should have one item containing the pipeline template.
+// The first input set (index 0) should have one item containing the pipeline template.
 #define SET_IDX_IN_PIPELINE_TEMPL 0
-/// The second input set (index 1) should have items containing the region infos.
+// The second input set (index 1) should have items containing the region infos.
 #define SET_IDX_IN_REGION_INFO 1
-/// The third input set (index 2) should have items containing the resolved data chunk buffers.
+// The third input set (index 2) should have items containing the resolved data chunk buffers.
 #define SET_IDX_IN_DATA_CHUNKS 2
 
 namespace plume::fn {

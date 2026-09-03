@@ -16,9 +16,7 @@
 #include <memory>
 #include <sstream>
 
-// TODO: move to cmake config
-#define ENABLE_STDIO // uncomment to use function with stdio set registered (debugging)
-#ifdef ENABLE_STDIO
+#ifdef PLUME_DSL_STDIO
 # define EXTRA_OUT_SET ", stdio"
 #else
 # define EXTRA_OUT_SET

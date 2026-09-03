@@ -45,6 +45,10 @@ option(PLUME_WITH_TESTS       "Build the test suites"                          O
 
 # internals
 option(PLUME_RECYCLING_ALLOCATOR "Recycle small/short-lived allocations through a per-thread free-list pool instead of malloc/free" ON)
+option(PLUME_DSL_STDIO "Register the stdio output set on generated Dandelion function compositions (debugging)" ON)
+if(PLUME_DSL_STDIO)
+  add_compile_definitions(PLUME_DSL_STDIO)
+endif()
 set(PLUME_VERBOSE "0" CACHE STRING "Verbosity level (0 = off, higher = more verbose)")
 if(PLUME_VERBOSE GREATER 0)
   message(STATUS "Using Plume verbosity level: ${PLUME_VERBOSE}")
