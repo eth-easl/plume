@@ -65,6 +65,15 @@ Result<BenchmarkConfig> BenchmarkConfig::FromJsonFile(const std::string &path) {
         if (data.contains("dandelionUrl")) {
             cfg.dandelion_url = data.at("dandelionUrl").get<std::string>();
         }
+        const std::string invocation_mode = data.value("invocationMode", "sync");
+        if (invocation_mode == "sync") {
+            cfg.invocation_mode = BenchmarkConfig::InvocationMode::kSync;
+        } else if (invocation_mode == "async") {
+            cfg.invocation_mode = BenchmarkConfig::InvocationMode::kAsync;
+        } else {
+            return Error("Unknown invocationMode '" + invocation_mode + "' (expected sync|async).",
+                         ErrorKind::InvalidInput);
+        }
         if (data.contains("requestTimeout")) {
             cfg.request_timeout_s = data.at("requestTimeout").get<int>();
         }
@@ -152,6 +161,10 @@ Result<BenchmarkConfig> BenchmarkConfig::FromJsonFile(const std::string &path) {
             cfg.bench = trc;
         } else {
             return Error("Unknown benchmarkType '" + type + "' (expected single|throughput|trace).",
+                         ErrorKind::InvalidInput);
+        }
+        if (cfg.invocation_mode == InvocationMode::kAsync && cfg.type != Type::kSingle) {
+            return Error("invocationMode 'async' currently supports benchmarkType 'single' only.",
                          ErrorKind::InvalidInput);
         }
     } catch (const std::exception &e) {

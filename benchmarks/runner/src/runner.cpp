@@ -7,6 +7,7 @@
 #include "plume/parser/compile.hpp"
 
 #include <cpr/cpr.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -24,11 +25,23 @@ namespace plume::bench {
 
 namespace {
 
-std::string DandelionUrl(const std::string& base_url) {
+std::string UrlPath(const std::string &base_url, const std::string &path) {
     if (base_url.back() == '/') {
-        return base_url + "hot/matmul";
+        return base_url + path;
     }
-    return base_url + "/hot/matmul";
+    return base_url + "/" + path;
+}
+
+std::string DandelionUrl(const std::string &base_url) {
+    return UrlPath(base_url, "hot/matmul");
+}
+
+std::string AsyncSubmitUrl(const std::string &base_url) {
+    return UrlPath(base_url, "async/warm");
+}
+
+std::string AsyncResultUrl(const std::string &base_url, const std::string &invocation_id) {
+    return UrlPath(base_url, "async/invocation/" + invocation_id + "/result?wait=true");
 }
 
 bool IsIdent(const std::string &s) {
@@ -170,7 +183,9 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
     return idx;
 }
 
-Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp, std::string *resp_string) {
+Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp,
+                                    std::string *resp_string,
+                                    std::optional<int64_t> latency_ms) {
     if (resp.error && resp.error.code != cpr::ErrorCode::OK) {
         return Error("dandelion request failed: " + resp.error.message, ErrorKind::Generic);
     }
@@ -196,9 +211,96 @@ Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp, std::
         }
     }
 
-    inv.latencies_ms.push_back(static_cast<int64_t>(resp.elapsed * 1000.0));
+    inv.latencies_ms.push_back(latency_ms.value_or(static_cast<int64_t>(resp.elapsed * 1000.0)));
     inv.timestamps.push_back(std::move(timestamps));
     return Ok();
+}
+
+bool IsTransportError(const cpr::Response &resp) {
+    return resp.error && resp.error.code != cpr::ErrorCode::OK;
+}
+
+cpr::Timeout RequestTimeout(int timeout_s) {
+    return cpr::Timeout{std::chrono::milliseconds(timeout_s * 1000)};
+}
+
+std::chrono::steady_clock::time_point RecoverDeadline(int timeout_s) {
+    const auto cap = timeout_s > 0 ? std::chrono::seconds(timeout_s) : std::chrono::minutes(10);
+    return std::chrono::steady_clock::now() + cap;
+}
+
+void RecoverBackoff() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+}
+
+Result<void> Runner::Invoke(size_t idx, std::string *resp_string) {
+    Invocation &inv = invocations_[idx];
+    inv.num_invocations++;
+
+    if (config_.invocation_mode == BenchmarkConfig::InvocationMode::kAsync) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = RecoverDeadline(config_.request_timeout_s);
+        const auto timeout = RequestTimeout(config_.request_timeout_s);
+
+        cpr::Response accepted;
+        for (;;) {
+            accepted = cpr::Post(
+                cpr::Url{AsyncSubmitUrl(config_.dandelion_url)},
+                cpr::Body{reinterpret_cast<const char *>(inv.body.data()), inv.body.size()},
+                cpr::Header{{"Content-Type", "application/octet-stream"}},
+                timeout);
+            if (!IsTransportError(accepted) && accepted.status_code == 202) {
+                break;
+            }
+            if (!IsTransportError(accepted) || std::chrono::steady_clock::now() >= deadline) {
+                if (IsTransportError(accepted)) {
+                    return Error("async dandelion submission failed: " + accepted.error.message,
+                                 ErrorKind::Generic);
+                }
+                return Error("async dandelion submission returned HTTP " +
+                                 std::to_string(accepted.status_code) + ": " + accepted.text,
+                             ErrorKind::Generic);
+            }
+            std::cerr << "   retry async submit after transport error: " << accepted.error.message
+                      << std::endl;
+            RecoverBackoff();
+        }
+
+        std::string invocation_id;
+        try {
+            const auto body = nlohmann::json::from_bson(accepted.text.begin(), accepted.text.end());
+            invocation_id = body.at("invocation_id").get<std::string>();
+        } catch (const std::exception &e) {
+            return Error("failed to parse async submission response: " + std::string(e.what()),
+                         ErrorKind::Generic);
+        }
+
+        cpr::Response result;
+        for (;;) {
+            result = cpr::Get(cpr::Url{AsyncResultUrl(config_.dandelion_url, invocation_id)}, timeout);
+            if (!IsTransportError(result)) {
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return Error("async result GET failed after reconnect retries: " + result.error.message,
+                             ErrorKind::Generic);
+            }
+            std::cerr << "   retry GET invocation " << invocation_id
+                      << " after transport error: " << result.error.message << std::endl;
+            RecoverBackoff();
+        }
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count();
+        return HandleResponse(idx, result, resp_string, elapsed_ms);
+    }
+
+    cpr::Response resp = cpr::Post(
+        cpr::Url{DandelionUrl(config_.dandelion_url)},
+        cpr::Body{reinterpret_cast<const char *>(inv.body.data()), inv.body.size()},
+        cpr::Header{{"Content-Type", "application/octet-stream"}},
+        cpr::Timeout{std::chrono::milliseconds(config_.request_timeout_s * 1000)});
+    return HandleResponse(idx, resp, resp_string);
 }
 
 Result<void> Runner::RunSingle(const SingleConfig &sc) {
@@ -219,16 +321,8 @@ Result<void> Runner::RunSingle(const SingleConfig &sc) {
         LogInfo("Round ", (r + 1), "/", sc.repetitions);
         for (size_t idx = 0; idx < invocations_.size(); idx++) {
             std::cout << " > " << invocations_[idx].name << std::flush;
-            Invocation &inv = invocations_[idx];
-            inv.num_invocations++;
-            cpr::Response resp = cpr::Post(
-                cpr::Url{DandelionUrl(config_.dandelion_url)},
-                cpr::Body{reinterpret_cast<const char *>(inv.body.data()), inv.body.size()},
-                cpr::Header{{"Content-Type", "application/octet-stream"}},
-                cpr::Timeout{std::chrono::milliseconds(config_.request_timeout_s * 1000)});
-
             std::string result_str;
-            auto status = HandleResponse(idx, resp, config_.debug_prints ? &result_str : nullptr);
+            auto status = Invoke(idx, config_.debug_prints ? &result_str : nullptr);
             if (status.is_error()) {
                 std::cout << " -> ERROR: " << status.error().message() << "\n";
             } else {
@@ -479,7 +573,14 @@ Result<void> Runner::ExportResults() {
             std::cout << "\t-\t-\t-";
         }
         if (checksum_file_) {
-            std::cout << "\t" << (inv.num_invocations - inv.checksum_failures) << "/" << inv.num_invocations;
+            if (inv.expected_checksum) {
+                // A latency is recorded only after the HTTP response was parsed and
+                // its checksum matched, so transport/HTTP/parse errors must not be
+                // reported as successful checksum checks.
+                std::cout << "\t" << inv.latencies_ms.size() << "/" << inv.num_invocations;
+            } else {
+                std::cout << "\tn/a";
+            }
         }
         std::cout << "\n";
 

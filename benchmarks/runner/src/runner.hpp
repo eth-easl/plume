@@ -50,7 +50,11 @@ class Runner {
     Result<size_t> BuildInvocation(const std::string &key, const std::string &query_file, 
         const DataSource &source, const std::string &checksum_query, const std::string &checksum_scale_factor);
 
-    Result<void> HandleResponse(size_t idx, const cpr::Response &resp, std::string *resp_string = nullptr);
+    Result<void> Invoke(size_t idx, std::string *resp_string = nullptr);
+
+    Result<void> HandleResponse(size_t idx, const cpr::Response &resp,
+                                std::string *resp_string = nullptr,
+                                std::optional<int64_t> latency_ms = std::nullopt);
 
     Result<void> RunSingle(const SingleConfig &sc);
     Result<void> RunThroughput(const ThroughputConfig &tc);

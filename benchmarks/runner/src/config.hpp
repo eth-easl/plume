@@ -42,6 +42,7 @@ struct TraceConfig {
 
 struct BenchmarkConfig {
     enum class Type { kSingle, kThroughput, kTrace };
+    enum class InvocationMode { kSync, kAsync };
 
     // Parse + validate a config file. Expands leading `~` in path fields to $HOME.
     static Result<BenchmarkConfig> FromJsonFile(const std::string &path);
@@ -49,8 +50,9 @@ struct BenchmarkConfig {
     std::vector<std::string> queries; // .sql file names (relative to query_dir)
     std::string query_dir;            // directory holding the .sql files
     std::string dandelion_url;        // empty -> compile only (no invocation)
-    int request_timeout_s = 60;
-    std::string results_prefix;       // output dir for timings/timestamps/planning
+    InvocationMode invocation_mode = InvocationMode::kSync;
+    int request_timeout_s = 60;         // 0 disables the client-side timeout
+    std::string results_prefix; // output dir for timings/timestamps/planning
     bool debug_prints = false;
 
     // DataSource and scale-factor label for single/throughput modes.
