@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <numeric>
 #include <thread>
 
@@ -234,8 +235,13 @@ void RecoverBackoff() {
 }
 
 Result<void> Runner::Invoke(size_t idx, std::string *resp_string) {
-    Invocation &inv = invocations_[idx];
-    inv.num_invocations++;
+    invocations_[idx].num_invocations++;
+    TRY(auto response, PerformRequest(idx));
+    return HandleResponse(idx, response.response, resp_string, response.latency_ms);
+}
+
+Result<Runner::InvocationResponse> Runner::PerformRequest(size_t idx) {
+    const Invocation &inv = invocations_[idx];
 
     if (config_.invocation_mode == BenchmarkConfig::InvocationMode::kAsync) {
         const auto start = std::chrono::steady_clock::now();
@@ -292,7 +298,7 @@ Result<void> Runner::Invoke(size_t idx, std::string *resp_string) {
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - start)
                                     .count();
-        return HandleResponse(idx, result, resp_string, elapsed_ms);
+        return InvocationResponse{std::move(result), elapsed_ms};
     }
 
     cpr::Response resp = cpr::Post(
@@ -300,7 +306,7 @@ Result<void> Runner::Invoke(size_t idx, std::string *resp_string) {
         cpr::Body{reinterpret_cast<const char *>(inv.body.data()), inv.body.size()},
         cpr::Header{{"Content-Type", "application/octet-stream"}},
         cpr::Timeout{std::chrono::milliseconds(config_.request_timeout_s * 1000)});
-    return HandleResponse(idx, resp, resp_string);
+    return InvocationResponse{std::move(resp), std::nullopt};
 }
 
 Result<void> Runner::RunSingle(const SingleConfig &sc) {
@@ -355,13 +361,19 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
 
         LogInfo("Throughput: Firing '", inv.name, "' every ", interval_ms, " ms for ", tc.duration_s, " s");
 
-        const std::string url = DandelionUrl(config_.dandelion_url);
-        const std::string body(reinterpret_cast<const char *>(inv.body.data()),
-                            inv.body.size());
-        const int32_t timeout_ms = config_.request_timeout_s * 1000;
-        
-        std::vector<std::future<cpr::Response>> futures;
-        futures.reserve(repetitions);
+        struct TimedResponse {
+            Result<InvocationResponse> response;
+            double submitted_s;
+            double completed_s;
+        };
+        struct PendingRequest {
+            std::future<TimedResponse> future;
+            size_t seq;
+            double scheduled_s;
+        };
+
+        std::vector<PendingRequest> pending;
+        pending.reserve(repetitions);
         auto start = std::chrono::steady_clock::now();
         auto next_interval = start;
         size_t dispatched = 0, completed = 0, ok = 0, failed = 0;
@@ -373,14 +385,16 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
 
                 // use standard futures so we can force immediate async execution of the request
                 inv.num_invocations++;
-                futures.push_back(std::async(std::launch::async, [url, body, timeout_ms]() {
-                    return cpr::Post(
-                        cpr::Url(url),
-                        cpr::Body(body),
-                        cpr::Header{{"Content-Type", "application/octet-stream"}},
-                        cpr::Timeout{timeout_ms}
-                    );
-                }));
+                const size_t seq = dispatched;
+                const double scheduled_s = std::chrono::duration<double>(next_interval - start).count();
+                pending.push_back({std::async(std::launch::async, [this, idx, start]() {
+                    const double submitted_s = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - start).count();
+                    auto response = PerformRequest(idx);
+                    const double completed_s = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - start).count();
+                    return TimedResponse{std::move(response), submitted_s, completed_s};
+                }), seq, scheduled_s});
                 dispatched++;
                 next_interval += std::chrono::milliseconds(interval_ms);
                 if (dispatched == repetitions) {
@@ -388,11 +402,17 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
                 }
             }
 
-            for (size_t i=0; i<futures.size(); i++) {
-                if (futures[i].valid()) {
-                    if (futures[i].wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-                        cpr::Response resp = futures[i].get();
-                        auto status = HandleResponse(idx, resp);
+            for (auto &request : pending) {
+                if (request.future.valid()) {
+                    if (request.future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                        auto timed = request.future.get();
+                        Result<void> status = timed.response.is_error()
+                            ? Result<void>(timed.response.error())
+                            : HandleResponse(idx, timed.response.unwrap().response, nullptr,
+                                             timed.response.unwrap().latency_ms);
+                        throughput_events_.push_back({rps_idx, rps, request.seq, status.is_ok(),
+                                                      request.scheduled_s, timed.submitted_s,
+                                                      timed.completed_s});
                         if (status.is_ok()) {
                             ok++;
                         } else {
@@ -446,8 +466,6 @@ Result<void> Runner::RunTrace(const TraceConfig &trc) {
         return Ok();
     }
 
-    const std::string url = DandelionUrl(config_.dandelion_url);
-    const int32_t timeout_ms = config_.request_timeout_s * 1000;
     std::string results_path = config_.results_prefix + "/trace_results.csv";
     std::ofstream results(results_path, std::ios::trunc);
     results << std::fixed << std::setprecision(3);
@@ -457,20 +475,13 @@ Result<void> Runner::RunTrace(const TraceConfig &trc) {
         auto start = std::chrono::steady_clock::now();
         size_t ok = 0, failed = 0;
         for (size_t i=0; i<trace.size(); i++) {
+            if (entry_idx[i] == SIZE_MAX) {
+                continue;
+            }
             LogInfo(" > Sending request for ", invocations_[entry_idx[i]].name, "...");
-            
-            std::string body(reinterpret_cast<const char *>(invocations_[entry_idx[i]].body.data()),
-                             invocations_[entry_idx[i]].body.size());
             auto now = std::chrono::steady_clock::now();
             auto start_offset_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-            invocations_[entry_idx[i]].num_invocations++;
-            cpr::Response resp = cpr::Post(
-                cpr::Url{url}, cpr::Body{body},
-                cpr::Header{{"Content-Type", "application/octet-stream"}},
-                cpr::Timeout{timeout_ms}
-            );
-
-            auto status = HandleResponse(entry_idx[i], resp);
+            auto status = Invoke(entry_idx[i]);
             results << i << "," << trace[i].query << "_" << i;
             int64_t latency_ms = 0;
             if (status.is_ok()) {
@@ -491,9 +502,10 @@ Result<void> Runner::RunTrace(const TraceConfig &trc) {
     } else { // open loop
         LogInfo("Running trace in open loop...");
         struct TraceInvocation {
-            std::future<cpr::Response> future;
+            std::future<Result<InvocationResponse>> future;
             size_t inv_idx;
-            int64_t latency;
+            size_t trace_idx;
+            int64_t latency = 0;
         };
         std::vector<TraceInvocation> pending;
         auto start = std::chrono::steady_clock::now();
@@ -503,25 +515,26 @@ Result<void> Runner::RunTrace(const TraceConfig &trc) {
             }
             auto target = start + std::chrono::milliseconds(trace[i].offset_ms);
             std::this_thread::sleep_until(target);
-            std::string body(reinterpret_cast<const char *>(invocations_[entry_idx[i]].body.data()),
-                             invocations_[entry_idx[i]].body.size());
             LogInfo(" > [", trace[i].offset_ms, " ms] ", invocations_[entry_idx[i]].name);
-            invocations_[entry_idx[i]].num_invocations++;
-            pending.push_back({std::async(std::launch::async, [url, body, timeout_ms]() {
-                return cpr::Post(cpr::Url{url}, cpr::Body{body},
-                                 cpr::Header{{"Content-Type", "application/octet-stream"}},
-                                 cpr::Timeout{timeout_ms});
+            const size_t inv_idx = entry_idx[i];
+            invocations_[inv_idx].num_invocations++;
+            pending.push_back({std::async(std::launch::async, [this, inv_idx]() {
+                return PerformRequest(inv_idx);
             }),
-            entry_idx[i]});
+            inv_idx, i});
         }
         LogInfo("Dispatched all ", pending.size(), " requests, awaiting completion...");
 
         size_t ok = 0, failed = 0;
         for (auto &p : pending) {
-            cpr::Response resp = p.future.get();
-            auto status = HandleResponse(p.inv_idx, resp);
+            auto response = p.future.get();
+            Result<void> status = response.is_error()
+                ? Result<void>(response.error())
+                : HandleResponse(p.inv_idx, response.unwrap().response, nullptr,
+                                 response.unwrap().latency_ms);
             if (status.is_ok()) {
-                p.latency = invocations_[p.inv_idx].latencies_ms.back();
+                p.latency = response.unwrap().latency_ms.value_or(
+                    static_cast<int64_t>(response.unwrap().response.elapsed * 1000.0));
                 ok++;
                 continue;
             }
@@ -532,11 +545,11 @@ Result<void> Runner::RunTrace(const TraceConfig &trc) {
         LogInfo("Trace completed: ", ok, " ok, ", failed, " failed");
 
         // export trace result in useful format
-        for (size_t i=0; i<trace.size(); i++) {
-            results << i << "," << trace[i].query << "_" << i << ",";
-            results << (pending[i].latency > 0 ? "success" : "error");
-            double start_s = ((double) trace[i].offset_ms) / 1000;
-            double latency_s = ((double) pending[i].latency) / 1000;
+        for (const auto &p : pending) {
+            results << p.trace_idx << "," << trace[p.trace_idx].query << "_" << p.trace_idx << ",";
+            results << (p.latency > 0 ? "success" : "error");
+            double start_s = ((double) trace[p.trace_idx].offset_ms) / 1000;
+            double latency_s = ((double) p.latency) / 1000;
             results << "," << start_s << "," << start_s + latency_s << "," << start_s << "," 
                       << start_s + latency_s << "," << latency_s << std::endl;
         }
@@ -647,6 +660,20 @@ Result<void> Runner::ExportResults() {
         for (const auto &inv : invocations_) {
             f << "Query " << inv.name << ": " << inv.planning_ms << "\n";
         }
+    }
+
+    if (config_.type == BenchmarkConfig::Type::kThroughput) {
+        const std::string path = config_.results_prefix + "/throughput_results.csv";
+        std::ofstream f(path, std::ios::trunc);
+        f << std::fixed << std::setprecision(6);
+        f << "run,target_rps,seq,status,scheduled_s,submitted_s,completed_s,latency_s\n";
+        for (const auto &event : throughput_events_) {
+            f << event.run << "," << event.target_rps << "," << event.seq << ","
+              << (event.success ? "success" : "error") << "," << event.scheduled_s << ","
+              << event.submitted_s << "," << event.completed_s << ","
+              << (event.completed_s - event.submitted_s) << "\n";
+        }
+        LogInfo("Wrote throughput_results.csv to ", config_.results_prefix);
     }
 
     // timestamps.txt

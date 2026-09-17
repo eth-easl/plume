@@ -163,10 +163,6 @@ Result<BenchmarkConfig> BenchmarkConfig::FromJsonFile(const std::string &path) {
             return Error("Unknown benchmarkType '" + type + "' (expected single|throughput|trace).",
                          ErrorKind::InvalidInput);
         }
-        if (cfg.invocation_mode == InvocationMode::kAsync && cfg.type != Type::kSingle) {
-            return Error("invocationMode 'async' currently supports benchmarkType 'single' only.",
-                         ErrorKind::InvalidInput);
-        }
     } catch (const std::exception &e) {
         return Error("Malformed config: " + std::string(e.what()), ErrorKind::InvalidInput);
     }
