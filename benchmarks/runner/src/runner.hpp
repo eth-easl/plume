@@ -60,13 +60,16 @@ class Runner {
         double scheduled_s;
         double submitted_s;
         double completed_s;
+        std::string invocation_id;
+        std::string error;
     };
 
     Result<size_t> BuildInvocation(const std::string &key, const std::string &query_file, 
         const DataSource &source, const std::string &checksum_query, const std::string &checksum_scale_factor);
 
     Result<void> Invoke(size_t idx, std::string *resp_string = nullptr);
-    Result<InvocationResponse> PerformRequest(size_t idx);
+    Result<InvocationResponse> PerformRequest(size_t idx,
+                                              std::string *invocation_id_out = nullptr);
 
     Result<void> HandleResponse(size_t idx, const cpr::Response &resp,
                                 std::string *resp_string = nullptr,

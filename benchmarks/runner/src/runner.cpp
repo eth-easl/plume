@@ -45,6 +45,22 @@ std::string AsyncResultUrl(const std::string &base_url, const std::string &invoc
     return UrlPath(base_url, "async/invocation/" + invocation_id + "/result?wait=true");
 }
 
+std::string CsvField(const std::string &value) {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) {
+        return value;
+    }
+    std::string escaped = "\"";
+    for (char c : value) {
+        if (c == '\"') {
+            escaped += "\"\"";
+        } else {
+            escaped += c;
+        }
+    }
+    escaped += "\"";
+    return escaped;
+}
+
 bool IsIdent(const std::string &s) {
     if (s.empty() || (!std::isalpha(static_cast<unsigned char>(s[0])) && s[0] != '_')) {
         return false;
@@ -240,7 +256,8 @@ Result<void> Runner::Invoke(size_t idx, std::string *resp_string) {
     return HandleResponse(idx, response.response, resp_string, response.latency_ms);
 }
 
-Result<Runner::InvocationResponse> Runner::PerformRequest(size_t idx) {
+Result<Runner::InvocationResponse> Runner::PerformRequest(size_t idx,
+                                                          std::string *invocation_id_out) {
     const Invocation &inv = invocations_[idx];
 
     if (config_.invocation_mode == BenchmarkConfig::InvocationMode::kAsync) {
@@ -279,6 +296,9 @@ Result<Runner::InvocationResponse> Runner::PerformRequest(size_t idx) {
         } catch (const std::exception &e) {
             return Error("failed to parse async submission response: " + std::string(e.what()),
                          ErrorKind::Generic);
+        }
+        if (invocation_id_out != nullptr) {
+            *invocation_id_out = invocation_id;
         }
 
         cpr::Response result;
@@ -365,6 +385,7 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
             Result<InvocationResponse> response;
             double submitted_s;
             double completed_s;
+            std::string invocation_id;
         };
         struct PendingRequest {
             std::future<TimedResponse> future;
@@ -390,10 +411,12 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
                 pending.push_back({std::async(std::launch::async, [this, idx, start]() {
                     const double submitted_s = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - start).count();
-                    auto response = PerformRequest(idx);
+                    std::string invocation_id;
+                    auto response = PerformRequest(idx, &invocation_id);
                     const double completed_s = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - start).count();
-                    return TimedResponse{std::move(response), submitted_s, completed_s};
+                    return TimedResponse{std::move(response), submitted_s, completed_s,
+                                         std::move(invocation_id)};
                 }), seq, scheduled_s});
                 dispatched++;
                 next_interval += std::chrono::milliseconds(interval_ms);
@@ -410,9 +433,13 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
                             ? Result<void>(timed.response.error())
                             : HandleResponse(idx, timed.response.unwrap().response, nullptr,
                                              timed.response.unwrap().latency_ms);
+                        const std::string error = status.is_error()
+                            ? status.error().message()
+                            : std::string();
                         throughput_events_.push_back({rps_idx, rps, request.seq, status.is_ok(),
                                                       request.scheduled_s, timed.submitted_s,
-                                                      timed.completed_s});
+                                                      timed.completed_s,
+                                                      std::move(timed.invocation_id), error});
                         if (status.is_ok()) {
                             ok++;
                         } else {
@@ -666,12 +693,13 @@ Result<void> Runner::ExportResults() {
         const std::string path = config_.results_prefix + "/throughput_results.csv";
         std::ofstream f(path, std::ios::trunc);
         f << std::fixed << std::setprecision(6);
-        f << "run,target_rps,seq,status,scheduled_s,submitted_s,completed_s,latency_s\n";
+        f << "run,target_rps,seq,status,scheduled_s,submitted_s,completed_s,latency_s,invocation_id,error\n";
         for (const auto &event : throughput_events_) {
             f << event.run << "," << event.target_rps << "," << event.seq << ","
               << (event.success ? "success" : "error") << "," << event.scheduled_s << ","
               << event.submitted_s << "," << event.completed_s << ","
-              << (event.completed_s - event.submitted_s) << "\n";
+              << (event.completed_s - event.submitted_s) << ","
+              << CsvField(event.invocation_id) << "," << CsvField(event.error) << "\n";
         }
         LogInfo("Wrote throughput_results.csv to ", config_.results_prefix);
     }
