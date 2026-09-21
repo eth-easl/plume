@@ -60,7 +60,7 @@ class Runner {
         double scheduled_s;
         double submitted_s;
         double completed_s;
-        std::string invocation_id;
+        std::string run_id;
         std::string error;
     };
 
@@ -69,7 +69,7 @@ class Runner {
 
     Result<void> Invoke(size_t idx, std::string *resp_string = nullptr);
     Result<InvocationResponse> PerformRequest(size_t idx,
-                                              std::string *invocation_id_out = nullptr);
+                                              std::string *run_id_out = nullptr);
 
     Result<void> HandleResponse(size_t idx, const cpr::Response &resp,
                                 std::string *resp_string = nullptr,

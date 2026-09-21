@@ -41,8 +41,8 @@ std::string AsyncSubmitUrl(const std::string &base_url) {
     return UrlPath(base_url, "async/warm");
 }
 
-std::string AsyncResultUrl(const std::string &base_url, const std::string &invocation_id) {
-    return UrlPath(base_url, "async/invocation/" + invocation_id + "/result?wait=true");
+std::string AsyncResultUrl(const std::string &base_url, const std::string &run_id) {
+    return UrlPath(base_url, "async/invocation/" + run_id + "/result?wait=true");
 }
 
 std::string CsvField(const std::string &value) {
@@ -257,7 +257,7 @@ Result<void> Runner::Invoke(size_t idx, std::string *resp_string) {
 }
 
 Result<Runner::InvocationResponse> Runner::PerformRequest(size_t idx,
-                                                          std::string *invocation_id_out) {
+                                                          std::string *run_id_out) {
     const Invocation &inv = invocations_[idx];
 
     if (config_.invocation_mode == BenchmarkConfig::InvocationMode::kAsync) {
@@ -289,21 +289,21 @@ Result<Runner::InvocationResponse> Runner::PerformRequest(size_t idx,
             RecoverBackoff();
         }
 
-        std::string invocation_id;
+        std::string run_id;
         try {
             const auto body = nlohmann::json::from_bson(accepted.text.begin(), accepted.text.end());
-            invocation_id = body.at("invocation_id").get<std::string>();
+            run_id = body.at("run_id").get<std::string>();
         } catch (const std::exception &e) {
             return Error("failed to parse async submission response: " + std::string(e.what()),
                          ErrorKind::Generic);
         }
-        if (invocation_id_out != nullptr) {
-            *invocation_id_out = invocation_id;
+        if (run_id_out != nullptr) {
+            *run_id_out = run_id;
         }
 
         cpr::Response result;
         for (;;) {
-            result = cpr::Get(cpr::Url{AsyncResultUrl(config_.dandelion_url, invocation_id)}, timeout);
+            result = cpr::Get(cpr::Url{AsyncResultUrl(config_.dandelion_url, run_id)}, timeout);
             if (!IsTransportError(result)) {
                 break;
             }
@@ -311,7 +311,7 @@ Result<Runner::InvocationResponse> Runner::PerformRequest(size_t idx,
                 return Error("async result GET failed after reconnect retries: " + result.error.message,
                              ErrorKind::Generic);
             }
-            std::cerr << "   retry GET invocation " << invocation_id
+            std::cerr << "   retry GET invocation " << run_id
                       << " after transport error: " << result.error.message << std::endl;
             RecoverBackoff();
         }
@@ -385,7 +385,7 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
             Result<InvocationResponse> response;
             double submitted_s;
             double completed_s;
-            std::string invocation_id;
+            std::string run_id;
         };
         struct PendingRequest {
             std::future<TimedResponse> future;
@@ -411,12 +411,12 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
                 pending.push_back({std::async(std::launch::async, [this, idx, start]() {
                     const double submitted_s = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - start).count();
-                    std::string invocation_id;
-                    auto response = PerformRequest(idx, &invocation_id);
+                    std::string run_id;
+                    auto response = PerformRequest(idx, &run_id);
                     const double completed_s = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - start).count();
                     return TimedResponse{std::move(response), submitted_s, completed_s,
-                                         std::move(invocation_id)};
+                                         std::move(run_id)};
                 }), seq, scheduled_s});
                 dispatched++;
                 next_interval += std::chrono::milliseconds(interval_ms);
@@ -439,7 +439,7 @@ Result<void> Runner::RunThroughput(const ThroughputConfig &tc) {
                         throughput_events_.push_back({rps_idx, rps, request.seq, status.is_ok(),
                                                       request.scheduled_s, timed.submitted_s,
                                                       timed.completed_s,
-                                                      std::move(timed.invocation_id), error});
+                                                      std::move(timed.run_id), error});
                         if (status.is_ok()) {
                             ok++;
                         } else {
@@ -693,13 +693,13 @@ Result<void> Runner::ExportResults() {
         const std::string path = config_.results_prefix + "/throughput_results.csv";
         std::ofstream f(path, std::ios::trunc);
         f << std::fixed << std::setprecision(6);
-        f << "run,target_rps,seq,status,scheduled_s,submitted_s,completed_s,latency_s,invocation_id,error\n";
+        f << "run,target_rps,seq,status,scheduled_s,submitted_s,completed_s,latency_s,run_id,error\n";
         for (const auto &event : throughput_events_) {
             f << event.run << "," << event.target_rps << "," << event.seq << ","
               << (event.success ? "success" : "error") << "," << event.scheduled_s << ","
               << event.submitted_s << "," << event.completed_s << ","
               << (event.completed_s - event.submitted_s) << ","
-              << CsvField(event.invocation_id) << "," << CsvField(event.error) << "\n";
+              << CsvField(event.run_id) << "," << CsvField(event.error) << "\n";
         }
         LogInfo("Wrote throughput_results.csv to ", config_.results_prefix);
     }
