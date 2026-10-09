@@ -2,6 +2,7 @@
 #include "plume/execution/executor.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/pipeline.hpp"
+#include "plume/functions/dynamic_filter.hpp"
 #include "plume/functions/output_split.hpp"
 #include "plume/functions/parquet.hpp"
 #include "plume/memory/allocator.hpp"
@@ -25,6 +26,11 @@
 #define SET_IDX_IN_REGION_INFO 1
 // The third input set (index 2) should have items containing the resolved data chunk buffers.
 #define SET_IDX_IN_DATA_CHUNKS 2
+
+// The first output set (index 0) contains the normal row output.
+// The second output set (index 1) optionally contains a single serialized DynamicFilterBounds item,
+// emitted only if the pipeline contains a DynamicFilterBuildTemplate operator.
+#define SET_IDX_OUT_DYNAMIC_FILTER 1
 
 namespace plume::fn {
 
@@ -55,6 +61,9 @@ Result<void> RunParquetStage() {
     TRY(auto region_itms, abi::GetInputSet(SET_IDX_IN_REGION_INFO));
     TRY(auto data_chunk_itms, abi::GetInputSet(SET_IDX_IN_DATA_CHUNKS));
     if (region_itms.empty()) {
+        if (auto *dyn_filter = executor.FindDynamicFilterBuild()) {
+            abi::AddOutput("dynamic_filter", SET_IDX_OUT_DYNAMIC_FILTER, SerializeToBuffer(dyn_filter->Bounds()));
+        }
         return Ok();
     }
 
@@ -179,6 +188,9 @@ Result<void> RunParquetStage() {
     }
 
     TRYV(executor.Finish());
+    if (auto *dyn_filter = executor.FindDynamicFilterBuild()) {
+        abi::AddOutput("dynamic_filter", SET_IDX_OUT_DYNAMIC_FILTER, SerializeToBuffer(dyn_filter->Bounds()));
+    }
 
 #if defined(PLUME_VERBOSE) && PLUME_VERBOSE >= 1
     alloc.PrintStats();

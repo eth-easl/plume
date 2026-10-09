@@ -12,6 +12,7 @@
 #include "plume/parquet/metadata.hpp"
 #include "plume/parquet/parquet.hpp"
 #include "plume/parquet/prune.hpp"
+#include "plume/parquet/regions.hpp"
 
 #include "duckdb/common/types/value.hpp"
 
@@ -476,9 +477,11 @@ TEST_CASE("pq_prepare: an explicitly empty dynamic filter set behaves as no filt
     CHECK(mock::OutputsForSet(0).size() == 1);
 }
 
-TEST_CASE("pq_prepare: a dynamic filter set with more than one item is an error") {
-    parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
+namespace {
+
+// Wires config/footer/url like RunprepareWithDynFilter, with one dynamic filter item per build
+// instance at set 3.
+void RunprepareWithDynFilters(parquet::ParquetConfig cfg, DataBuffer footer, std::vector<DataBuffer> dyn_filters) {
     mock::Reset();
     mock::SetInput(0, [&] {
         std::vector<DataBuffer> v;
@@ -487,7 +490,7 @@ TEST_CASE("pq_prepare: a dynamic filter set with more than one item is an error"
     }());
     mock::SetInput(1, [&] {
         std::vector<DataBuffer> v;
-        v.push_back(EncodeStatsFooter());
+        v.push_back(std::move(footer));
         return v;
     }());
     mock::SetInput(2, [&] {
@@ -496,20 +499,50 @@ TEST_CASE("pq_prepare: a dynamic filter set with more than one item is an error"
         v.push_back(mock::MakeBuffer(url, std::char_traits<char>::length(url)));
         return v;
     }());
-    mock::SetInput(3, [&] {
-        std::vector<DataBuffer> v;
-        v.push_back(EncodeBounds(true, Value::INTEGER(0), Value::INTEGER(1)));
-        v.push_back(EncodeBounds(true, Value::INTEGER(0), Value::INTEGER(1)));
-        return v;
-    }());
-    CHECK(!fn::RunParquetPrepare().is_ok());
+    mock::SetInput(3, std::move(dyn_filters));
+    CHECK(fn::RunParquetPrepare().is_ok());
 }
 
-TEST_CASE("pq_prepare: dynamic filter with invalid bounds is a no-op") {
+} // namespace
+
+TEST_CASE("pq_prepare: dynamic filter items of several build instances are merged") {
+    // EncodeStatsFooter's row group is [-7, 999]. Each instance's range alone would prune it,
+    // but the merged range [-100, 1100] overlaps it -> kept.
     parquet::ParquetConfig cfg;
     cfg.dynamic_filter_column = 0;
-    RunprepareWithDynFilter(cfg, EncodeStatsFooter(), EncodeBounds(/*valid=*/false, Value(), Value()));
+    std::vector<DataBuffer> items;
+    items.push_back(EncodeBounds(true, Value::INTEGER(1000), Value::INTEGER(1100)));
+    items.push_back(EncodeBounds(true, Value::INTEGER(-100), Value::INTEGER(-50)));
+    RunprepareWithDynFilters(cfg, EncodeStatsFooter(), std::move(items));
     CHECK(mock::OutputsForSet(0).size() == 1);
+
+    // Both instances out of range (union [2000, 4000]) -> pruned.
+    items.clear();
+    items.push_back(EncodeBounds(true, Value::INTEGER(2000), Value::INTEGER(3000)));
+    items.push_back(EncodeBounds(true, Value::INTEGER(3500), Value::INTEGER(4000)));
+    RunprepareWithDynFilters(cfg, EncodeStatsFooter(), std::move(items));
+    CHECK(mock::OutputsForSet(0).empty());
+}
+
+TEST_CASE("pq_prepare: an empty build instance doesn't widen the merged range") {
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    std::vector<DataBuffer> items;
+    items.push_back(EncodeBounds(/*valid=*/false, Value(), Value()));
+    items.push_back(EncodeBounds(true, Value::INTEGER(2000), Value::INTEGER(3000)));
+    RunprepareWithDynFilters(cfg, EncodeStatsFooter(), std::move(items));
+    CHECK(mock::OutputsForSet(0).empty());
+}
+
+TEST_CASE("pq_prepare: all-invalid dynamic filter (empty build side) prunes the entire scan") {
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    std::vector<DataBuffer> items;
+    items.push_back(EncodeBounds(/*valid=*/false, Value(), Value()));
+    items.push_back(EncodeBounds(/*valid=*/false, Value(), Value()));
+    RunprepareWithDynFilters(cfg, EncodeStatsFooter(), std::move(items));
+    CHECK(mock::OutputsForSet(0).empty());
+    CHECK(mock::OutputsForSet(1).empty());
 }
 
 TEST_CASE("pq_prepare: dynamic filter prunes a row group its range excludes") {
@@ -554,6 +587,56 @@ TEST_CASE("pq_prepare: static filter still prunes alongside a (non-pruning) dyna
     RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
                             EncodeBounds(true, Value::INTEGER(-100), Value::INTEGER(100)));
     CHECK(mock::OutputsForSet(0).empty());
+}
+
+// --- multi-file sources (one pq_prepare instance per footer) -----------------
+
+TEST_CASE("pq_prepare: per-file split share and region keys unique across files") {
+    // Two files of 2 row groups each, 2 splits in total -> one region per file. The region keys
+    // must not collide between the two (separately invoked) per-file prepare instances.
+    parquet::ParquetConfig cfg;
+    cfg.num_splits = 2;
+    cfg.coalesce_distance = 0;
+    cfg.file_row_group_offsets = {0, 2};
+
+    std::vector<size_t> region_keys;
+    for (size_t file = 0; file < 2; file++) {
+        mock::Reset();
+        mock::SetInput(0, [&] {
+            std::vector<DataBuffer> v;
+            v.push_back(SerializeToBuffer(cfg));
+            return v;
+        }());
+        mock::AddInput(1, EncodeFooter(), "footer", file);
+        const std::string url = "s3://b/f" + std::to_string(file) + ".parquet";
+        mock::AddInput(2, mock::MakeBuffer(url.data(), url.size()), "url", file);
+        CHECK(fn::RunParquetPrepare().is_ok());
+
+        auto regions = mock::OutputsForSet(0);
+        CHECK(regions.size() == 1);
+        for (auto *r : regions) {
+            region_keys.push_back(r->key);
+        }
+        for (auto *req : mock::OutputsForSet(1)) {
+            CHECK(req->key == regions[0]->key);
+        }
+    }
+    CHECK(region_keys.size() == 2);
+    CHECK(region_keys[0] == 0);
+    CHECK(region_keys[1] == 2);
+}
+
+TEST_CASE("FileSplitCount: divides splits across files, scales by surviving row groups") {
+    // 5 splits over 2 files -> 3 + 2.
+    CHECK(parquet::FileSplitCount(5, 2, 0, 10, 10) == 3);
+    CHECK(parquet::FileSplitCount(5, 2, 1, 10, 10) == 2);
+    // Fewer splits than files -> still one per file.
+    CHECK(parquet::FileSplitCount(1, 3, 2, 4, 4) == 1);
+    // Half the row groups survive -> half the splits (rounded up), never below one.
+    CHECK(parquet::FileSplitCount(8, 1, 0, 5, 10) == 4);
+    CHECK(parquet::FileSplitCount(8, 1, 0, 1, 10) == 1);
+    CHECK(parquet::FileSplitCount(8, 1, 0, 0, 10) == 1);
+    CHECK(parquet::FileSplitCount(0, 1, 0, 0, 0) == 1);
 }
 
 int main() { return plume_test::RunAll(); }

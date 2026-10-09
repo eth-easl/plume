@@ -23,6 +23,8 @@ struct DynamicFilterBounds {
     duckdb::Value min;
     duckdb::Value max;
 
+    void Merge(const DynamicFilterBounds &other);
+
     void Serialize(duckdb::Serializer &s) const;
     static DynamicFilterBounds Deserialize(duckdb::Deserializer &d);
 };

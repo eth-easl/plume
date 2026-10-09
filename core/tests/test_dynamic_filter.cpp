@@ -246,6 +246,34 @@ TEST_CASE("DynamicFilterBounds: wire round-trip") {
     CHECK(!invalid2.valid);
 }
 
+TEST_CASE("DynamicFilterBounds: Merge widens to the union, invalid is the identity") {
+    auto make = [](int32_t lo, int32_t hi) {
+        DynamicFilterBounds b;
+        b.valid = true;
+        b.min = Value::INTEGER(lo);
+        b.max = Value::INTEGER(hi);
+        return b;
+    };
+
+    DynamicFilterBounds merged;
+    merged.Merge(DynamicFilterBounds{}); // invalid into invalid -> still invalid
+    CHECK(!merged.valid);
+
+    merged.Merge(make(10, 20));
+    CHECK(merged.valid);
+    CHECK(merged.min == Value::INTEGER(10));
+    CHECK(merged.max == Value::INTEGER(20));
+
+    merged.Merge(DynamicFilterBounds{}); // an empty build instance doesn't change anything
+    CHECK(merged.min == Value::INTEGER(10));
+    CHECK(merged.max == Value::INTEGER(20));
+
+    merged.Merge(make(-5, 15));
+    merged.Merge(make(12, 40));
+    CHECK(merged.min == Value::INTEGER(-5));
+    CHECK(merged.max == Value::INTEGER(40));
+}
+
 TEST_CASE("BuildRangeFilter: invalid bounds -> no filter") {
     DynamicFilterBounds b;
     CHECK(!BuildRangeFilter(0, I32(), b).has_value());

@@ -206,4 +206,17 @@ std::vector<Region> DefineRegions(const FileMeta &meta, uint32_t num_splits, uin
     return regions;
 }
 
+uint32_t FileSplitCount(uint32_t num_splits, uint32_t num_files, uint32_t file_idx,
+                        size_t kept_row_groups, size_t total_row_groups) {
+    num_files = std::max<uint32_t>(1, num_files);
+    const uint32_t total = std::max<uint32_t>(num_files, std::max<uint32_t>(1, num_splits));
+    const uint32_t base_splits = total / num_files;
+    const uint32_t rounding_files = total - base_splits * num_files;
+    uint64_t splits = file_idx < rounding_files ? base_splits + 1 : base_splits;
+    if (total_row_groups > 0 && kept_row_groups < total_row_groups) {
+        splits = (splits * kept_row_groups + total_row_groups - 1) / total_row_groups;
+    }
+    return static_cast<uint32_t>(std::max<uint64_t>(1, splits));
+}
+
 } // namespace plume::parquet

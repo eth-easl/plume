@@ -6,6 +6,8 @@
 #include "parquet_encode.hpp"
 #include "test_util.hpp"
 
+#include "plume/common/serial.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/functions/parquet.hpp"
 #include "plume/memory/adapter.hpp"
@@ -216,6 +218,73 @@ TEST_CASE("plume_pq_stage: decode a region + run pipeline") {
     CHECK(rows[1] == std::make_pair(2, 200));
     CHECK(rows[2] == std::make_pair(3, 300));
     CHECK(rows[3] == std::make_pair(4, 100));
+}
+
+TEST_CASE("plume_pq_stage: emits dynamic filter bounds when the pipeline builds one") {
+    mock::Reset();
+
+    auto amt_chunk = PlainInt32Chunk({70, -3, 12});
+    parquet::Region region;
+    parquet::DataChunk dc;
+    dc.row_group_idx = 0;
+    dc.column_idx = 0;
+    dc.size = int64_t(amt_chunk.size());
+    dc.req_idx = 0;
+    dc.req_offset = 0;
+    region.row_groups.push_back({dc});
+    region.requests.push_back({0, dc.size});
+
+    PipelineTemplate desc;
+    desc.input_schema.columns = {{"amount", I32(), false}};
+    desc.operators = {std::make_shared<DynamicFilterBuildTemplate>(/*column=*/0)};
+    auto blob = plume::SerializePipeline(desc);
+
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(mock::MakeBuffer(blob.data(), blob.size()));
+        return v;
+    }());
+    mock::SetInput(1, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(region.Serialize());
+        return v;
+    }());
+    mock::AddInput(2, mock::MakeBuffer(amt_chunk.data(), amt_chunk.size()), "0", 0);
+
+    CHECK(fn::RunParquetStage().is_ok());
+
+    auto dyn_outs = mock::OutputsForSet(1);
+    CHECK(dyn_outs.size() == 1);
+    auto bounds =
+        DeserializeFromBytes<DynamicFilterBounds>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
+    CHECK(bounds.valid);
+    CHECK(bounds.min == duckdb::Value::INTEGER(-3));
+    CHECK(bounds.max == duckdb::Value::INTEGER(70));
+}
+
+TEST_CASE("plume_pq_stage: emits invalid dynamic filter bounds without any region") {
+    mock::Reset();
+
+    PipelineTemplate desc;
+    desc.input_schema.columns = {{"amount", I32(), false}};
+    desc.operators = {std::make_shared<DynamicFilterBuildTemplate>(/*column=*/0)};
+    auto blob = plume::SerializePipeline(desc);
+
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(mock::MakeBuffer(blob.data(), blob.size()));
+        return v;
+    }());
+    mock::SetInput(1, std::vector<DataBuffer>{});
+    mock::SetInput(2, std::vector<DataBuffer>{});
+
+    CHECK(fn::RunParquetStage().is_ok());
+
+    auto dyn_outs = mock::OutputsForSet(1);
+    CHECK(dyn_outs.size() == 1);
+    auto bounds =
+        DeserializeFromBytes<DynamicFilterBounds>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
+    CHECK(!bounds.valid);
 }
 
 TEST_CASE("ColumnChunkReader matches DecodeColumnChunk (fixed-width, boundaries)") {

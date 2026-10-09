@@ -3,8 +3,8 @@
 #include "plume/abi/abi.hpp"
 #include "plume/common/serial.hpp"
 #include "plume/execution/executor.hpp"
-#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/pipeline.hpp"
+#include "plume/functions/dynamic_filter.hpp"
 #include "plume/functions/output_split.hpp"
 #include "plume/memory/allocator.hpp"
 

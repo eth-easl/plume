@@ -20,8 +20,8 @@
 #define SET_IDX_IN_FOOTER 1
 // The third input set (index 2) should have items containing source urls of the parquet.
 #define SET_IDX_IN_URL 2
-// The fourth input set (index 3) is optional and holds zero or one DynamicFilterBounds computed by
-// an upstream stage's join build side.
+// The fourth input set (index 3) is optional and holds the DynamicFilterBounds computed by an
+// upstream stage's join build side, one item per build instance.
 #define SET_IDX_IN_DYNAMIC_FILTER 3
 
 // The first output set (index 0) contains the region infos.
@@ -37,10 +37,18 @@ Result<void> RunParquetPrepare() {
     const uint32_t num_splits = config.num_splits == 0 ? 1 : config.num_splits;
 
     std::optional<exec::DynamicFilterBounds> dyn_filter_bounds = std::nullopt;
-    TRY(auto dyn_filter_item, abi::GetOptionalInputSingleton(SET_IDX_IN_DYNAMIC_FILTER));
-    if (dyn_filter_item) {
-        dyn_filter_bounds = std::make_optional(DeserializeFromBytes<exec::DynamicFilterBounds>(
-            dyn_filter_item->buffer.data(), dyn_filter_item->buffer.size()));
+    auto dyn_filter_itms = abi::GetOptionalInputSet(SET_IDX_IN_DYNAMIC_FILTER);
+    if (config.dynamic_filter_column >= 0 && dyn_filter_itms && !dyn_filter_itms->empty()) {
+        exec::DynamicFilterBounds merged;
+        for (auto &itm : *dyn_filter_itms) {
+            merged.Merge(DeserializeFromBytes<exec::DynamicFilterBounds>(itm.buffer.data(), itm.buffer.size()));
+        }
+        if (!merged.valid) {
+            // The build side has no non-NULL key at all: the inner join can't produce any row,
+            // so the entire probe scan is pruned.
+            return Ok();
+        }
+        dyn_filter_bounds = std::move(merged);
     }
 
     TRY(auto footer_itms, abi::GetInputSet(SET_IDX_IN_FOOTER));
@@ -56,11 +64,17 @@ Result<void> RunParquetPrepare() {
         url_buf_index[url_buf.key] = &url_buf.buffer;
     }
 
-    size_t region_key = 0;
+    const auto &rg_offsets = config.file_row_group_offsets;
+    const uint32_t num_files = rg_offsets.empty() ? 1 : static_cast<uint32_t>(rg_offsets.size());
+
     for (auto& footer_itm : footer_itms) {
         auto it = url_buf_index.find(footer_itm.key);
         if (it == url_buf_index.end()) {
             return Error("Did not find url item with matching key.");
+        }
+        const size_t file_idx = rg_offsets.empty() ? 0 : footer_itm.key;
+        if (!rg_offsets.empty() && file_idx >= rg_offsets.size()) {
+            return Error("Footer key exceeds ParquetConfig.file_row_group_offsets.", ErrorKind::OutOfRange);
         }
         auto url = std::string(reinterpret_cast<const char *>(it->second->data()), it->second->size());
 
@@ -97,11 +111,15 @@ Result<void> RunParquetPrepare() {
         }
 
         // projection pushdown
-        auto regions = parquet::DefineRegions(meta, num_splits, config.coalesce_distance,
+        const size_t kept_rgs = has_filter ? keep_row_groups.size() : meta.row_groups.size();
+        const uint32_t file_splits = parquet::FileSplitCount(num_splits, num_files, static_cast<uint32_t>(file_idx),
+                                                             kept_rgs, meta.row_groups.size());
+        auto regions = parquet::DefineRegions(meta, file_splits, config.coalesce_distance,
                                               config.projection, keep_row_groups, config.max_region_size);
 
+        const size_t key_base = rg_offsets.empty() ? 0 : rg_offsets[file_idx];
         for (size_t r = 0; r < regions.size(); r++) {
-            const size_t key = region_key++;
+            const size_t key = key_base + r;
             abi::AddOutput("region", SET_IDX_OUT_REGION, regions[r].Serialize(), key);
             for (size_t ri = 0; ri < regions[r].requests.size(); ri++) {
                 const auto &req = regions[r].requests[ri];

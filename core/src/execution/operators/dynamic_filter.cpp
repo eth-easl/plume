@@ -24,6 +24,18 @@ void DynamicFilterBounds::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(102, "max", max);
 }
 
+void DynamicFilterBounds::Merge(const DynamicFilterBounds &other) {
+    if (!other.valid) {
+        return;
+    }
+    if (!valid) {
+        *this = other;
+        return;
+    }
+    if (other.min < min) min = other.min;
+    if (other.max > max) max = other.max;
+}
+
 DynamicFilterBounds DynamicFilterBounds::Deserialize(duckdb::Deserializer &d) {
     DynamicFilterBounds b;
     b.valid = d.ReadProperty<bool>(100, "valid");

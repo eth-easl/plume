@@ -13,11 +13,11 @@ class Deserializer;
 
 namespace plume::parquet {
 
-// Parquet reading configuration. The information used by csv_prepare.
+// Parquet reading configuration. The information used by pq_prepare.
 struct ParquetConfig {
     uint32_t num_splits = 1;
     uint64_t coalesce_distance = 1 << 20; // merge column chunks within this gap into one request
-    uint64_t max_region_size = 0;         // cap on the compressed bytes each region processes (0 ⇒ unlimited)
+    uint64_t max_region_size = 0;         // cap on the compressed bytes each region processes (0 => unlimited)
 
     // Projection pushdown: the column indices to be read, empty -> no projection.
     std::vector<uint32_t> projection;
@@ -29,6 +29,10 @@ struct ParquetConfig {
     // Dynamic filter: file column index a runtime-computed DynamicFilterBounds input applies to.
     // -1 means this scan doesn't take a dynamic filter.
     int32_t dynamic_filter_column = -1;
+
+    // Per-file prefix sums of the source's row group counts (one entry per file, indexed by the
+    // footer item's key). Empty -> single-file source.
+    std::vector<uint64_t> file_row_group_offsets;
 
     void Serialize(duckdb::Serializer &s) const;
     static ParquetConfig Deserialize(duckdb::Deserializer &d);

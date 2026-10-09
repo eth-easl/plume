@@ -225,12 +225,7 @@ Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource
         return Error("Parquet source has no resolved footer for every file.", ErrorKind::InvalidInput);
     }
 
-    // TODO: apply filter pushdown first, then split according to remaining row groups per file
-    uint32_t total = num_splits == 0 ? 1 : num_splits;
     const uint32_t num_files = static_cast<uint32_t>(src.metadata.size());
-    total = std::max<uint32_t>(num_files, total);
-    const uint32_t base_splits = total / num_files;
-    const uint32_t rounding_files = total - base_splits * num_files;
 
     ParquetStageInputs out;
     uint64_t region_key = 0;
@@ -251,7 +246,9 @@ Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource
             }
         }
 
-        const uint32_t region_splits = i < rounding_files ? base_splits + 1: base_splits;
+        const size_t kept_rgs = pushed_filter ? keep_row_groups.size() : meta.row_groups.size();
+        const uint32_t region_splits = parquet::FileSplitCount(num_splits, num_files, static_cast<uint32_t>(i),
+                                                               kept_rgs, meta.row_groups.size());
         auto regions = parquet::DefineRegions(meta, region_splits, coalesce_distance, projection, keep_row_groups, max_region_bytes);
 
         for (size_t r = 0; r < regions.size(); r++) {
@@ -290,6 +287,11 @@ ParquetPrepareInputs BuildParquetPrepareInputs(const RemoteParquetDataSource &sr
         cfg.pushed_filter = *pushed_filter;
     }
     cfg.dynamic_filter_column = dyn_filter_col;
+    uint64_t rg_offset = 0;
+    for (const auto &meta : src.metadata) {
+        cfg.file_row_group_offsets.push_back(rg_offset);
+        rg_offset += meta.row_groups.size();
+    }
     auto cfg_buf = SerializeToBuffer(cfg);
     out.cfg.push_back({0, "config", dandelion::BinaryData(cfg_buf.data(), cfg_buf.data() + cfg_buf.size())});
 
