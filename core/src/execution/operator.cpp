@@ -88,6 +88,9 @@ std::shared_ptr<OperatorTemplate> OperatorTemplate::DeserializeOperator(OpType t
         auto t = std::make_shared<DynamicFilterBuildTemplate>();
         t->type = type;
         t->column = d.ReadProperty<uint32_t>(101, "column");
+        t->key_type = d.ReadProperty<ColumnType>(102, "key_type");
+        t->max_values = d.ReadProperty<uint32_t>(103, "max_values");
+        t->bloom_bits = d.ReadProperty<uint64_t>(104, "bloom_bits");
         return t;
     }
     default:

@@ -49,6 +49,14 @@ struct ConverterConfig {
     // A dynamic filter is only attached when the build side's estimated cardinality is at
     // most this fraction of the probe side's
     double dynamic_filter_selectivity_threshold = 0.2;
+    // Upper limit on the exact distinct build keys a dynamic filter carries (0 => no exact set).
+    uint32_t dynamic_filter_max_values = 1024;
+    // Bloom filter bits per estimated build-side row (0 => no Bloom filter), used once the build
+    // side has more than dynamic_filter_max_values distinct keys. Off until the probe-side scan
+    // evaluates the Bloom filter.
+    uint32_t dynamic_filter_bloom_bits_per_key = 0;
+    // Upper limit on a dynamic filter's Bloom filter size.
+    uint64_t dynamic_filter_max_bloom_bytes = 4 << 20;
 };
 
 // Converts a bound + optimized DuckDB logical plan into Plume PhysicalPlan.

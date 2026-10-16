@@ -3,8 +3,8 @@
 #include "plume/abi/abi.hpp"
 #include "plume/common/serial.hpp"
 #include "plume/execution/executor.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/pipeline.hpp"
-#include "plume/functions/dynamic_filter.hpp"
 #include "plume/functions/output_split.hpp"
 #include "plume/memory/allocator.hpp"
 
@@ -20,7 +20,7 @@
 #define SET_IDX_IN_DATA_CHUNKS_RIGHT 2
 
 // The first output set (index 0) contains the normal row output.
-// The second output set (index 1) optionally contains a single serialized DynamicFilterBounds item,
+// The second output set (index 1) optionally contains a single serialized DynamicFilter item,
 // emitted only if the pipeline contains a DynamicFilterBuildTemplate operator.
 #define SET_IDX_OUT_DYNAMIC_FILTER 1
 
@@ -62,7 +62,7 @@ Result<void> RunStage() {
     TRYV(executor.Finish());
 
     if (auto *dyn_filter = executor.FindDynamicFilterBuild()) {
-        abi::AddOutput("dynamic_filter", SET_IDX_OUT_DYNAMIC_FILTER, SerializeToBuffer(dyn_filter->Bounds()));
+        abi::AddOutput("dynamic_filter", SET_IDX_OUT_DYNAMIC_FILTER, SerializeToBuffer(dyn_filter->Filter()));
     }
 
 #if defined(PLUME_VERBOSE) && PLUME_VERBOSE >= 1

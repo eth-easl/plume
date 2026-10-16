@@ -236,7 +236,7 @@ TEST_CASE("plume_pq_stage: emits dynamic filter bounds when the pipeline builds 
 
     PipelineTemplate desc;
     desc.input_schema.columns = {{"amount", I32(), false}};
-    desc.operators = {std::make_shared<DynamicFilterBuildTemplate>(/*column=*/0)};
+    desc.operators = {std::make_shared<DynamicFilterBuildTemplate>(/*column=*/0, I32())};
     auto blob = plume::SerializePipeline(desc);
 
     mock::SetInput(0, [&] {
@@ -256,8 +256,8 @@ TEST_CASE("plume_pq_stage: emits dynamic filter bounds when the pipeline builds 
     auto dyn_outs = mock::OutputsForSet(1);
     CHECK(dyn_outs.size() == 1);
     auto bounds =
-        DeserializeFromBytes<DynamicFilterBounds>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
-    CHECK(bounds.valid);
+        DeserializeFromBytes<DynamicFilter>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
+    CHECK(bounds.has_bounds);
     CHECK(bounds.min == duckdb::Value::INTEGER(-3));
     CHECK(bounds.max == duckdb::Value::INTEGER(70));
 }
@@ -267,7 +267,7 @@ TEST_CASE("plume_pq_stage: emits invalid dynamic filter bounds without any regio
 
     PipelineTemplate desc;
     desc.input_schema.columns = {{"amount", I32(), false}};
-    desc.operators = {std::make_shared<DynamicFilterBuildTemplate>(/*column=*/0)};
+    desc.operators = {std::make_shared<DynamicFilterBuildTemplate>(/*column=*/0, I32())};
     auto blob = plume::SerializePipeline(desc);
 
     mock::SetInput(0, [&] {
@@ -283,8 +283,8 @@ TEST_CASE("plume_pq_stage: emits invalid dynamic filter bounds without any regio
     auto dyn_outs = mock::OutputsForSet(1);
     CHECK(dyn_outs.size() == 1);
     auto bounds =
-        DeserializeFromBytes<DynamicFilterBounds>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
-    CHECK(!bounds.valid);
+        DeserializeFromBytes<DynamicFilter>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
+    CHECK(!bounds.has_bounds);
 }
 
 TEST_CASE("ColumnChunkReader matches DecodeColumnChunk (fixed-width, boundaries)") {

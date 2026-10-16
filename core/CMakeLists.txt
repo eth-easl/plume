@@ -11,6 +11,7 @@ set(PLUME_CORE_ENGINE_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/common/types.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/csv/csv.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dandelion/s3.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/bloom_filter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/aggregate.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/dynamic_filter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/filter.cpp

@@ -405,11 +405,11 @@ TEST_CASE("RowGroupMayMatch: comparison decisions against INT32 [min,max] stats"
 namespace {
 
 DataBuffer EncodeBounds(bool valid, duckdb::Value min, duckdb::Value max) {
-    exec::DynamicFilterBounds b;
-    b.valid = valid;
-    b.min = std::move(min);
-    b.max = std::move(max);
-    return SerializeToBuffer(b);
+    exec::DynamicFilter f;
+    f.has_bounds = valid;
+    f.min = std::move(min);
+    f.max = std::move(max);
+    return SerializeToBuffer(f);
 }
 
 // Wires config/footer/url as usual (set 0/1/2); `dyn_filter`, if present, is wired as the

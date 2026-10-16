@@ -20,7 +20,7 @@
 #define SET_IDX_IN_FOOTER 1
 // The third input set (index 2) should have items containing source urls of the parquet.
 #define SET_IDX_IN_URL 2
-// The fourth input set (index 3) is optional and holds the DynamicFilterBounds computed by an
+// The fourth input set (index 3) is optional and holds the DynamicFilter computed by an
 // upstream stage's join build side, one item per build instance.
 #define SET_IDX_IN_DYNAMIC_FILTER 3
 
@@ -36,19 +36,21 @@ Result<void> RunParquetPrepare() {
     auto config = DeserializeFromBytes<parquet::ParquetConfig>(config_itm.buffer.data(), config_itm.buffer.size());
     const uint32_t num_splits = config.num_splits == 0 ? 1 : config.num_splits;
 
-    std::optional<exec::DynamicFilterBounds> dyn_filter_bounds = std::nullopt;
+    std::optional<exec::DynamicFilter> dyn_filter = std::nullopt;
     auto dyn_filter_itms = abi::GetOptionalInputSet(SET_IDX_IN_DYNAMIC_FILTER);
     if (config.dynamic_filter_column >= 0 && dyn_filter_itms && !dyn_filter_itms->empty()) {
-        exec::DynamicFilterBounds merged;
-        for (auto &itm : *dyn_filter_itms) {
-            merged.Merge(DeserializeFromBytes<exec::DynamicFilterBounds>(itm.buffer.data(), itm.buffer.size()));
+        auto &first = (*dyn_filter_itms)[0];
+        auto merged = DeserializeFromBytes<exec::DynamicFilter>(first.buffer.data(), first.buffer.size());
+        for (size_t i = 1; i < dyn_filter_itms->size(); i++) {
+            auto &itm = (*dyn_filter_itms)[i];
+            merged.Merge(DeserializeFromBytes<exec::DynamicFilter>(itm.buffer.data(), itm.buffer.size()));
         }
-        if (!merged.valid) {
+        if (!merged.has_bounds) {
             // The build side has no non-NULL key at all: the inner join can't produce any row,
             // so the entire probe scan is pruned.
             return Ok();
         }
-        dyn_filter_bounds = std::move(merged);
+        dyn_filter = std::move(merged);
     }
 
     TRY(auto footer_itms, abi::GetInputSet(SET_IDX_IN_FOOTER));
@@ -83,12 +85,12 @@ Result<void> RunParquetPrepare() {
         // combine any dynamic filter with static pushed filters
         bool has_filter = config.has_pushed_filter;
         expr::ExprNode filter = config.pushed_filter;
-        if (dyn_filter_bounds && config.dynamic_filter_column >= 0) {
+        if (dyn_filter && config.dynamic_filter_column >= 0) {
             if (static_cast<size_t>(config.dynamic_filter_column) >= meta.schema.columns.size()) {
                 return Error("ParquetConfig.dynamic_filter_column exceeds metadata schema columns.", ErrorKind::OutOfRange);
             }
             const auto &col_type = meta.schema.columns[config.dynamic_filter_column].type;
-            auto range = exec::BuildRangeFilter(config.dynamic_filter_column, col_type, *dyn_filter_bounds);
+            auto range = exec::BuildRangeFilter(config.dynamic_filter_column, col_type, *dyn_filter);
             if (range) {
                 filter = has_filter ? expr::ExprNode::Conjunction(
                              duckdb::ExpressionType::CONJUNCTION_AND, {std::move(filter), std::move(*range)}

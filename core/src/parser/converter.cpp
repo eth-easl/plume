@@ -40,6 +40,7 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -674,7 +675,17 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
         static_cast<double>(right_card) <= static_cast<double>(left_card) * cfg_.dynamic_filter_selectivity_threshold) {
         auto probe_leaf = TraceLeafFileColumn(builder_, left, left_keys[0]);
         if (probe_leaf && probe_leaf->first->data_source->type == catalog::DataSourceType::REMOTE_PARQUET) {
-            auto dyn_templ = std::make_shared<exec::DynamicFilterBuildTemplate>(right_keys[0]);
+            // Exact keys and hashes are only comparable to the probe side if both key columns share
+            // a type; otherwise fall back to the min/max range alone.
+            const ColumnType key_type = right->output_schema.columns[right_keys[0]].type;
+            const bool same_type = key_type == left->output_schema.columns[left_keys[0]].type;
+            uint64_t bloom_bits = 0;
+            if (same_type && cfg_.dynamic_filter_bloom_bits_per_key > 0) {
+                bloom_bits = std::min<uint64_t>(std::max<uint64_t>(right_card, 1) * cfg_.dynamic_filter_bloom_bits_per_key,
+                                                cfg_.dynamic_filter_max_bloom_bytes * 8);
+            }
+            auto dyn_templ = std::make_shared<exec::DynamicFilterBuildTemplate>(right_keys[0], key_type,
+                same_type ? cfg_.dynamic_filter_max_values : 0, bloom_bits);
             Schema build_schema = right->output_schema; // passthrough: schema unchanged
             right = builder_.After(std::move(right), std::move(dyn_templ), std::move(build_schema));
             probe_leaf->first->dynamic_filter_column = static_cast<int32_t>(probe_leaf->second);

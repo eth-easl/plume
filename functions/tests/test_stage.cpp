@@ -319,7 +319,7 @@ TEST_CASE("plume_stage: emits dynamic filter bounds when the pipeline builds one
     // (column 1) -- a pure passthrough with the min/max side effect.
     PipelineTemplate desc;
     desc.input_schema = RegionAmount();
-    auto dyn_build = std::make_shared<DynamicFilterBuildTemplate>(/*column=*/1);
+    auto dyn_build = std::make_shared<DynamicFilterBuildTemplate>(/*column=*/1, I32());
     desc.operators = {dyn_build};
     auto blob = plume::SerializePipeline(desc);
 
@@ -339,8 +339,8 @@ TEST_CASE("plume_stage: emits dynamic filter bounds when the pipeline builds one
     auto dyn_outs = mock::OutputsForSet(1);
     CHECK(dyn_outs.size() == 1);
     auto bounds =
-        DeserializeFromBytes<DynamicFilterBounds>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
-    CHECK(bounds.valid);
+        DeserializeFromBytes<DynamicFilter>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
+    CHECK(bounds.has_bounds);
     CHECK(bounds.min == Value::INTEGER(-5));
     CHECK(bounds.max == Value::INTEGER(100));
 
