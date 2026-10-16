@@ -7,7 +7,9 @@
 #include "test_util.hpp"
 
 #include "plume/common/serial.hpp"
+#include "plume/execution/bloom_filter.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
+#include "plume/execution/operators/filter.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/functions/parquet.hpp"
 #include "plume/memory/adapter.hpp"
@@ -15,6 +17,7 @@
 #include "plume/parquet/parquet.hpp"
 
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/vector.hpp"
 
@@ -285,6 +288,128 @@ TEST_CASE("plume_pq_stage: emits invalid dynamic filter bounds without any regio
     auto bounds =
         DeserializeFromBytes<DynamicFilter>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
     CHECK(!bounds.has_bounds);
+}
+
+namespace {
+
+// Runs pq_stage over one row group of (id, amount) INT32 columns, with the given pipeline
+// operators and the dynamic filter attached to the region on column `dyn_col`; returns the rows.
+std::vector<std::pair<int32_t, int32_t>> RunIdAmountStage(const std::vector<int32_t> &ids,
+        const std::vector<int32_t> &amounts, std::vector<std::shared_ptr<OperatorTemplate>> operators,
+        const DynamicFilter *dyn_filter, int32_t dyn_col = 0) {
+    mock::Reset();
+    auto id_chunk = PlainInt32Chunk(ids);
+    auto amt_chunk = PlainInt32Chunk(amounts);
+
+    parquet::Region region;
+    parquet::DataChunk dc0;
+    dc0.row_group_idx = 0;
+    dc0.column_idx = 0;
+    dc0.size = int64_t(id_chunk.size());
+    dc0.req_idx = 0;
+    dc0.req_offset = 0;
+    parquet::DataChunk dc1 = dc0;
+    dc1.column_idx = 1;
+    dc1.size = int64_t(amt_chunk.size());
+    dc1.req_idx = 1;
+    region.row_groups.push_back({dc0, dc1});
+    region.requests.push_back({0, dc0.size});
+    region.requests.push_back({0, dc1.size});
+    if (dyn_filter) {
+        auto buf = SerializeToBuffer(*dyn_filter);
+        region.dynamic_filter_column = dyn_col;
+        region.dynamic_filter.assign(buf.data(), buf.data() + buf.size());
+    }
+
+    PipelineTemplate desc;
+    desc.input_schema.columns = {{"id", I32(), false}, {"amount", I32(), false}};
+    desc.operators = std::move(operators);
+    auto blob = plume::SerializePipeline(desc);
+
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(mock::MakeBuffer(blob.data(), blob.size()));
+        return v;
+    }());
+    mock::SetInput(1, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(region.Serialize());
+        return v;
+    }());
+    mock::AddInput(2, mock::MakeBuffer(id_chunk.data(), id_chunk.size()), "0", 0);
+    mock::AddInput(2, mock::MakeBuffer(amt_chunk.data(), amt_chunk.size()), "1", 0);
+    CHECK(fn::RunParquetStage().is_ok());
+
+    std::vector<std::pair<int32_t, int32_t>> rows;
+    for (auto *out : mock::OutputsForSet(0)) {
+        Schema schema;
+        auto chunks =
+            memory::ImportBlockChunks(const_cast<uint8_t *>(out->buffer.data()), out->buffer.size(), schema).unwrap();
+        for (auto &c : chunks) {
+            for (idx_t r = 0; r < c->size(); r++) {
+                rows.emplace_back(c->GetValue(0, r).GetValue<int32_t>(), c->GetValue(1, r).GetValue<int32_t>());
+            }
+        }
+    }
+    return rows;
+}
+
+DynamicFilter ExactInts(std::vector<int32_t> keys) {
+    DynamicFilter f;
+    f.has_values = true;
+    for (int32_t k : keys) {
+        f.MergeBounds(duckdb::Value::INTEGER(k), duckdb::Value::INTEGER(k));
+        f.values.push_back(duckdb::Value::INTEGER(k));
+    }
+    return f;
+}
+
+using Rows = std::vector<std::pair<int32_t, int32_t>>;
+
+} // namespace
+
+TEST_CASE("plume_pq_stage: dynamic filter drops probe rows without a join partner") {
+    const std::vector<int32_t> ids = {1, 2, 3, 4, 5, 6};
+    const std::vector<int32_t> amounts = {10, 20, 30, 40, 50, 60};
+
+    auto exact = ExactInts({2, 5, 6});
+    CHECK(RunIdAmountStage(ids, amounts, {}, &exact) == Rows({{2, 20}, {5, 50}, {6, 60}}));
+
+    // Key column is not the first column.
+    auto by_amount = ExactInts({30});
+    CHECK(RunIdAmountStage(ids, amounts, {}, &by_amount, 1) == Rows({{3, 30}}));
+
+    // Bloom filter.
+    DynamicFilter bloom;
+    bloom.MergeBounds(duckdb::Value::INTEGER(1), duckdb::Value::INTEGER(4));
+    bloom.bloom = BloomFilter(1024);
+    bloom.bloom.Insert(duckdb::Hash<int32_t>(1));
+    bloom.bloom.Insert(duckdb::Hash<int32_t>(4));
+    auto rows = RunIdAmountStage(ids, amounts, {}, &bloom);
+    CHECK(std::find(rows.begin(), rows.end(), std::make_pair(1, 10)) != rows.end());
+    CHECK(std::find(rows.begin(), rows.end(), std::make_pair(4, 40)) != rows.end());
+    for (auto &r : rows) {
+        CHECK(r.first >= 1 && r.first <= 4); // the key range always applies
+    }
+
+    // No row survives.
+    auto none = ExactInts({100});
+    CHECK(RunIdAmountStage(ids, amounts, {}, &none).empty());
+
+    // No dynamic filter -> everything.
+    CHECK(RunIdAmountStage(ids, amounts, {}, nullptr).size() == ids.size());
+}
+
+TEST_CASE("plume_pq_stage: dynamic filter combines with the pushed-down scan filter") {
+    const std::vector<int32_t> ids = {1, 2, 3, 4, 5, 6};
+    const std::vector<int32_t> amounts = {10, 20, 30, 40, 50, 60};
+    // amount > 25, and id in {2, 3, 5}
+    auto scan_filter = std::make_shared<FilterTemplate>();
+    scan_filter->filter = expr::ExprNode::Comparison(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                                     expr::ExprNode::Reference(1, I32()),
+                                                     expr::ExprNode::Constant(duckdb::Value::INTEGER(25), I32()));
+    auto exact = ExactInts({2, 3, 5});
+    CHECK(RunIdAmountStage(ids, amounts, {scan_filter}, &exact) == Rows({{3, 30}, {5, 50}}));
 }
 
 TEST_CASE("ColumnChunkReader matches DecodeColumnChunk (fixed-width, boundaries)") {

@@ -626,6 +626,46 @@ TEST_CASE("pq_prepare: per-file split share and region keys unique across files"
     CHECK(region_keys[1] == 2);
 }
 
+TEST_CASE("pq_prepare: every region carries the merged dynamic filter for pq_stage") {
+    auto region_of = [](const mock::Output *out) {
+        auto buf = mock::MakeBuffer(out->buffer.data(), out->buffer.size());
+        return parquet::Region::Deserialize(buf);
+    };
+
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    cfg.projection = {0};
+    exec::DynamicFilter a, b;
+    a.MergeBounds(Value::INTEGER(1), Value::INTEGER(1));
+    a.has_values = true;
+    a.values = {Value::INTEGER(1)};
+    a.max_values = 4;
+    b = a;
+    b.MergeBounds(Value::INTEGER(5), Value::INTEGER(5));
+    b.values = {Value::INTEGER(5)};
+    std::vector<DataBuffer> items;
+    items.push_back(SerializeToBuffer(a));
+    items.push_back(SerializeToBuffer(b));
+    RunprepareWithDynFilters(cfg, EncodeStatsFooter(), std::move(items));
+
+    auto regions = mock::OutputsForSet(0);
+    CHECK(regions.size() == 1);
+    auto region = region_of(regions[0]);
+    CHECK(region.dynamic_filter_column == 0); // scan column of file column 0
+    auto f = DeserializeFromBytes<exec::DynamicFilter>(region.dynamic_filter.data(), region.dynamic_filter.size());
+    CHECK(f.min == Value::INTEGER(1));
+    CHECK(f.max == Value::INTEGER(5));
+    CHECK(f.has_values);
+    CHECK(f.values.size() == 2);
+
+    // Without a dynamic filter, regions carry none.
+    parquet::ParquetConfig plain;
+    RunprepareWithDynFilter(plain, EncodeStatsFooter(), std::nullopt);
+    auto plain_region = region_of(mock::OutputsForSet(0)[0]);
+    CHECK(plain_region.dynamic_filter_column == -1);
+    CHECK(plain_region.dynamic_filter.empty());
+}
+
 TEST_CASE("FileSplitCount: divides splits across files, scales by surviving row groups") {
     // 5 splits over 2 files -> 3 + 2.
     CHECK(parquet::FileSplitCount(5, 2, 0, 10, 10) == 3);

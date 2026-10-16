@@ -6,6 +6,7 @@
 //  (4) BuildRangeFilter produces a predicate that actually prunes as expected
 //  (5) BloomFilter: no false negatives, expected false positive rate, merge, wire format
 //  (6) DynamicFilter: exact key set, conversion to a Bloom filter, key casting/typing, merging
+//  (7) DynamicFilterProbe: per-row evaluation on the probe side, self-disabling
 
 #include "exec_test_util.hpp"
 #include "test_util.hpp"
@@ -23,7 +24,9 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/hash.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 
 #include <algorithm>
@@ -681,3 +684,129 @@ TEST_CASE("DynamicFilter: wire round-trip") {
 }
 
 int main() { return plume_test::RunAll(); }
+
+// --- DynamicFilterProbe ------------------------------------------------------
+
+namespace {
+
+// Runs `probe` over an INT32 vector (std::nullopt -> NULL), starting from the rows in `candidates`
+// (all rows if empty), and returns the surviving keys.
+std::vector<int32_t> ProbeInts(DynamicFilterProbe &probe, const std::vector<std::optional<int32_t>> &keys,
+                               std::vector<idx_t> candidates = {}) {
+    duckdb::Vector vec(LogicalType::INTEGER, keys.size());
+    for (idx_t i = 0; i < keys.size(); i++) {
+        vec.SetValue(i, keys[i] ? Value::INTEGER(*keys[i]) : Value(LogicalType::INTEGER));
+    }
+    if (candidates.empty()) {
+        for (idx_t i = 0; i < keys.size(); i++) {
+            candidates.push_back(i);
+        }
+    }
+    duckdb::SelectionVector sel(keys.size());
+    for (idx_t i = 0; i < candidates.size(); i++) {
+        sel.set_index(i, candidates[i]);
+    }
+    const idx_t passed = probe.Select(vec, keys.size(), sel, candidates.size());
+    std::vector<int32_t> out;
+    for (idx_t i = 0; i < passed; i++) {
+        out.push_back(*keys[sel.get_index(i)]);
+    }
+    return out;
+}
+
+DynamicFilter IntRange(int32_t lo, int32_t hi) {
+    DynamicFilter f;
+    f.MergeBounds(Value::INTEGER(lo), Value::INTEGER(hi));
+    return f;
+}
+
+} // namespace
+
+TEST_CASE("DynamicFilterProbe: key range only, NULLs rejected, candidate selection honored") {
+    auto probe = DynamicFilterProbe::Create(IntRange(3, 7), LogicalType::INTEGER).unwrap();
+    CHECK(probe != nullptr);
+    CHECK(ProbeInts(*probe, {1, 3, std::nullopt, 5, 7, 8}) == std::vector<int32_t>({3, 5, 7}));
+    // Only rows 1 and 2 are candidates (e.g. what the scan filter let through).
+    CHECK(ProbeInts(*probe, {4, 5, 9, 6}, {1, 2}) == std::vector<int32_t>({5}));
+}
+
+TEST_CASE("DynamicFilterProbe: exact key set") {
+    auto f = IntRange(2, 9);
+    f.has_values = true;
+    f.values = {Value::INTEGER(2), Value::INTEGER(5), Value::INTEGER(9)};
+    auto probe = DynamicFilterProbe::Create(std::move(f), LogicalType::INTEGER).unwrap();
+    CHECK(ProbeInts(*probe, {1, 2, 3, 5, 6, 9, 10}) == std::vector<int32_t>({2, 5, 9}));
+}
+
+TEST_CASE("DynamicFilterProbe: Bloom filter has no false negatives and rejects most other keys") {
+    auto f = IntRange(0, 1999);
+    f.bloom = BloomFilter(1000 * 10);
+    std::vector<std::optional<int32_t>> keys;
+    for (int32_t k = 0; k < 2000; k++) {
+        if (k % 2 == 0) {
+            f.bloom.Insert(duckdb::Hash<int32_t>(k));
+        }
+        keys.push_back(k);
+    }
+    auto probe = DynamicFilterProbe::Create(std::move(f), LogicalType::INTEGER).unwrap();
+    auto passed = ProbeInts(*probe, keys);
+    size_t odd = 0;
+    for (int32_t k : passed) {
+        odd += k % 2;
+    }
+    CHECK(passed.size() - odd == 1000); // every inserted key passes
+    CHECK_MSG(odd < 50, "more than 5% false positives at 10 bits/key");
+}
+
+TEST_CASE("DynamicFilterProbe: VARCHAR exact keys and bounds") {
+    std::string long_str(40, 'm');
+    DynamicFilter f;
+    f.MergeBounds(Value("b"), Value(long_str));
+    f.has_values = true;
+    f.values = {Value("b"), Value(long_str)};
+    auto probe = DynamicFilterProbe::Create(std::move(f), LogicalType::VARCHAR).unwrap();
+
+    std::vector<std::string> keys = {"a", "b", "c", long_str, std::string(41, 'm')};
+    duckdb::Vector vec(LogicalType::VARCHAR, keys.size());
+    for (idx_t i = 0; i < keys.size(); i++) {
+        vec.SetValue(i, Value(keys[i]));
+    }
+    duckdb::SelectionVector sel(keys.size());
+    for (idx_t i = 0; i < keys.size(); i++) {
+        sel.set_index(i, i);
+    }
+    CHECK(probe->Select(vec, keys.size(), sel, keys.size()) == 2);
+    CHECK(sel.get_index(0) == 1);
+    CHECK(sel.get_index(1) == 3);
+}
+
+TEST_CASE("DynamicFilterProbe: nothing to check -> no probe") {
+    CHECK(DynamicFilterProbe::Create(DynamicFilter(), LogicalType::INTEGER).unwrap() == nullptr);
+    // Build keys typed BIGINT can't be checked against an INTEGER probe column.
+    DynamicFilter f;
+    f.MergeBounds(Value::BIGINT(1), Value::BIGINT(2));
+    CHECK(DynamicFilterProbe::Create(std::move(f), LogicalType::INTEGER).unwrap() == nullptr);
+}
+
+TEST_CASE("DynamicFilterProbe: turns itself off if it lets through too many rows") {
+    const idx_t n = STANDARD_VECTOR_SIZE;
+    std::vector<std::optional<int32_t>> keys;
+    for (idx_t i = 0; i < n; i++) {
+        keys.push_back(static_cast<int32_t>(i));
+    }
+
+    // Everything passes -> off after the warmup.
+    auto all = DynamicFilterProbe::Create(IntRange(0, int32_t(n)), LogicalType::INTEGER).unwrap();
+    for (uint64_t checked = 0; checked < DynamicFilterProbe::kWarmupRows; checked += n) {
+        CHECK(all->Active());
+        ProbeInts(*all, keys);
+    }
+    CHECK(!all->Active());
+
+    // Half passes -> stays on.
+    auto half = DynamicFilterProbe::Create(IntRange(0, int32_t(n / 2) - 1), LogicalType::INTEGER).unwrap();
+    for (uint64_t checked = 0; checked < 2 * DynamicFilterProbe::kWarmupRows; checked += n) {
+        ProbeInts(*half, keys);
+    }
+    CHECK(half->Active());
+}

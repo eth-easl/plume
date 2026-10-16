@@ -77,6 +77,9 @@ struct Region {
     std::vector<std::vector<DataChunk>> row_groups;
     // The data fetching requests.
     std::vector<ChunkRequest> requests;
+    // Runtime filter for the rows of scan column `dynamic_filter_column` (-1 -> none).
+    int32_t dynamic_filter_column = -1;
+    std::vector<uint8_t> dynamic_filter;
 
     inline bool empty() const {
         return row_groups.empty();

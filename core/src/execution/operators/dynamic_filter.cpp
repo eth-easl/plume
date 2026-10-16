@@ -151,7 +151,118 @@ void DynamicFilterBuildTemplate::Serialize(duckdb::Serializer &s) const {
 }
 
 //===----------------------------------------------------------------------===//
-// Key collection
+// DynamicFilterProbe
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+struct KeyHash {
+    template <class T> size_t operator()(const T &k) const { return duckdb::Hash<T>(k); }
+};
+
+template <class T>
+class TypedProbe final : public DynamicFilterProbe {
+public:
+    // Keys of the exact set and the bounds point into filter_'s Values for strings.
+    explicit TypedProbe(DynamicFilter filter)
+        : filter_(std::move(filter)), lo_(filter_.min.GetValueUnsafe<T>()), hi_(filter_.max.GetValueUnsafe<T>()) {
+        if (filter_.has_values) {
+            mode_ = Mode::VALUES;
+            for (const auto &v : filter_.values) {
+                set_.insert(v.GetValueUnsafe<T>());
+            }
+        } else if (!filter_.bloom.Empty()) {
+            mode_ = Mode::BLOOM;
+        }
+    }
+
+protected:
+    idx_t SelectRows(Vector &keys, idx_t size, duckdb::SelectionVector &sel, idx_t count) override {
+        UnifiedVectorFormat udata;
+        keys.ToUnifiedFormat(size, udata);
+        auto data = UnifiedVectorFormat::GetData<T>(udata);
+        idx_t passed = 0;
+        for (idx_t i = 0; i < count; i++) {
+            const auto row = sel.get_index(i);
+            const auto idx = udata.sel->get_index(row);
+            if (!udata.validity.RowIsValid(idx)) {
+                continue; // NULL keys never join
+            }
+            const T &v = data[idx];
+            if (v < lo_ || hi_ < v) {
+                continue; // exceeds bounds
+            }
+            if (mode_ == Mode::VALUES && set_.find(v) == set_.end()) {
+                continue; // no match in exact values
+            } else if (mode_ == Mode::BLOOM && !filter_.bloom.MayContain(duckdb::Hash<T>(v))) {
+                continue; // no match in Bloom filter
+            }
+            sel.set_index(passed++, row);
+        }
+        return passed;
+    }
+
+private:
+    // What is checked next to the key range.
+    enum class Mode { BOUNDS, VALUES, BLOOM };
+
+    DynamicFilter filter_;
+    T lo_;
+    T hi_;
+    Mode mode_ = Mode::BOUNDS;
+    std::unordered_set<T, KeyHash> set_;
+};
+
+template <class T>
+std::unique_ptr<DynamicFilterProbe> MakeProbe(DynamicFilter filter) {
+    return std::make_unique<TypedProbe<T>>(std::move(filter));
+}
+
+} // namespace
+
+Result<std::unique_ptr<DynamicFilterProbe>> DynamicFilterProbe::Create(DynamicFilter filter,
+                                                                        const LogicalType &key_type) {
+    // The bounds and exact keys are Values of the build template's key type, and the Bloom
+    // filter hashes keys of that type: a probe column of another type can't be checked.
+    if (!filter.has_bounds || filter.min.type() != key_type) {
+        return std::unique_ptr<DynamicFilterProbe>();
+    }
+    switch (key_type.InternalType()) {
+    case PhysicalType::BOOL: return MakeProbe<bool>(std::move(filter));
+    case PhysicalType::INT8: return MakeProbe<int8_t>(std::move(filter));
+    case PhysicalType::INT16: return MakeProbe<int16_t>(std::move(filter));
+    case PhysicalType::INT32: return MakeProbe<int32_t>(std::move(filter));
+    case PhysicalType::INT64: return MakeProbe<int64_t>(std::move(filter));
+    case PhysicalType::UINT8: return MakeProbe<uint8_t>(std::move(filter));
+    case PhysicalType::UINT16: return MakeProbe<uint16_t>(std::move(filter));
+    case PhysicalType::UINT32: return MakeProbe<uint32_t>(std::move(filter));
+    case PhysicalType::UINT64: return MakeProbe<uint64_t>(std::move(filter));
+    case PhysicalType::INT128: return MakeProbe<duckdb::hugeint_t>(std::move(filter));
+    case PhysicalType::UINT128: return MakeProbe<duckdb::uhugeint_t>(std::move(filter));
+    case PhysicalType::FLOAT: return MakeProbe<float>(std::move(filter));
+    case PhysicalType::DOUBLE: return MakeProbe<double>(std::move(filter));
+    case PhysicalType::VARCHAR: return MakeProbe<duckdb::string_t>(std::move(filter));
+    default:
+        return Error("Dynamic filter probe over an unsupported column type", ErrorKind::NotImplemented);
+    }
+}
+
+idx_t DynamicFilterProbe::Select(Vector &keys, idx_t size, duckdb::SelectionVector &sel, idx_t count) {
+    const idx_t passed = SelectRows(keys, size, sel, count);
+    // The pass rate is judged once, over the first kWarmupRows checked rows.
+    if (rows_checked_ < kWarmupRows) {
+        rows_checked_ += count;
+        rows_passed_ += passed;
+        if (rows_checked_ >= kWarmupRows &&
+            static_cast<double>(rows_passed_) > kMaxPassRate * static_cast<double>(rows_checked_)) {
+            active_ = false;
+        }
+    }
+    return passed;
+}
+
+//===----------------------------------------------------------------------===//
+// DynamicFilterBuildOperator
 //===----------------------------------------------------------------------===//
 
 // Folds a key column into a DynamicFilter.
@@ -196,10 +307,6 @@ void ReduceFlatAllValid(const T *__restrict data, idx_t count, bool &has_value, 
         if (chunk_max < v) chunk_max = v;
     }
 }
-
-struct KeyHash {
-    template <class T> size_t operator()(const T &k) const { return duckdb::Hash<T>(k); }
-};
 
 // The key as a Value of the key type: physical values of e.g. DATE or DECIMAL keys are
 // reinterpreted instead of surfacing as their plain integer representation.
@@ -361,10 +468,6 @@ Result<std::unique_ptr<KeyCollector>> CreateKeyCollector(const DynamicFilterBuil
 }
 
 } // namespace
-
-//===----------------------------------------------------------------------===//
-// DynamicFilterBuildOperator
-//===----------------------------------------------------------------------===//
 
 DynamicFilterBuildOperator::DynamicFilterBuildOperator(const DynamicFilterBuildTemplate &templ,
         std::unique_ptr<KeyCollector> collector, duckdb::vector<LogicalType> output_types)

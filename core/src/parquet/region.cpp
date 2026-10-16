@@ -43,6 +43,9 @@ DataBuffer Region::Serialize() const {
             rs.WriteProperty(101, "size", requests[i].size);
         });
     });
+    s.WriteProperty(102, "dynamic_filter_column", dynamic_filter_column);
+    s.WriteProperty(103, "dynamic_filter_size", static_cast<uint64_t>(dynamic_filter.size()));
+    s.WriteProperty(104, "dynamic_filter", dynamic_filter.data(), dynamic_filter.size());
     s.End();
 
     const auto size = stream.GetPosition();
@@ -85,6 +88,9 @@ Region Region::Deserialize(DataBuffer &buf) {
             region.requests.push_back(req);
         });
     });
+    region.dynamic_filter_column = d.ReadProperty<int32_t>(102, "dynamic_filter_column");
+    region.dynamic_filter.resize(d.ReadProperty<uint64_t>(103, "dynamic_filter_size"));
+    d.ReadProperty(104, "dynamic_filter", region.dynamic_filter.data(), region.dynamic_filter.size());
     d.End();
     return region;
 }

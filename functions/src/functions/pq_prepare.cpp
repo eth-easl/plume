@@ -8,6 +8,7 @@
 #include "plume/parquet/prune.hpp"
 #include "plume/parquet/regions.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -51,6 +52,26 @@ Result<void> RunParquetPrepare() {
             return Ok();
         }
         dyn_filter = std::move(merged);
+    }
+
+    // The merged filter goes along with every region, for pq_stage to evaluate on the key column
+    // (an index into the scan schema, i.e. the projected columns).
+    int32_t dyn_filter_scan_column = -1;
+    std::vector<uint8_t> dyn_filter_bytes;
+    if (dyn_filter) {
+        if (config.projection.empty()) {
+            dyn_filter_scan_column = config.dynamic_filter_column;
+        } else {
+            const auto file_col = static_cast<uint32_t>(config.dynamic_filter_column);
+            auto it = std::find(config.projection.begin(), config.projection.end(), file_col);
+            if (it != config.projection.end()) {
+                dyn_filter_scan_column = static_cast<int32_t>(it - config.projection.begin());
+            }
+        }
+        if (dyn_filter_scan_column >= 0) {
+            auto buf = SerializeToBuffer(*dyn_filter);
+            dyn_filter_bytes.assign(buf.data(), buf.data() + buf.size());
+        }
     }
 
     TRY(auto footer_itms, abi::GetInputSet(SET_IDX_IN_FOOTER));
@@ -122,6 +143,10 @@ Result<void> RunParquetPrepare() {
         const size_t key_base = rg_offsets.empty() ? 0 : rg_offsets[file_idx];
         for (size_t r = 0; r < regions.size(); r++) {
             const size_t key = key_base + r;
+            if (dyn_filter_scan_column >= 0) {
+                regions[r].dynamic_filter_column = dyn_filter_scan_column;
+                regions[r].dynamic_filter = dyn_filter_bytes;
+            }
             abi::AddOutput("region", SET_IDX_OUT_REGION, regions[r].Serialize(), key);
             for (size_t ri = 0; ri < regions[r].requests.size(); ri++) {
                 const auto &req = regions[r].requests[ri];

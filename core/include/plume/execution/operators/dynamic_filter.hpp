@@ -6,7 +6,9 @@
 #include "plume/execution/operator.hpp"
 #include "plume/expression/expression.hpp"
 
+#include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/vector.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -46,6 +48,33 @@ struct DynamicFilter {
 
     void Serialize(duckdb::Serializer &s) const;
     static DynamicFilter Deserialize(duckdb::Deserializer &d);
+};
+
+// Evaluates a DynamicFilter row by row on the probe-side scan.
+class DynamicFilterProbe {
+public:
+    static constexpr uint64_t kWarmupRows = 8 * STANDARD_VECTOR_SIZE;
+    static constexpr double kMaxPassRate = 0.9;
+
+    // Returns nullptr if the filter can't reject anything for it (no bounds, or keys of a different
+    // type than the build side's).
+    static Result<std::unique_ptr<DynamicFilterProbe>> Create(DynamicFilter filter, const duckdb::LogicalType &key_type);
+    virtual ~DynamicFilterProbe() = default;
+
+    bool Active() const { return active_; }
+
+    // Narrows the selection vector `sel` (of size `count`) of the vector `keys` (of size `size`) to
+    // the rows whose key may find a join partner. Returns the number of remaining rows.
+    duckdb::idx_t Select(duckdb::Vector &keys, duckdb::idx_t size, duckdb::SelectionVector &sel, duckdb::idx_t count);
+
+protected:
+    virtual duckdb::idx_t SelectRows(duckdb::Vector &keys, duckdb::idx_t size, duckdb::SelectionVector &sel,
+                                     duckdb::idx_t count) = 0;
+
+private:
+    bool active_ = true;
+    uint64_t rows_checked_ = 0;
+    uint64_t rows_passed_ = 0;
 };
 
 // Range predicate over the filter's key range. Returns a nullopt if it has no bounds.
