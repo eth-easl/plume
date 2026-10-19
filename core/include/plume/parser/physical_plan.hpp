@@ -62,6 +62,8 @@ struct LeafStage : Stage {
     // Runtime dynamic filter.
     int32_t dynamic_filter_column = -1;
     uint32_t dynamic_filter_source_stage = kNoDynamicFilter;
+    // Use `pq_prepare` to prune row groups using dynamic filters instead of doing it upfront.
+    bool dynamic_filter_prune = false;
 
     bool HasDynFilter() const { return dynamic_filter_column != -1; }
 };

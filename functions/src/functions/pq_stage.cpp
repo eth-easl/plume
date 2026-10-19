@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,6 +28,8 @@
 #define SET_IDX_IN_REGION_INFO 1
 // The third input set (index 2) should have items containing the resolved data chunk buffers.
 #define SET_IDX_IN_DATA_CHUNKS 2
+// The fourth input set (index 3) optionally holds the DynamicFilter of a join build side.
+#define SET_IDX_IN_DYNAMIC_FILTER 3
 
 // The first output set (index 0) contains the normal row output.
 // The second output set (index 1) optionally contains a single serialized DynamicFilter item,
@@ -128,9 +131,28 @@ Result<void> RunParquetStage() {
                 return Error("Region.dynamic_filter_column exceeds the scan schema.", ErrorKind::OutOfRange);
             }
             probe_col = static_cast<uint32_t>(region.dynamic_filter_column);
-            auto filter = DeserializeFromBytes<exec::DynamicFilter>(region.dynamic_filter.data(),
-                                                                    region.dynamic_filter.size());
-            TRY(probe, exec::DynamicFilterProbe::Create(std::move(filter), types[probe_col]));
+            std::optional<exec::DynamicFilter> filter;
+            if (!region.dynamic_filter.empty()) {
+                filter = DeserializeFromBytes<exec::DynamicFilter>(region.dynamic_filter.data(),
+                                                                   region.dynamic_filter.size());
+            } else if (auto itms = abi::GetOptionalInputSet(SET_IDX_IN_DYNAMIC_FILTER); itms && !itms->empty()) {
+                filter = DeserializeFromBytes<exec::DynamicFilter>((*itms)[0].buffer.data(), (*itms)[0].buffer.size());
+                for (size_t i = 1; i < itms->size(); i++) {
+                    auto &itm = (*itms)[i];
+                    filter->Merge(DeserializeFromBytes<exec::DynamicFilter>(itm.buffer.data(), itm.buffer.size()));
+                }
+                if (!filter->has_bounds) {
+                    // The build side has no non-NULL key at all: the inner join can't produce any
+                    // row, so nothing of the scan is needed.
+                    if (auto *dyn_filter = executor.FindDynamicFilterBuild()) {
+                        abi::AddOutput("dynamic_filter", SET_IDX_OUT_DYNAMIC_FILTER, SerializeToBuffer(dyn_filter->Filter()));
+                    }
+                    return Ok();
+                }
+            }
+            if (filter) {
+                TRY(probe, exec::DynamicFilterProbe::Create(std::move(*filter), types[probe_col]));
+            }
             probe_early_cols = filter_cols;
             if (col_is_filter[probe_col] == 0) {
                 probe_early_cols.push_back(probe_col);

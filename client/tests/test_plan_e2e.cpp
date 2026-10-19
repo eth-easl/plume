@@ -16,6 +16,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -130,7 +131,8 @@ duckdb::Connection MakeDb(duckdb::DuckDB &db) {
 // A resolved (schema + cardinality already set) fake REMOTE_PARQUET source, so tests can
 // exercise Converter's dynamic-filter attachment without a real remote fetch/resolve.
 struct FakeRemoteOrders : RemoteParquetDataSource {
-    explicit FakeRemoteOrders(uint64_t card) {
+    // `cust_ranges`: per row group [min, max] footer statistics of "cust" (none if empty).
+    explicit FakeRemoteOrders(uint64_t card, const std::vector<std::pair<int32_t, int32_t>> &cust_ranges = {}) {
         name = "remote_orders";
         schema = Schema{{{"o_id", {TypeId::INT32}, false}, {"cust", {TypeId::INT32}, false}}};
         cardinality_total = card;
@@ -139,20 +141,40 @@ struct FakeRemoteOrders : RemoteParquetDataSource {
         // 1:1, so they need to be present and the same size.
         paths = {"fake://remote_orders.parquet"};
         footer_bytes = {{0}};
-        metadata.push_back({});
+        parquet::FileMeta meta;
+        meta.schema = *schema;
+        for (auto [lo, hi] : cust_ranges) {
+            auto stat = [](int32_t v) {
+                std::vector<uint8_t> b(4);
+                std::memcpy(b.data(), &v, 4);
+                return b;
+            };
+            parquet::RowGroupMeta rg;
+            rg.columns.resize(2);
+            rg.columns[1].stats.has_min = rg.columns[1].stats.has_max = true;
+            rg.columns[1].stats.min_value = stat(lo);
+            rg.columns[1].stats.max_value = stat(hi);
+            meta.row_groups.push_back(rg);
+        }
+        metadata.push_back(std::move(meta));
     }
     Result<void> Resolve(const RemoteResolver &) override { return Ok(); }
 };
 
 // A fresh in-memory DB with a small local `customers` table and `remote_orders` registered
 // as a plume_remote(...) source of `orders_cardinality` estimated rows.
-duckdb::Connection MakeRemoteJoinDb(duckdb::DuckDB &db, uint64_t orders_cardinality) {
+duckdb::Connection MakeRemoteJoinDb(duckdb::DuckDB &db, uint64_t orders_cardinality,
+                                    const std::vector<std::pair<int32_t, int32_t>> &cust_ranges = {},
+                                    std::shared_ptr<DataSource> extra_source = nullptr) {
     duckdb::Connection con(db);
     con.Query("CREATE TABLE customers(cust INTEGER, name VARCHAR)");
     con.Query("INSERT INTO customers VALUES (1, 'alice'), (2, 'bob')");
 
     auto catalog_ptr = std::make_shared<SourceCatalog>();
-    CHECK(catalog_ptr->Add(std::make_shared<FakeRemoteOrders>(orders_cardinality)).is_ok());
+    CHECK(catalog_ptr->Add(std::make_shared<FakeRemoteOrders>(orders_cardinality, cust_ranges)).is_ok());
+    if (extra_source) {
+        CHECK(catalog_ptr->Add(std::move(extra_source)).is_ok());
+    }
     auto registry = duckdb::make_shared_ptr<PlumeRemoteInfo>();
     registry->catalog = catalog_ptr;
     RegisterPlumeRemote(con, std::move(registry));
@@ -1002,6 +1024,7 @@ TEST_CASE("dynamic filter: attaches to an INNER join's build side, marks the rem
     CHECK(orders->HasDynFilter());
     CHECK(orders->dynamic_filter_column == 1); // "cust" is file column 1 of (o_id, cust)
     CHECK(orders->dynamic_filter_source_stage != kNoDynamicFilter);
+    CHECK_MSG(!orders->dynamic_filter_prune, "no footer statistics -> nothing to prune, probe only");
 
     const Stage &build_stage = *plan->stages[orders->dynamic_filter_source_stage];
     const auto *dyn = FindDynamicFilterBuild(build_stage);
@@ -1037,13 +1060,80 @@ TEST_CASE("dynamic filter: producing leaf stage's dynFilter output is actually b
     auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", ConverterConfig{}).unwrap();
 
     const std::string dyn_var = "dfltr_" + std::to_string(build_stage.idx);
-    // plume_pq_prepare consumes it by name...
-    CHECK(Contains(comp.dsl, "dynFilter = all " + dyn_var));
+    // pq_stage consumes it by name (no row-group statistics -> no pq_prepare)...
+    CHECK(Contains(comp.dsl, "inBuffers = keyed data_" + std::to_string(orders->idx) + ", dynFilter = all " + dyn_var));
+    CHECK(!Contains(comp.dsl, "plume_pq_prepare ("));
     // ...and the producing stage's own function application must actually bind it as an
     // output, or the reference above is dangling.
     CHECK(Contains(comp.dsl, dyn_var + " = dynFilter"));
     // The function it's declared on must expose the output at all.
     CHECK(Contains(comp.dsl, "=> (outData, dynFilter"));
+}
+
+TEST_CASE("dynamic filter: probe column sorted in the files -> pq_prepare prunes before the fetch") {
+    duckdb::DuckDB db(nullptr);
+    // "cust" row groups [0,99], [100,199], ... -> each spans 1/4 of the range.
+    auto con = MakeRemoteJoinDb(db, 1'000'000, {{0, 99}, {100, 199}, {200, 299}, {300, 399}});
+    auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                       "JOIN customers c ON o.cust = c.cust")
+                    .unwrap();
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    CHECK(orders->HasDynFilter());
+    CHECK(orders->dynamic_filter_prune);
+
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", ConverterConfig{}).unwrap();
+    const std::string dyn_var = "dfltr_" + std::to_string(orders->dynamic_filter_source_stage);
+    CHECK(Contains(comp.dsl, "url = anyKeyed url_" + std::to_string(orders->idx) + ", dynFilter = all " + dyn_var));
+    CHECK(!Contains(comp.dsl, "inBuffers = keyed data_" + std::to_string(orders->idx) + ", dynFilter"));
+
+    // Unclustered: every row group spans the whole range -> probe only.
+    duckdb::DuckDB db2(nullptr);
+    auto con2 = MakeRemoteJoinDb(db2, 1'000'000, {{0, 399}, {1, 398}, {0, 397}, {2, 399}});
+    auto plan2 = BuildPhysicalPlan(con2, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                         "JOIN customers c ON o.cust = c.cust")
+                     .unwrap();
+    const LeafStage *orders2 = FindLeaf(*plan2, "remote_orders");
+    CHECK(orders2->HasDynFilter());
+    CHECK(!orders2->dynamic_filter_prune);
+}
+
+namespace {
+
+// A remote build side whose key "cust" is unique over `card` rows.
+struct FakeRemoteCustomers : RemoteParquetDataSource {
+    explicit FakeRemoteCustomers(uint64_t card) {
+        name = "remote_customers";
+        schema = Schema{{{"cust", {TypeId::INT32}, false}, {"name", {TypeId::VARCHAR}, false}}};
+        cardinality_total = card;
+        paths = {"fake://remote_customers.parquet"};
+        footer_bytes = {{0}};
+        metadata.push_back({});
+    }
+    Result<void> Resolve(const RemoteResolver &) override { return Ok(); }
+};
+
+} // namespace
+
+TEST_CASE("dynamic filter: attached by the share of build keys the build side keeps") {
+    // Unfiltered build side: it keeps every key -> every probe row has a partner, no filter.
+    {
+        duckdb::DuckDB db(nullptr);
+        auto con = MakeRemoteJoinDb(db, 1'000'000, {}, std::make_shared<FakeRemoteCustomers>(10'000));
+        auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                           "JOIN plume_remote('remote_customers') c ON o.cust = c.cust")
+                        .unwrap();
+        CHECK(!FindLeaf(*plan, "remote_orders")->HasDynFilter());
+    }
+    // A filter on a non-key build column keeps only part of the keys -> filter.
+    {
+        duckdb::DuckDB db(nullptr);
+        auto con = MakeRemoteJoinDb(db, 1'000'000, {}, std::make_shared<FakeRemoteCustomers>(10'000));
+        auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                           "JOIN plume_remote('remote_customers') c ON o.cust = c.cust "
+                                           "WHERE c.name = 'alice'")
+                        .unwrap();
+        CHECK(FindLeaf(*plan, "remote_orders")->HasDynFilter());
+    }
 }
 
 TEST_CASE("dynamic filter: disabled via ConverterConfig -> leaf isn't marked") {

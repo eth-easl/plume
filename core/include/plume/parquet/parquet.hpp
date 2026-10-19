@@ -93,4 +93,7 @@ struct Region {
     static Region Deserialize(DataBuffer& buf);
 };
 
+// Returns the index of the file column in the scan schema.
+int32_t ScanColumnIndex(const std::vector<uint32_t> &projection, int32_t file_col);
+
 } // namespace plume::parquet

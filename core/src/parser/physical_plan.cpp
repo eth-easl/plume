@@ -373,7 +373,8 @@ std::string Stage::ToString() const {
         out << body << "source: " << leaf.data_source->name << std::endl;
         if (leaf.HasDynFilter()) {
             out << body << "dynamic filter: column " << leaf.dynamic_filter_column << " <- Stage "
-                << leaf.dynamic_filter_source_stage << std::endl;
+                << leaf.dynamic_filter_source_stage << (leaf.dynamic_filter_prune ? " (prune)" : " (probe)")
+                << std::endl;
         }
     }
     if (ProducesDynFilter()) {

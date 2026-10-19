@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -294,9 +295,12 @@ namespace {
 
 // Runs pq_stage over one row group of (id, amount) INT32 columns, with the given pipeline
 // operators and the dynamic filter attached to the region on column `dyn_col`; returns the rows.
+// With `build_filters`, the region only names the column and the filters arrive per build
+// instance on input set 3 instead (no pq_prepare in between).
 std::vector<std::pair<int32_t, int32_t>> RunIdAmountStage(const std::vector<int32_t> &ids,
         const std::vector<int32_t> &amounts, std::vector<std::shared_ptr<OperatorTemplate>> operators,
-        const DynamicFilter *dyn_filter, int32_t dyn_col = 0) {
+        const DynamicFilter *dyn_filter, int32_t dyn_col = 0,
+        const std::optional<std::vector<DynamicFilter>> &build_filters = std::nullopt) {
     mock::Reset();
     auto id_chunk = PlainInt32Chunk(ids);
     auto amt_chunk = PlainInt32Chunk(amounts);
@@ -320,6 +324,9 @@ std::vector<std::pair<int32_t, int32_t>> RunIdAmountStage(const std::vector<int3
         region.dynamic_filter_column = dyn_col;
         region.dynamic_filter.assign(buf.data(), buf.data() + buf.size());
     }
+    if (build_filters) {
+        region.dynamic_filter_column = dyn_col;
+    }
 
     PipelineTemplate desc;
     desc.input_schema.columns = {{"id", I32(), false}, {"amount", I32(), false}};
@@ -338,6 +345,11 @@ std::vector<std::pair<int32_t, int32_t>> RunIdAmountStage(const std::vector<int3
     }());
     mock::AddInput(2, mock::MakeBuffer(id_chunk.data(), id_chunk.size()), "0", 0);
     mock::AddInput(2, mock::MakeBuffer(amt_chunk.data(), amt_chunk.size()), "1", 0);
+    if (build_filters) {
+        for (const auto &f : *build_filters) {
+            mock::AddInput(3, SerializeToBuffer(f), "dynamic_filter", 0);
+        }
+    }
     CHECK(fn::RunParquetStage().is_ok());
 
     std::vector<std::pair<int32_t, int32_t>> rows;
@@ -356,6 +368,7 @@ std::vector<std::pair<int32_t, int32_t>> RunIdAmountStage(const std::vector<int3
 
 DynamicFilter ExactInts(std::vector<int32_t> keys) {
     DynamicFilter f;
+    f.max_values = 16;
     f.has_values = true;
     for (int32_t k : keys) {
         f.MergeBounds(duckdb::Value::INTEGER(k), duckdb::Value::INTEGER(k));
@@ -410,6 +423,22 @@ TEST_CASE("plume_pq_stage: dynamic filter combines with the pushed-down scan fil
                                                      expr::ExprNode::Constant(duckdb::Value::INTEGER(25), I32()));
     auto exact = ExactInts({2, 3, 5});
     CHECK(RunIdAmountStage(ids, amounts, {scan_filter}, &exact) == Rows({{3, 30}, {5, 50}}));
+}
+
+TEST_CASE("plume_pq_stage: merges the build instances' dynamic filters from input set 3") {
+    const std::vector<int32_t> ids = {1, 2, 3, 4, 5, 6};
+    const std::vector<int32_t> amounts = {10, 20, 30, 40, 50, 60};
+
+    CHECK(RunIdAmountStage(ids, amounts, {}, nullptr, 0, std::vector<DynamicFilter>{ExactInts({2}), ExactInts({5, 6})}) ==
+          Rows({{2, 20}, {5, 50}, {6, 60}}));
+
+    // Every build instance empty -> the inner join can't produce anything: no rows at all.
+    DynamicFilter empty;
+    empty.has_values = true;
+    CHECK(RunIdAmountStage(ids, amounts, {}, nullptr, 0, std::vector<DynamicFilter>{empty, empty}).empty());
+
+    // The region names a column but no filter arrives -> everything.
+    CHECK(RunIdAmountStage(ids, amounts, {}, nullptr, 0, std::vector<DynamicFilter>{}).size() == ids.size());
 }
 
 TEST_CASE("ColumnChunkReader matches DecodeColumnChunk (fixed-width, boundaries)") {

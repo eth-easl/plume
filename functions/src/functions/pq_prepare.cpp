@@ -8,7 +8,6 @@
 #include "plume/parquet/prune.hpp"
 #include "plume/parquet/regions.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -59,15 +58,7 @@ Result<void> RunParquetPrepare() {
     int32_t dyn_filter_scan_column = -1;
     std::vector<uint8_t> dyn_filter_bytes;
     if (dyn_filter) {
-        if (config.projection.empty()) {
-            dyn_filter_scan_column = config.dynamic_filter_column;
-        } else {
-            const auto file_col = static_cast<uint32_t>(config.dynamic_filter_column);
-            auto it = std::find(config.projection.begin(), config.projection.end(), file_col);
-            if (it != config.projection.end()) {
-                dyn_filter_scan_column = static_cast<int32_t>(it - config.projection.begin());
-            }
-        }
+        dyn_filter_scan_column = parquet::ScanColumnIndex(config.projection, config.dynamic_filter_column);
         if (dyn_filter_scan_column >= 0) {
             auto buf = SerializeToBuffer(*dyn_filter);
             dyn_filter_bytes.assign(buf.data(), buf.data() + buf.size());

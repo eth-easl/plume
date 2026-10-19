@@ -28,7 +28,8 @@ struct ParquetStageInputs {
 
 Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource &src,
     const std::vector<uint32_t> &projection, const ExprNode *pushed_filter,
-    uint32_t num_splits = 1, uint64_t coalesce_distance = 1 << 10, uint64_t max_region_bytes = 0);
+    uint32_t num_splits = 1, uint64_t coalesce_distance = 1 << 10, uint64_t max_region_bytes = 0,
+    int32_t dyn_filter_col = -1);
 
 struct ParquetPrepareInputs {
     dandelion::DataItemVec cfg;

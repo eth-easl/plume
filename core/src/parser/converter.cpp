@@ -2,6 +2,7 @@
 
 #include "plume/catalog/catalog.hpp"
 #include "plume/catalog/local.hpp"
+#include "plume/catalog/parquet.hpp"
 #include "plume/catalog/plume_remote.hpp"
 #include "plume/common/result.hpp"
 #include "plume/execution/operators/aggregate.hpp"
@@ -13,6 +14,7 @@
 #include "plume/execution/operators/sort.hpp"
 #include "plume/execution/operators/top_n.hpp"
 #include "plume/expression/expression.hpp"
+#include "plume/parquet/prune.hpp"
 #include "plume/parser/expression_translator.hpp"
 #include "plume/parser/physical_plan.hpp"
 #include "plume/parser/plan_builder.hpp"
@@ -44,6 +46,7 @@
 #include <cstdint>
 #include <memory>
 #include <numeric>
+#include <optional>
 
 namespace plume::parser {
 
@@ -186,6 +189,25 @@ std::optional<std::pair<LeafStage *, uint32_t>> TraceLeafFileColumn(PlanBuilder 
         return TraceLeafFileColumn(builder, node->sources[0], e.ref_index);
     }
     return std::nullopt; // anything else (join, aggregate, limit, sort, ...) -- not chased in v1
+}
+
+// Estimated fraction of the probe rows a dynamic filter keeps. 
+// nullopt if the build key doesn't trace back to a remote scan.
+std::optional<double> EstimateMatchFraction(PlanBuilder &builder, const PlanBuilder::SharedOpNode &build,
+                                            uint32_t build_key, uint64_t build_card) {
+    auto build_leaf = TraceLeafFileColumn(builder, build, build_key);
+    if (!build_leaf) {
+        return std::nullopt;
+    }
+    const auto &src = *build_leaf->first->data_source;
+    uint64_t distinct = src.cardinality_total; // no distinct count -> assume a unique key
+    if (build_leaf->second < src.col_stats.size() && src.col_stats[build_leaf->second].has_distinct) {
+        distinct = src.col_stats[build_leaf->second].distinct_count;
+    }
+    if (distinct == 0) {
+        return std::nullopt;
+    }
+    return std::min(1.0, static_cast<double>(build_card) / static_cast<double>(distinct));
 }
 
 } // namespace
@@ -671,10 +693,15 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
     }
 
     if (cfg_.dynamic_filter && kind == exec::JoinKind::INNER && left_keys.size() == 1 &&
-        residual_conditions.empty() &&
-        static_cast<double>(right_card) <= static_cast<double>(left_card) * cfg_.dynamic_filter_selectivity_threshold) {
+        residual_conditions.empty()) {
         auto probe_leaf = TraceLeafFileColumn(builder_, left, left_keys[0]);
-        if (probe_leaf && probe_leaf->first->data_source->type == catalog::DataSourceType::REMOTE_PARQUET) {
+        auto match_fraction = EstimateMatchFraction(builder_, right, right_keys[0], right_card);
+        const bool selective = match_fraction
+            ? *match_fraction <= cfg_.dynamic_filter_max_match_fraction
+            : static_cast<double>(right_card) <=
+                  static_cast<double>(left_card) * cfg_.dynamic_filter_selectivity_threshold;
+        if (selective && probe_leaf &&
+            probe_leaf->first->data_source->type == catalog::DataSourceType::REMOTE_PARQUET) {
             // Exact keys and hashes are only comparable to the probe side if both key columns share
             // a type; otherwise fall back to the min/max range alone.
             const ColumnType key_type = right->output_schema.columns[right_keys[0]].type;
@@ -689,6 +716,12 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
             Schema build_schema = right->output_schema; // passthrough: schema unchanged
             right = builder_.After(std::move(right), std::move(dyn_templ), std::move(build_schema));
             probe_leaf->first->dynamic_filter_column = static_cast<int32_t>(probe_leaf->second);
+            // Waiting for the filter before fetching only pays off if it can prune row groups.
+            const auto &probe_src =
+                static_cast<const catalog::RemoteParquetDataSource &>(*probe_leaf->first->data_source);
+            const auto coverage = parquet::MeanRowGroupCoverage(probe_src.metadata, probe_leaf->second);
+            probe_leaf->first->dynamic_filter_prune =
+                coverage && *coverage <= cfg_.dynamic_filter_max_rowgroup_coverage;
             pending_dynamic_filters_.push_back({right, probe_leaf->first});
         }
     }

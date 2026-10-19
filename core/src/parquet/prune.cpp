@@ -4,8 +4,11 @@
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/value.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace plume::parquet {
 
@@ -72,6 +75,18 @@ std::optional<Value> DecodeStat(const std::vector<uint8_t> &bytes, const ColumnT
         }
         return std::nullopt;
     default:
+        return std::nullopt;
+    }
+}
+
+// The stat's position on an order-preserving numeric axis.
+std::optional<double> StatPosition(const Value &v) {
+    if (v.type().id() == duckdb::LogicalTypeId::DATE) {
+        return static_cast<double>(v.GetValue<duckdb::date_t>().days);
+    }
+    try {
+        return v.GetValue<double>();
+    } catch (...) {
         return std::nullopt;
     }
 }
@@ -176,6 +191,52 @@ bool RowGroupMayMatch(const ExprNode &pred, const RowGroupMeta &rgm, const Schem
     default:
         return true; // anything we don't model ⇒ keep
     }
+}
+
+std::optional<double> MeanRowGroupCoverage(const std::vector<FileMeta> &files, uint32_t column) {
+    std::vector<std::pair<double, double>> ranges;
+    for (const auto &file : files) {
+        if (column >= file.schema.columns.size()) {
+            return std::nullopt;
+        }
+        const ColumnType &ct = file.schema.columns[column].type;
+        for (const auto &rg : file.row_groups) {
+            if (column >= rg.columns.size()) {
+                return std::nullopt;
+            }
+            const auto &stats = rg.columns[column].stats;
+            if (!stats.has_min || !stats.has_max) {
+                return std::nullopt;
+            }
+            auto lo = DecodeStat(stats.min_value, ct);
+            auto hi = DecodeStat(stats.max_value, ct);
+            auto lo_pos = lo ? StatPosition(*lo) : std::nullopt;
+            auto hi_pos = hi ? StatPosition(*hi) : std::nullopt;
+            if (!lo_pos || !hi_pos) {
+                return std::nullopt;
+            }
+            ranges.emplace_back(*lo_pos, *hi_pos);
+        }
+    }
+    if (ranges.empty()) {
+        return std::nullopt;
+    }
+
+    double global_min = ranges[0].first;
+    double global_max = ranges[0].second;
+    for (const auto &[lo, hi] : ranges) {
+        global_min = std::min(global_min, lo);
+        global_max = std::max(global_max, hi);
+    }
+    const double width = global_max - global_min;
+    if (!(width > 0)) {
+        return 1.0; // a single value: every row group holds it
+    }
+    double coverage = 0;
+    for (const auto &[lo, hi] : ranges) {
+        coverage += (hi - lo) / width;
+    }
+    return coverage / static_cast<double>(ranges.size());
 }
 
 } // namespace plume::parquet

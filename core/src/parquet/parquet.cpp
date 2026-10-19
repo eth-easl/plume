@@ -3,6 +3,8 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 
+#include <algorithm>
+
 namespace plume::parquet {
 
 void ParquetConfig::Serialize(duckdb::Serializer &s) const {
@@ -33,6 +35,14 @@ ParquetConfig ParquetConfig::Deserialize(duckdb::Deserializer &d) {
         c.file_row_group_offsets.push_back(list.ReadElement<uint64_t>());
     });
     return c;
+}
+
+int32_t ScanColumnIndex(const std::vector<uint32_t> &projection, int32_t file_col) {
+    if (file_col < 0 || projection.empty()) {
+        return file_col;
+    }
+    auto it = std::find(projection.begin(), projection.end(), static_cast<uint32_t>(file_col));
+    return it == projection.end() ? -1 : static_cast<int32_t>(it - projection.begin());
 }
 
 } // namespace plume::parquet

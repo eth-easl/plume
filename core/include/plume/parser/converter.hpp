@@ -46,9 +46,17 @@ struct ConverterConfig {
 
     // Maximum gap to coalesce requests over.
     uint64_t coalesce_distance = 1 << 10;
-    // A dynamic filter is only attached when the build side's estimated cardinality is at
-    // most this fraction of the probe side's
+    // A dynamic filter is only attached when it is estimated to keep at most this fraction of
+    // the probe rows: the share of the build key's distinct values the build side keeps, if the
+    // build key traces back to a remote scan.
+    double dynamic_filter_max_match_fraction = 0.5;
+    // Otherwise, a dynamic filter is only attached when the build side's estimated cardinality
+    // is at most this fraction of the probe side's.
     double dynamic_filter_selectivity_threshold = 0.2;
+    // The probe scan waits for the filter to prune row groups before fetching (pq_prepare) only
+    // if a row group's key range spans at most this fraction of the key column's overall range on
+    // average. Otherwise the fetch starts right away and only pq_stage applies the filter.
+    double dynamic_filter_max_rowgroup_coverage = 0.5;
     // Upper limit on the exact distinct build keys a dynamic filter carries (0 => no exact set).
     uint32_t dynamic_filter_max_values = 1024;
     // Bloom filter bits per estimated build-side row (0 => no Bloom filter, 10 bits => ~1% false positives).

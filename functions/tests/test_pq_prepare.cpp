@@ -17,6 +17,7 @@
 #include "duckdb/common/types/value.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -664,6 +665,67 @@ TEST_CASE("pq_prepare: every region carries the merged dynamic filter for pq_sta
     auto plain_region = region_of(mock::OutputsForSet(0)[0]);
     CHECK(plain_region.dynamic_filter_column == -1);
     CHECK(plain_region.dynamic_filter.empty());
+}
+
+namespace {
+
+std::vector<uint8_t> Int32Stat(int32_t v) {
+    std::vector<uint8_t> b(4);
+    std::memcpy(b.data(), &v, 4);
+    return b;
+}
+
+// One file with an INT32 column whose row groups span the given [min, max] ranges.
+parquet::FileMeta RangesFile(const std::vector<std::pair<int32_t, int32_t>> &ranges, ColumnType type = {TypeId::INT32}) {
+    parquet::FileMeta meta;
+    meta.schema.columns = {{"k", type, false}};
+    for (auto [lo, hi] : ranges) {
+        parquet::RowGroupMeta rg;
+        parquet::ColumnChunkMeta cc;
+        cc.stats.has_min = cc.stats.has_max = true;
+        cc.stats.min_value = Int32Stat(lo);
+        cc.stats.max_value = Int32Stat(hi);
+        rg.columns.push_back(cc);
+        meta.row_groups.push_back(rg);
+    }
+    return meta;
+}
+
+} // namespace
+
+TEST_CASE("MeanRowGroupCoverage: sorted vs. unclustered key columns") {
+    // Sorted: 4 row groups of [0,24], [25,49], ... -> each spans ~1/4 of [0, 99].
+    auto sorted = parquet::MeanRowGroupCoverage({RangesFile({{0, 24}, {25, 49}, {50, 74}, {75, 99}})}, 0);
+    CHECK(sorted.has_value());
+    CHECK(*sorted > 0.2 && *sorted < 0.3);
+
+    // Unclustered: every row group spans (almost) the whole range.
+    auto random = parquet::MeanRowGroupCoverage({RangesFile({{0, 99}, {1, 98}, {0, 97}})}, 0);
+    CHECK(*random > 0.95);
+
+    // Across files: two sorted files that each cover half the range.
+    auto files = parquet::MeanRowGroupCoverage({RangesFile({{0, 9}, {10, 19}}), RangesFile({{20, 29}, {30, 39}})}, 0);
+    CHECK(*files < 0.3);
+
+    // DATE stats decode too.
+    CHECK(parquet::MeanRowGroupCoverage({RangesFile({{0, 9}, {10, 19}}, {TypeId::DATE})}, 0).has_value());
+
+    // A single value everywhere -> every row group holds it.
+    CHECK(*parquet::MeanRowGroupCoverage({RangesFile({{5, 5}, {5, 5}})}, 0) == 1.0);
+
+    // Missing statistics, column out of range, or no row groups -> unknown.
+    auto no_stats = RangesFile({{0, 9}, {10, 19}});
+    no_stats.row_groups[1].columns[0].stats.has_max = false;
+    CHECK(!parquet::MeanRowGroupCoverage({no_stats}, 0).has_value());
+    CHECK(!parquet::MeanRowGroupCoverage({RangesFile({{0, 9}})}, 1).has_value());
+    CHECK(!parquet::MeanRowGroupCoverage({}, 0).has_value());
+}
+
+TEST_CASE("ScanColumnIndex: file column -> position in the projection") {
+    CHECK(parquet::ScanColumnIndex({}, 3) == 3);
+    CHECK(parquet::ScanColumnIndex({4, 2, 7}, 7) == 2);
+    CHECK(parquet::ScanColumnIndex({4, 2, 7}, 5) == -1);
+    CHECK(parquet::ScanColumnIndex({4, 2, 7}, -1) == -1);
 }
 
 TEST_CASE("FileSplitCount: divides splits across files, scales by surviving row groups") {

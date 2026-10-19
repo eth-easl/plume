@@ -217,12 +217,16 @@ std::shared_ptr<DataSource> CreateRemoteParquetSource(std::string name, std::vec
 
 Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource &src,
         const std::vector<uint32_t> &projection, const ExprNode *pushed_filter,
-        uint32_t num_splits, uint64_t coalesce_distance, uint64_t max_region_bytes) {
+        uint32_t num_splits, uint64_t coalesce_distance, uint64_t max_region_bytes, int32_t dyn_filter_col) {
     if (!src.schema) {
         return Error("Parquet source has not been resolved (missing schema).", ErrorKind::InvalidInput);
     }
     if (src.metadata.size() != src.paths.size()) {
         return Error("Parquet source has no resolved footer for every file.", ErrorKind::InvalidInput);
+    }
+    const int32_t dyn_filter_scan_col = parquet::ScanColumnIndex(projection, dyn_filter_col);
+    if (dyn_filter_col >= 0 && dyn_filter_scan_col < 0) {
+        return Error("Dynamic filter column is not part of the projection.", ErrorKind::InvalidInput);
     }
 
     const uint32_t num_files = static_cast<uint32_t>(src.metadata.size());
@@ -253,6 +257,7 @@ Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource
 
         for (size_t r = 0; r < regions.size(); r++) {
             const uint64_t key = region_key++;
+            regions[r].dynamic_filter_column = dyn_filter_scan_col;
             auto region_buf = regions[r].Serialize();
             out.region_info.push_back({
                 key, 
