@@ -158,8 +158,18 @@ std::pair<PlanBuilder::SharedOpNode, uint32_t> AppendColumn(PlanBuilder &builder
 }
 
 std::optional<std::pair<LeafStage *, uint32_t>> TraceLeafFileColumn(PlanBuilder &builder,
-        const PlanBuilder::SharedOpNode &node, uint32_t col_idx) {
+        const PlanBuilder::SharedOpNode &node, uint32_t col_idx,
+        std::vector<PlanBuilder::OperatorNode *> *path = nullptr) {
+    if (path) {
+        path->push_back(node.get());
+    }
+    auto trace = [&](uint32_t source, uint32_t idx) {
+        return TraceLeafFileColumn(builder, node->sources[source], idx, path);
+    };
     if (!node->templ) {
+        if (node->sources[0]) {
+            return trace(0, col_idx); // a splitter: passthrough, same columns
+        }
         // Scan() immediately produces a leaf node unlike every other node, whose stage_idx stays 
         // kUnmaterialized until Export().
         LeafStage *leaf = builder.LeafStageAt(node->stage_idx);
@@ -175,10 +185,12 @@ std::optional<std::pair<LeafStage *, uint32_t>> TraceLeafFileColumn(PlanBuilder 
         }
         return std::make_pair(leaf, file_idx);
     }
-    if (dynamic_cast<exec::FilterTemplate *>(node->templ.get())) {
-        return TraceLeafFileColumn(builder, node->sources[0], col_idx); // passthrough, same columns
+    const auto *templ = node->templ.get();
+    if (dynamic_cast<const exec::FilterTemplate *>(templ) || dynamic_cast<const exec::SortTemplate *>(templ) ||
+        dynamic_cast<const exec::DynamicFilterBuildTemplate *>(templ)) {
+        return trace(0, col_idx); // passthrough, same columns
     }
-    if (auto *proj = dynamic_cast<exec::ProjectionTemplate *>(node->templ.get())) {
+    if (auto *proj = dynamic_cast<const exec::ProjectionTemplate *>(templ)) {
         if (col_idx >= proj->projections.size()) {
             return std::nullopt;
         }
@@ -186,9 +198,31 @@ std::optional<std::pair<LeafStage *, uint32_t>> TraceLeafFileColumn(PlanBuilder 
         if (e.kind != expr::ExprKind::REFERENCE) {
             return std::nullopt; // a computed column -- can't trace a value back through it
         }
-        return TraceLeafFileColumn(builder, node->sources[0], e.ref_index);
+        return trace(0, e.ref_index);
     }
-    return std::nullopt; // anything else (join, aggregate, limit, sort, ...) -- not chased in v1
+    if (auto *agg = dynamic_cast<const exec::AggregateTemplate *>(templ)) {
+        // The output leads with the group keys; a group's rows all share its key.
+        if (col_idx >= agg->group_keys.size() || agg->group_keys[col_idx].kind != expr::ExprKind::REFERENCE) {
+            return std::nullopt;
+        }
+        return trace(0, agg->group_keys[col_idx].ref_index);
+    }
+    if (auto *join = dynamic_cast<const exec::JoinTemplate *>(templ)) {
+        // The natural layout (exec::JoinSchema): left columns, right columns, marker.
+        using K = exec::JoinKind;
+        const bool has_left = join->kind != K::RIGHT_SEMI && join->kind != K::RIGHT_ANTI;
+        const bool has_right = join->kind != K::SEMI && join->kind != K::ANTI && join->kind != K::MARK;
+        const auto left_size = static_cast<uint32_t>(node->sources[0]->output_schema.columns.size());
+        if (has_left && col_idx < left_size) {
+            return trace(0, col_idx);
+        }
+        const uint32_t right_idx = has_left ? col_idx - left_size : col_idx;
+        if (has_right && join->kind != K::SINGLE && right_idx < join->right_schema.columns.size()) {
+            return trace(1, right_idx);
+        }
+        return std::nullopt; // the marker, or a SINGLE join's build side
+    }
+    return std::nullopt; // anything else (limit, top-n, ...) -- filtering its input changes its output
 }
 
 // Estimated fraction of the probe rows a dynamic filter keeps. 
@@ -214,14 +248,15 @@ std::optional<double> EstimateMatchFraction(PlanBuilder &builder, const PlanBuil
 
 Result<std::unique_ptr<PhysicalPlan>> Converter::Convert(duckdb::LogicalOperator &root) {
     TRY(auto root_node, Build(root));
+    DropSharedDynamicFilters(root_node);
     std::unique_ptr<PhysicalPlan> plan = builder_.Export(root_node);
 
     // Dynamic filter build nodes only get a final stage_idx once Export() materializes the
     // whole plan. Set both directions of the (producer stage <-> consumer leaf) link now.
-    for (auto &[build_node, leaf] : pending_dynamic_filters_) {
-        const uint32_t source_stage = static_cast<uint32_t>(build_node->stage_idx);
-        leaf->dynamic_filter_source_stage = source_stage;
-        plan->stages[source_stage]->dynamic_filter_consumer_stage = static_cast<uint32_t>(leaf->idx);
+    for (auto &pending : pending_dynamic_filters_) {
+        const uint32_t source_stage = static_cast<uint32_t>(pending.build->stage_idx);
+        pending.leaf->dynamic_filter_source_stage = source_stage;
+        plan->stages[source_stage]->dynamic_filter_consumer_stage = static_cast<uint32_t>(pending.leaf->idx);
     }
 
     return plan;
@@ -241,6 +276,107 @@ uint32_t Converter::SplitCount(uint64_t estimated_rows) const {
         n = cfg_.max_splits;
     }
     return static_cast<uint32_t>(n);
+}
+
+std::optional<Converter::PendingDynamicFilter> Converter::AttachDynamicFilter(PlanBuilder::SharedOpNode &left,
+        PlanBuilder::SharedOpNode &right, exec::JoinKind kind, const std::vector<uint32_t> &left_keys,
+        const std::vector<uint32_t> &right_keys, const std::vector<bool> &keys_match_null,
+        uint64_t left_card, uint64_t right_card) {
+    // Only for joins that drop every probe row without a build match.
+    using K = exec::JoinKind;
+    if (kind != K::INNER && kind != K::SEMI && kind != K::RIGHT && kind != K::RIGHT_SEMI) {
+        return std::nullopt;
+    }
+
+    // Filtering on any one key keeps every probe row with a match. Pick the key estimated to keep
+    // the fewest probe rows.
+    struct Candidate {
+        size_t key;
+        std::pair<LeafStage *, uint32_t> probe_leaf;
+        std::optional<double> match_fraction;
+    };
+    std::optional<Candidate> best;
+    for (size_t i = 0; i < left_keys.size(); i++) {
+        if (keys_match_null[i]) {
+            continue; // the filter rejects NULL probe keys
+        }
+        std::vector<PlanBuilder::OperatorNode *> path;
+        auto probe_leaf = TraceLeafFileColumn(builder_, left, left_keys[i], &path);
+        if (!probe_leaf || probe_leaf->first->data_source->type != catalog::DataSourceType::REMOTE_PARQUET ||
+            probe_leaf->first->dynamic_filter_column >= 0) {
+            continue; // not a remote parquet scan, or already filtered by another join
+        }
+        // The scan must only feed this join (rechecked in DropSharedDynamicFilters).
+        if (std::any_of(path.begin(), path.end(), [](auto *n) { return n->consumers.size() > 1; })) {
+            continue;
+        }
+        auto match_fraction = EstimateMatchFraction(builder_, right, right_keys[i], right_card);
+        const bool selective = match_fraction
+            ? *match_fraction <= cfg_.dynamic_filter_max_match_fraction
+            : static_cast<double>(right_card) <=
+                  static_cast<double>(left_card) * cfg_.dynamic_filter_selectivity_threshold;
+        if (!selective) {
+            continue;
+        }
+        if (!best || (match_fraction && (!best->match_fraction || *match_fraction < *best->match_fraction))) {
+            best = Candidate{i, *probe_leaf, match_fraction};
+        }
+    }
+    if (!best) {
+        return std::nullopt;
+    }
+
+    const uint32_t lk = left_keys[best->key];
+    const uint32_t rk = right_keys[best->key];
+    LeafStage *leaf = best->probe_leaf.first;
+    // Exact keys and hashes are only comparable to the probe side if both key columns share
+    // a type; otherwise fall back to the min/max range alone.
+    const ColumnType key_type = right->output_schema.columns[rk].type;
+    const bool same_type = key_type == left->output_schema.columns[lk].type;
+    uint64_t bloom_bits = 0;
+    if (same_type && cfg_.dynamic_filter_bloom_bits_per_key > 0) {
+        bloom_bits = std::min<uint64_t>(std::max<uint64_t>(right_card, 1) * cfg_.dynamic_filter_bloom_bits_per_key,
+                                        cfg_.dynamic_filter_max_bloom_bytes * 8);
+    }
+    auto dyn_templ = std::make_shared<exec::DynamicFilterBuildTemplate>(rk, key_type,
+        same_type ? cfg_.dynamic_filter_max_values : 0, bloom_bits);
+    Schema build_schema = right->output_schema; // passthrough: schema unchanged
+    right = builder_.After(std::move(right), std::move(dyn_templ), std::move(build_schema));
+    if (std::any_of(pending_dynamic_filters_.begin(), pending_dynamic_filters_.end(),
+                    [&](const auto &p) { return p.build == right; })) {
+        return std::nullopt; // reused another join's identical filter, which only feeds one scan
+    }
+    leaf->dynamic_filter_column = static_cast<int32_t>(best->probe_leaf.second);
+    // Waiting for the filter before fetching only pays off if it can prune row groups.
+    const auto &probe_src = static_cast<const catalog::RemoteParquetDataSource &>(*leaf->data_source);
+    const auto coverage = parquet::MeanRowGroupCoverage(probe_src.metadata, best->probe_leaf.second);
+    leaf->dynamic_filter_prune = coverage && *coverage <= cfg_.dynamic_filter_max_rowgroup_coverage;
+    return PendingDynamicFilter{right, nullptr, lk, leaf};
+}
+
+void Converter::DropSharedDynamicFilters(const PlanBuilder::SharedOpNode &root) {
+    for (auto it = pending_dynamic_filters_.begin(); it != pending_dynamic_filters_.end();) {
+        // Nodes get shared after the join was built too (CTEs, delim joins, scan reuse). Filtering
+        // a shared scan would drop rows its other consumers need.
+        std::vector<PlanBuilder::OperatorNode *> path;
+        auto probe_leaf = TraceLeafFileColumn(builder_, it->join->sources[0], it->probe_key, &path);
+        const bool exclusive = probe_leaf && probe_leaf->first == it->leaf &&
+            std::all_of(path.begin(), path.end(), [&](auto *n) { return n->consumers.size() == 1 && n != root.get(); });
+        if (exclusive) {
+            it++;
+            continue;
+        }
+        it->leaf->dynamic_filter_column = -1;
+        it->leaf->dynamic_filter_prune = false;
+        // Turn the build operator into a no-op.
+        auto identity = std::make_shared<exec::ProjectionTemplate>();
+        const auto &columns = it->build->output_schema.columns;
+        for (uint32_t c = 0; c < columns.size(); c++) {
+            identity->projections.push_back(expr::ExprNode::Reference(c, columns[c].type));
+        }
+        it->build->templ = std::move(identity);
+        it = pending_dynamic_filters_.erase(it);
+    }
 }
 
 Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
@@ -664,6 +800,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
 
     std::vector<uint32_t> left_keys;
     std::vector<uint32_t> right_keys;
+    std::vector<bool> keys_match_null; // IS NOT DISTINCT FROM
     std::vector<const duckdb::JoinCondition *> residual_conditions;
     left_keys.reserve(join.conditions.size());
     right_keys.reserve(join.conditions.size());
@@ -690,40 +827,13 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
         }
         left_keys.push_back(lk);
         right_keys.push_back(rk);
+        keys_match_null.push_back(cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
     }
 
-    if (cfg_.dynamic_filter && kind == exec::JoinKind::INNER && left_keys.size() == 1 &&
-        residual_conditions.empty()) {
-        auto probe_leaf = TraceLeafFileColumn(builder_, left, left_keys[0]);
-        auto match_fraction = EstimateMatchFraction(builder_, right, right_keys[0], right_card);
-        const bool selective = match_fraction
-            ? *match_fraction <= cfg_.dynamic_filter_max_match_fraction
-            : static_cast<double>(right_card) <=
-                  static_cast<double>(left_card) * cfg_.dynamic_filter_selectivity_threshold;
-        if (selective && probe_leaf &&
-            probe_leaf->first->data_source->type == catalog::DataSourceType::REMOTE_PARQUET) {
-            // Exact keys and hashes are only comparable to the probe side if both key columns share
-            // a type; otherwise fall back to the min/max range alone.
-            const ColumnType key_type = right->output_schema.columns[right_keys[0]].type;
-            const bool same_type = key_type == left->output_schema.columns[left_keys[0]].type;
-            uint64_t bloom_bits = 0;
-            if (same_type && cfg_.dynamic_filter_bloom_bits_per_key > 0) {
-                bloom_bits = std::min<uint64_t>(std::max<uint64_t>(right_card, 1) * cfg_.dynamic_filter_bloom_bits_per_key,
-                                                cfg_.dynamic_filter_max_bloom_bytes * 8);
-            }
-            auto dyn_templ = std::make_shared<exec::DynamicFilterBuildTemplate>(right_keys[0], key_type,
-                same_type ? cfg_.dynamic_filter_max_values : 0, bloom_bits);
-            Schema build_schema = right->output_schema; // passthrough: schema unchanged
-            right = builder_.After(std::move(right), std::move(dyn_templ), std::move(build_schema));
-            probe_leaf->first->dynamic_filter_column = static_cast<int32_t>(probe_leaf->second);
-            // Waiting for the filter before fetching only pays off if it can prune row groups.
-            const auto &probe_src =
-                static_cast<const catalog::RemoteParquetDataSource &>(*probe_leaf->first->data_source);
-            const auto coverage = parquet::MeanRowGroupCoverage(probe_src.metadata, probe_leaf->second);
-            probe_leaf->first->dynamic_filter_prune =
-                coverage && *coverage <= cfg_.dynamic_filter_max_rowgroup_coverage;
-            pending_dynamic_filters_.push_back({right, probe_leaf->first});
-        }
+    std::optional<PendingDynamicFilter> dyn_filter;
+    if (cfg_.dynamic_filter) {
+        dyn_filter = AttachDynamicFilter(left, right, kind, left_keys, right_keys, keys_match_null,
+                                         left_card, right_card);
     }
 
     bool is_broadcast_join = false;
@@ -783,6 +893,10 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
     Schema natural = exec::JoinSchema(*t, left->output_schema); // the kind's natural layout
     PlanBuilder::SharedOpNode cur = builder_.Join(left, right, std::move(t), natural,
         std::move(probe_split_columns), std::move(build_split_columns), partitions, build_partitions);
+    if (dyn_filter) {
+        dyn_filter->join = cur;
+        pending_dynamic_filters_.push_back(std::move(*dyn_filter));
+    }
 
     const bool has_left = kind != exec::JoinKind::RIGHT_SEMI && kind != exec::JoinKind::RIGHT_ANTI;
     const bool has_right = kind != exec::JoinKind::SEMI && kind != exec::JoinKind::ANTI &&

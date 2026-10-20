@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,20 @@ public:
 private:
     uint32_t SplitCount(uint64_t estimated_rows) const;
 
+    // A dynamic filter from a join's build side to a probe-side scan.
+    struct PendingDynamicFilter {
+        PlanBuilder::SharedOpNode build; // the DynamicFilterBuildTemplate node
+        PlanBuilder::SharedOpNode join;  // the join whose probe side it filters
+        uint32_t probe_key;              // the key column in the join's probe input
+        LeafStage *leaf;                 // the filtered scan
+    };
+
+    std::optional<PendingDynamicFilter> AttachDynamicFilter(PlanBuilder::SharedOpNode &left,
+        PlanBuilder::SharedOpNode &right, exec::JoinKind kind, const std::vector<uint32_t> &left_keys,
+        const std::vector<uint32_t> &right_keys, const std::vector<bool> &keys_match_null,
+        uint64_t left_card, uint64_t right_card);
+    void DropSharedDynamicFilters(const PlanBuilder::SharedOpNode &root);
+    
     Result<PlanBuilder::SharedOpNode> BuildGet(duckdb::LogicalGet &get);
     Result<PlanBuilder::SharedOpNode> BuildChunkGet(duckdb::LogicalColumnDataGet &get);
     Result<PlanBuilder::SharedOpNode> BuildAggregate(duckdb::LogicalAggregate &agg, PlanBuilder::SharedOpNode child);
@@ -96,8 +111,7 @@ private:
 
     std::map<uint64_t, PlanBuilder::SharedOpNode> cte_subs_;
     std::vector<PlanBuilder::SharedOpNode> delim_stack_;
-
-    std::vector<std::pair<PlanBuilder::SharedOpNode, LeafStage *>> pending_dynamic_filters_;
+    std::vector<PendingDynamicFilter> pending_dynamic_filters_;
 };
 
 Result<std::unique_ptr<PhysicalPlan>> BuildPhysicalPlan(duckdb::Connection &con, 

@@ -1136,6 +1136,90 @@ TEST_CASE("dynamic filter: attached by the share of build keys the build side ke
     }
 }
 
+namespace {
+
+std::unique_ptr<PhysicalPlan> RemoteJoinPlan(const std::string &sql) {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeRemoteJoinDb(db, 1'000'000);
+    return BuildPhysicalPlan(con, sql).unwrap();
+}
+
+size_t CountDynamicFilterBuilds(const PhysicalPlan &plan) {
+    size_t n = 0;
+    for (auto &s : plan.stages) {
+        n += FindDynamicFilterBuild(*s) != nullptr;
+    }
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("dynamic filter: SEMI and RIGHT_SEMI joins filter their probe side") {
+    // orders IN (customers): customers is the build side of a SEMI join.
+    auto semi = RemoteJoinPlan("SELECT o.o_id FROM plume_remote('remote_orders') o "
+                               "WHERE o.cust IN (SELECT cust FROM customers)");
+    CHECK(semi->ToString().find("SEMI") != std::string::npos);
+    CHECK(FindLeaf(*semi, "remote_orders")->HasDynFilter());
+    CHECK(FindLeaf(*semi, "remote_orders")->dynamic_filter_column == 1);
+
+    // customers IN (orders): DuckDB builds on the small side, i.e. a RIGHT_SEMI probing orders.
+    auto right_semi = RemoteJoinPlan("SELECT c.name FROM customers c "
+                                     "WHERE c.cust IN (SELECT cust FROM plume_remote('remote_orders'))");
+    CHECK(right_semi->ToString().find("RIGHT_SEMI") != std::string::npos);
+    CHECK(FindLeaf(*right_semi, "remote_orders")->HasDynFilter());
+}
+
+TEST_CASE("dynamic filter: multi-key joins and residuals filter on one equality key") {
+    auto plan = RemoteJoinPlan("SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                               "JOIN customers c ON o.cust = c.cust AND o.o_id = c.cust + 1 AND o.o_id > c.cust");
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    CHECK(orders->HasDynFilter());
+    CHECK(orders->dynamic_filter_column == 1); // o_id = c.cust + 1 has a computed build key, so: cust
+
+    // IS NOT DISTINCT FROM matches NULL keys, which the filter rejects.
+    auto null_eq = RemoteJoinPlan("SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                  "JOIN customers c ON o.cust IS NOT DISTINCT FROM c.cust");
+    CHECK(!FindLeaf(*null_eq, "remote_orders")->HasDynFilter());
+    CHECK(CountDynamicFilterBuilds(*null_eq) == 0);
+}
+
+TEST_CASE("dynamic filter: traced through group keys and other joins") {
+    auto agg = RemoteJoinPlan("SELECT o.cust, o.n, c.name FROM "
+                              "(SELECT cust, count(*) AS n FROM plume_remote('remote_orders') GROUP BY cust) o "
+                              "JOIN customers c ON o.cust = c.cust");
+    CHECK(FindLeaf(*agg, "remote_orders")->HasDynFilter());
+    CHECK(FindLeaf(*agg, "remote_orders")->dynamic_filter_column == 1);
+
+    // An aggregate's result can't be traced.
+    auto agg_value = RemoteJoinPlan("SELECT o.cust, c.name FROM "
+                                    "(SELECT cust, max(o_id) AS m FROM plume_remote('remote_orders') GROUP BY cust) o "
+                                    "JOIN customers c ON o.m = c.cust");
+    CHECK(!FindLeaf(*agg_value, "remote_orders")->HasDynFilter());
+
+    // o_id passes through the LEFT join with tiers to the INNER join with customers.
+    auto joined = RemoteJoinPlan("SELECT o.o_id, t.name, c.name FROM plume_remote('remote_orders') o "
+                                 "LEFT JOIN (SELECT cust AS tier, name FROM customers) t ON o.cust = t.tier "
+                                 "JOIN customers c ON o.o_id = c.cust");
+    CHECK(FindLeaf(*joined, "remote_orders")->HasDynFilter());
+    CHECK(FindLeaf(*joined, "remote_orders")->dynamic_filter_column == 0);
+
+    // LIMIT keeps the first rows of its input, so filtering that input isn't equivalent.
+    auto limited = RemoteJoinPlan("SELECT o.o_id, c.name FROM "
+                                  "(SELECT * FROM plume_remote('remote_orders') LIMIT 100) o "
+                                  "JOIN customers c ON o.cust = c.cust");
+    CHECK(!FindLeaf(*limited, "remote_orders")->HasDynFilter());
+}
+
+TEST_CASE("dynamic filter: dropped when the probe scan is shared with another consumer") {
+    // The materialized CTE's scan also feeds the count, which needs the rows the filter would drop.
+    auto plan = RemoteJoinPlan("WITH o AS MATERIALIZED (SELECT * FROM plume_remote('remote_orders')) "
+                               "SELECT o.o_id, c.name, x.n FROM o JOIN customers c ON o.cust = c.cust, "
+                               "(SELECT count(*) AS n FROM o) x");
+    CHECK(CountLeaves(*plan, DataSourceType::REMOTE_PARQUET) == 1);
+    CHECK(!FindLeaf(*plan, "remote_orders")->HasDynFilter());
+    CHECK(CountDynamicFilterBuilds(*plan) == 0);
+}
+
 TEST_CASE("dynamic filter: disabled via ConverterConfig -> leaf isn't marked") {
     duckdb::DuckDB db(nullptr);
     auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
@@ -1174,7 +1258,7 @@ TEST_CASE("dynamic filter: build side too large relative to the probe -> not att
     CHECK(!orders->HasDynFilter());
 }
 
-TEST_CASE("dynamic filter: not attached for a non-INNER join") {
+TEST_CASE("dynamic filter: not attached for a join that keeps unmatched probe rows") {
     duckdb::DuckDB db(nullptr);
     auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
     auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
