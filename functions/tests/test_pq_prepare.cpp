@@ -16,6 +16,7 @@
 
 #include "duckdb/common/types/value.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -719,6 +720,141 @@ TEST_CASE("MeanRowGroupCoverage: sorted vs. unclustered key columns") {
     CHECK(!parquet::MeanRowGroupCoverage({no_stats}, 0).has_value());
     CHECK(!parquet::MeanRowGroupCoverage({RangesFile({{0, 9}})}, 1).has_value());
     CHECK(!parquet::MeanRowGroupCoverage({}, 0).has_value());
+}
+
+namespace {
+
+std::vector<uint8_t> StrStat(const std::string &v) { return std::vector<uint8_t>(v.begin(), v.end()); }
+
+std::vector<uint8_t> Int64Stat(int64_t v) {
+    std::vector<uint8_t> b(8);
+    std::memcpy(b.data(), &v, 8);
+    return b;
+}
+
+// One file with a single column of the given type whose row groups carry the raw [min, max] stats.
+parquet::FileMeta StatsFile(ColumnType type, const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &ranges) {
+    parquet::FileMeta meta;
+    meta.schema.columns = {{"k", type, false}};
+    for (const auto &[lo, hi] : ranges) {
+        parquet::RowGroupMeta rg;
+        parquet::ColumnChunkMeta cc;
+        cc.stats.has_min = cc.stats.has_max = true;
+        cc.stats.min_value = lo;
+        cc.stats.max_value = hi;
+        rg.columns.push_back(cc);
+        meta.row_groups.push_back(rg);
+    }
+    return meta;
+}
+
+ExprNode KEquals(ColumnType type, Value v) {
+    return ExprNode::Comparison(duckdb::ExpressionType::COMPARE_EQUAL, ExprNode::Reference(0, type),
+                                ExprNode::Constant(std::move(v), type));
+}
+
+DataBuffer EncodeValues(std::vector<Value> values) {
+    exec::DynamicFilter f;
+    f.has_bounds = true;
+    f.min = *std::min_element(values.begin(), values.end());
+    f.max = *std::max_element(values.begin(), values.end());
+    f.has_values = true;
+    f.values = std::move(values);
+    f.max_values = 16;
+    return SerializeToBuffer(f);
+}
+
+} // namespace
+
+TEST_CASE("RowGroupMayContainAny: keeps only row groups some key falls into") {
+    auto meta = RangesFile({{0, 24}, {25, 49}, {50, 74}, {75, 99}});
+    auto may = [&](std::vector<Value> keys) {
+        auto sorted = parquet::SortStatValues(keys, {TypeId::INT32});
+        CHECK(sorted.has_value());
+        std::vector<bool> out;
+        if (!sorted) {
+            return out;
+        }
+        for (const auto &rg : meta.row_groups) {
+            out.push_back(parquet::RowGroupMayContainAny(rg, meta.schema, 0, *sorted));
+        }
+        return out;
+    };
+    CHECK((may({Value::INTEGER(80), Value::INTEGER(30)}) == std::vector<bool>{false, true, false, true}));
+    // Keys on a row group's min/max boundary.
+    CHECK((may({Value::INTEGER(24), Value::INTEGER(75)}) == std::vector<bool>{true, false, false, true}));
+    // Keys of another type are cast to the column's; all outside every range.
+    CHECK((may({Value::BIGINT(-5), Value::BIGINT(100)}) == std::vector<bool>{false, false, false, false}));
+    // A key that doesn't fit the column type -> no value set.
+    CHECK(!parquet::SortStatValues({Value::BIGINT(int64_t(1) << 40)}, {TypeId::INT32}).has_value());
+
+    // No statistics -> keep.
+    auto sorted = *parquet::SortStatValues({Value::INTEGER(1000)}, {TypeId::INT32});
+    meta.row_groups[0].columns[0].stats.has_min = false;
+    CHECK(parquet::RowGroupMayContainAny(meta.row_groups[0], meta.schema, 0, sorted));
+    CHECK(!parquet::RowGroupMayContainAny(meta.row_groups[1], meta.schema, 0, sorted));
+}
+
+TEST_CASE("pq_prepare: dynamic filter's exact keys prune a row group its range overlaps") {
+    // EncodeStatsFooter's only row group has min=-7, max=999; the keys' range [-50, 2000] overlaps
+    // it but neither key falls into it.
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    RunprepareWithDynFilter(cfg, EncodeStatsFooter(), EncodeValues({Value::INTEGER(-50), Value::INTEGER(2000)}));
+    CHECK(mock::OutputsForSet(0).empty());
+    CHECK(mock::OutputsForSet(1).empty());
+
+    RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
+                            EncodeValues({Value::INTEGER(-50), Value::INTEGER(10), Value::INTEGER(2000)}));
+    CHECK(mock::OutputsForSet(0).size() == 1);
+}
+
+TEST_CASE("RowGroupMayMatch: VARCHAR, BOOLEAN and TIME statistics") {
+    auto strings = StatsFile({TypeId::VARCHAR}, {{StrStat("apple"), StrStat("banana")}});
+    const auto &str_rg = strings.row_groups[0];
+    CHECK(parquet::RowGroupMayMatch(KEquals({TypeId::VARCHAR}, Value("avocado")), str_rg, strings.schema));
+    CHECK(parquet::RowGroupMayMatch(KEquals({TypeId::VARCHAR}, Value("banana")), str_rg, strings.schema));
+    CHECK(!parquet::RowGroupMayMatch(KEquals({TypeId::VARCHAR}, Value("cherry")), str_rg, strings.schema));
+    CHECK(!parquet::RowGroupMayMatch(KEquals({TypeId::VARCHAR}, Value("Apple")), str_rg, strings.schema));
+    // Bytewise unsigned order: a non-ASCII string sorts after every ASCII one.
+    CHECK(!parquet::RowGroupMayMatch(KEquals({TypeId::VARCHAR}, Value("\xc3\xa4pfel")), str_rg, strings.schema));
+
+    // Deprecated (signed order) string statistics and invalid UTF-8 aren't used.
+    auto deprecated = strings;
+    deprecated.row_groups[0].columns[0].stats.deprecated_min_max = true;
+    CHECK(parquet::RowGroupMayMatch(KEquals({TypeId::VARCHAR}, Value("cherry")), deprecated.row_groups[0],
+                                    deprecated.schema));
+    auto truncated = StatsFile({TypeId::VARCHAR}, {{StrStat("apple"), StrStat("b\xc3")}});
+    CHECK(parquet::RowGroupMayMatch(KEquals({TypeId::VARCHAR}, Value("cherry")), truncated.row_groups[0],
+                                    truncated.schema));
+
+    auto bools = StatsFile({TypeId::BOOLEAN}, {{{1}, {1}}});
+    CHECK(parquet::RowGroupMayMatch(KEquals({TypeId::BOOLEAN}, Value::BOOLEAN(true)), bools.row_groups[0], bools.schema));
+    CHECK(!parquet::RowGroupMayMatch(KEquals({TypeId::BOOLEAN}, Value::BOOLEAN(false)), bools.row_groups[0], bools.schema));
+
+    auto times = StatsFile({TypeId::TIME}, {{Int64Stat(1000), Int64Stat(5000)}});
+    CHECK(parquet::RowGroupMayMatch(KEquals({TypeId::TIME}, Value::TIME(duckdb::dtime_t(3000))), times.row_groups[0],
+                                    times.schema));
+    CHECK(!parquet::RowGroupMayMatch(KEquals({TypeId::TIME}, Value::TIME(duckdb::dtime_t(6000))), times.row_groups[0],
+                                     times.schema));
+}
+
+TEST_CASE("MeanRowGroupCoverage: VARCHAR and TIME key columns") {
+    // Sorted strings sharing a long common prefix are placed by the bytes after it.
+    auto sorted = parquet::MeanRowGroupCoverage(
+        {StatsFile({TypeId::VARCHAR}, {{StrStat("Customer#000000001"), StrStat("Customer#000002499")},
+                                       {StrStat("Customer#000002500"), StrStat("Customer#000004999")},
+                                       {StrStat("Customer#000005000"), StrStat("Customer#000007499")},
+                                       {StrStat("Customer#000007500"), StrStat("Customer#000009999")}})},
+        0);
+    CHECK(sorted.value_or(1.0) < 0.3);
+    auto random = parquet::MeanRowGroupCoverage(
+        {StatsFile({TypeId::VARCHAR}, {{StrStat("a"), StrStat("zz")}, {StrStat("ab"), StrStat("zy")}})}, 0);
+    CHECK(random.value_or(0.0) > 0.95);
+
+    auto times = parquet::MeanRowGroupCoverage(
+        {StatsFile({TypeId::TIME}, {{Int64Stat(0), Int64Stat(9)}, {Int64Stat(10), Int64Stat(19)}})}, 0);
+    CHECK(times.value_or(1.0) < 0.5);
 }
 
 TEST_CASE("ScanColumnIndex: file column -> position in the projection") {

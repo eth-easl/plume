@@ -16,6 +16,8 @@ struct ColumnStats {
     bool has_max = false;
     std::vector<uint8_t> min_value; // prefers Statistics.min_value, else the deprecated min
     std::vector<uint8_t> max_value;
+    // min/max come from the deprecated fields, which order BYTE_ARRAY values by signed bytes.
+    bool deprecated_min_max = false;
     bool has_null_count = false;
     int64_t null_count = 0;
     bool has_distinct_count = false;

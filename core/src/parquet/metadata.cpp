@@ -141,10 +141,12 @@ void ParseStatistics(CompactReader &r, ColumnStats &st) {
     if (!st.has_min && has_dep_min) {
         st.min_value = std::move(dep_min);
         st.has_min = true;
+        st.deprecated_min_max = true;
     }
     if (!st.has_max && has_dep_max) {
         st.max_value = std::move(dep_max);
         st.has_max = true;
+        st.deprecated_min_max = true;
     }
 }
 

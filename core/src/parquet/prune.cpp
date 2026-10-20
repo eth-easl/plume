@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -36,6 +37,11 @@ std::optional<Value> DecodeStat(const std::vector<uint8_t> &bytes, const ColumnT
         }
     };
     switch (ct.id) {
+    case TypeId::BOOLEAN:
+        if (bytes.size() == 1) {
+            return Value::BOOLEAN(bytes[0] != 0);
+        }
+        return std::nullopt;
     case TypeId::INT8:
     case TypeId::INT16:
     case TypeId::INT32: // parquet's smallest physical int is INT32
@@ -46,6 +52,11 @@ std::optional<Value> DecodeStat(const std::vector<uint8_t> &bytes, const ColumnT
     case TypeId::DATE:
         if (bytes.size() == 4) {
             return norm(Value::DATE(duckdb::date_t(LoadLE<int32_t>(bytes.data()))));
+        }
+        return std::nullopt;
+    case TypeId::TIME: // TIME_MICROS
+        if (bytes.size() == 8) {
+            return Value::TIME(duckdb::dtime_t(LoadLE<int64_t>(bytes.data())));
         }
         return std::nullopt;
     case TypeId::INT64:
@@ -74,20 +85,61 @@ std::optional<Value> DecodeStat(const std::vector<uint8_t> &bytes, const ColumnT
             return norm(Value::DECIMAL(LoadLE<int64_t>(bytes.data()), ct.decimal_width, ct.decimal_scale));
         }
         return std::nullopt;
+    case TypeId::VARCHAR:
+        // Unsigned bytewise order, same as duckdb's string comparison. A truncated min (max) is
+        // still a lower (upper) bound; one cut within a UTF-8 sequence fails to construct.
+        try {
+            return Value(std::string(reinterpret_cast<const char *>(bytes.data()), bytes.size()));
+        } catch (...) {
+            return std::nullopt;
+        }
     default:
         return std::nullopt;
     }
 }
 
-// The stat's position on an order-preserving numeric axis.
-std::optional<double> StatPosition(const Value &v) {
-    if (v.type().id() == duckdb::LogicalTypeId::DATE) {
-        return static_cast<double>(v.GetValue<duckdb::date_t>().days);
-    }
-    try {
-        return v.GetValue<double>();
-    } catch (...) {
+// The column chunk's decoded [min, max], if its statistics have both.
+std::optional<std::pair<Value, Value>> DecodeMinMax(const ColumnStats &stats, const ColumnType &ct) {
+    if (!stats.has_min || !stats.has_max) {
         return std::nullopt;
+    }
+    if (ct.id == TypeId::VARCHAR && stats.deprecated_min_max) {
+        return std::nullopt; // signed byte order
+    }
+    auto lo = DecodeStat(stats.min_value, ct);
+    auto hi = DecodeStat(stats.max_value, ct);
+    if (!lo || !hi) {
+        return std::nullopt;
+    }
+    return std::make_pair(std::move(*lo), std::move(*hi));
+}
+
+// Strings are placed on the axis by the bytes following a common prefix; this many of them fit
+// into a double's mantissa exactly.
+constexpr size_t kStringPositionBytes = 6;
+
+// The stat's position on an order-preserving (but not strictly) numeric axis. Strings skip their
+// first string_prefix bytes.
+std::optional<double> StatPosition(const Value &v, size_t string_prefix) {
+    switch (v.type().id()) {
+    case duckdb::LogicalTypeId::DATE:
+        return static_cast<double>(v.GetValue<duckdb::date_t>().days);
+    case duckdb::LogicalTypeId::TIME:
+        return static_cast<double>(v.GetValue<duckdb::dtime_t>().micros);
+    case duckdb::LogicalTypeId::VARCHAR: {
+        const auto &str = duckdb::StringValue::Get(v);
+        double pos = 0;
+        for (size_t i = string_prefix; i < string_prefix + kStringPositionBytes; i++) {
+            pos = pos * 256 + (i < str.size() ? static_cast<uint8_t>(str[i]) : 0);
+        }
+        return pos;
+    }
+    default:
+        try {
+            return v.GetValue<double>();
+        } catch (...) {
+            return std::nullopt;
+        }
     }
 }
 
@@ -143,15 +195,10 @@ bool ComparisonMayMatch(const ExprNode &cmp, const RowGroupMeta &rgm, const Sche
     if (idx >= rgm.columns.size() || idx >= schema.columns.size()) {
         return true;
     }
-    const ColumnStats &stats = rgm.columns[idx].stats;
-    if (!stats.has_min || !stats.has_max) {
-        return true; // no stats ⇒ can't prune
-    }
     const ColumnType &ct = schema.columns[idx].type;
-    auto lo = DecodeStat(stats.min_value, ct);
-    auto hi = DecodeStat(stats.max_value, ct);
-    if (!lo || !hi) {
-        return true;
+    auto range = DecodeMinMax(rgm.columns[idx].stats, ct);
+    if (!range) {
+        return true; // no stats ⇒ can't prune
     }
     Value rhs;
     try {
@@ -162,7 +209,7 @@ bool ComparisonMayMatch(const ExprNode &cmp, const RowGroupMeta &rgm, const Sche
     } catch (...) {
         return true;
     }
-    return RangeSatisfies(op, *lo, *hi, rhs);
+    return RangeSatisfies(op, range->first, range->second, rhs);
 }
 
 } // namespace
@@ -193,8 +240,38 @@ bool RowGroupMayMatch(const ExprNode &pred, const RowGroupMeta &rgm, const Schem
     }
 }
 
+std::optional<std::vector<Value>> SortStatValues(const std::vector<Value> &values, const ColumnType &type) {
+    const LogicalType lt = ToLogicalType(type);
+    std::vector<Value> sorted;
+    sorted.reserve(values.size());
+    try {
+        for (const auto &v : values) {
+            sorted.push_back(v.DefaultCastAs(lt));
+        }
+    } catch (...) {
+        return std::nullopt;
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const Value &a, const Value &b) { return a < b; });
+    return sorted;
+}
+
+bool RowGroupMayContainAny(const RowGroupMeta &rgm, const Schema &file_schema, uint32_t column,
+                           const std::vector<Value> &sorted_values) {
+    if (column >= rgm.columns.size() || column >= file_schema.columns.size()) {
+        return true;
+    }
+    auto range = DecodeMinMax(rgm.columns[column].stats, file_schema.columns[column].type);
+    if (!range) {
+        return true;
+    }
+    // The first value >= min must also be <= max.
+    auto it = std::lower_bound(sorted_values.begin(), sorted_values.end(), range->first,
+                               [](const Value &a, const Value &b) { return a < b; });
+    return it != sorted_values.end() && *it <= range->second;
+}
+
 std::optional<double> MeanRowGroupCoverage(const std::vector<FileMeta> &files, uint32_t column) {
-    std::vector<std::pair<double, double>> ranges;
+    std::vector<std::pair<Value, Value>> stats;
     for (const auto &file : files) {
         if (column >= file.schema.columns.size()) {
             return std::nullopt;
@@ -204,31 +281,45 @@ std::optional<double> MeanRowGroupCoverage(const std::vector<FileMeta> &files, u
             if (column >= rg.columns.size()) {
                 return std::nullopt;
             }
-            const auto &stats = rg.columns[column].stats;
-            if (!stats.has_min || !stats.has_max) {
+            auto range = DecodeMinMax(rg.columns[column].stats, ct);
+            if (!range) {
                 return std::nullopt;
             }
-            auto lo = DecodeStat(stats.min_value, ct);
-            auto hi = DecodeStat(stats.max_value, ct);
-            auto lo_pos = lo ? StatPosition(*lo) : std::nullopt;
-            auto hi_pos = hi ? StatPosition(*hi) : std::nullopt;
-            if (!lo_pos || !hi_pos) {
-                return std::nullopt;
-            }
-            ranges.emplace_back(*lo_pos, *hi_pos);
+            stats.push_back(std::move(*range));
         }
     }
-    if (ranges.empty()) {
+    if (stats.empty()) {
         return std::nullopt;
     }
 
-    double global_min = ranges[0].first;
-    double global_max = ranges[0].second;
-    for (const auto &[lo, hi] : ranges) {
-        global_min = std::min(global_min, lo);
-        global_max = std::max(global_max, hi);
+    Value global_min = stats[0].first;
+    Value global_max = stats[0].second;
+    for (const auto &[lo, hi] : stats) {
+        if (lo < global_min) global_min = lo;
+        if (hi > global_max) global_max = hi;
     }
-    const double width = global_max - global_min;
+    // Every string within [global_min, global_max] shares their common prefix.
+    size_t string_prefix = 0;
+    if (global_min.type().id() == duckdb::LogicalTypeId::VARCHAR) {
+        const auto &a = duckdb::StringValue::Get(global_min);
+        const auto &b = duckdb::StringValue::Get(global_max);
+        while (string_prefix < a.size() && string_prefix < b.size() && a[string_prefix] == b[string_prefix]) {
+            string_prefix++;
+        }
+    }
+
+    std::vector<std::pair<double, double>> ranges;
+    ranges.reserve(stats.size());
+    for (const auto &[lo, hi] : stats) {
+        auto lo_pos = StatPosition(lo, string_prefix);
+        auto hi_pos = StatPosition(hi, string_prefix);
+        if (!lo_pos || !hi_pos) {
+            return std::nullopt;
+        }
+        ranges.emplace_back(*lo_pos, *hi_pos);
+    }
+    const double global_lo = *StatPosition(global_min, string_prefix);
+    const double width = *StatPosition(global_max, string_prefix) - global_lo;
     if (!(width > 0)) {
         return 1.0; // a single value: every row group holds it
     }

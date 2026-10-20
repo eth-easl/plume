@@ -97,6 +97,7 @@ Result<void> RunParquetPrepare() {
         // combine any dynamic filter with static pushed filters
         bool has_filter = config.has_pushed_filter;
         expr::ExprNode filter = config.pushed_filter;
+        std::optional<std::vector<duckdb::Value>> dyn_values;
         if (dyn_filter && config.dynamic_filter_column >= 0) {
             if (static_cast<size_t>(config.dynamic_filter_column) >= meta.schema.columns.size()) {
                 return Error("ParquetConfig.dynamic_filter_column exceeds metadata schema columns.", ErrorKind::OutOfRange);
@@ -109,13 +110,21 @@ Result<void> RunParquetPrepare() {
                          ) : std::move(*range);
                 has_filter = true;
             }
+            // An exact key set additionally prunes the row groups none of its keys falls into.
+            if (dyn_filter->has_values) {
+                dyn_values = parquet::SortStatValues(dyn_filter->values, col_type);
+            }
         }
 
         // filter pushdown
+        const bool prune = has_filter || dyn_values;
         std::vector<uint32_t> keep_row_groups;
-        if (has_filter) {
+        if (prune) {
             for (uint32_t rg = 0; rg < meta.row_groups.size(); rg++) {
-                if (parquet::RowGroupMayMatch(filter, meta.row_groups[rg], meta.schema)) {
+                const auto &rgm = meta.row_groups[rg];
+                if ((!has_filter || parquet::RowGroupMayMatch(filter, rgm, meta.schema)) &&
+                    (!dyn_values || parquet::RowGroupMayContainAny(rgm, meta.schema, config.dynamic_filter_column,
+                                                                   *dyn_values))) {
                     keep_row_groups.push_back(rg);
                 }
             }
@@ -125,7 +134,7 @@ Result<void> RunParquetPrepare() {
         }
 
         // projection pushdown
-        const size_t kept_rgs = has_filter ? keep_row_groups.size() : meta.row_groups.size();
+        const size_t kept_rgs = prune ? keep_row_groups.size() : meta.row_groups.size();
         const uint32_t file_splits = parquet::FileSplitCount(num_splits, num_files, static_cast<uint32_t>(file_idx),
                                                              kept_rgs, meta.row_groups.size());
         auto regions = parquet::DefineRegions(meta, file_splits, config.coalesce_distance,
