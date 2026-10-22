@@ -247,8 +247,49 @@ Result<std::unique_ptr<DynamicFilterProbe>> DynamicFilterProbe::Create(DynamicFi
     }
 }
 
+idx_t DynamicFilterProbe::SetDictionary(const Vector *dictionary, idx_t size) {
+    dict_data_ = nullptr;
+    dict_pass_.clear();
+    if (!dictionary) {
+        return 0;
+    }
+    // SelectRows only reads the keys.
+    auto &dict = const_cast<Vector &>(*dictionary);
+    duckdb::SelectionVector sel(size);
+    for (idx_t i = 0; i < size; i++) {
+        sel.set_index(i, i);
+    }
+    const idx_t passed = SelectRows(dict, size, sel, size);
+    dict_pass_.assign(size, 0);
+    for (idx_t i = 0; i < passed; i++) {
+        dict_pass_[sel.get_index(i)] = 1;
+    }
+    dict_data_ = duckdb::FlatVector::GetData(dict);
+    return passed;
+}
+
+idx_t DynamicFilterProbe::SelectDictionaryRows(Vector &keys, duckdb::SelectionVector &sel, idx_t count) {
+    const auto &dict_sel = duckdb::DictionaryVector::SelVector(keys);
+    idx_t passed = 0;
+    for (idx_t i = 0; i < count; i++) {
+        const auto row = sel.get_index(i);
+        const auto entry = dict_sel.get_index(row);
+        if (entry < dict_pass_.size() && dict_pass_[entry]) {
+            sel.set_index(passed++, row);
+        }
+    }
+    return passed;
+}
+
 idx_t DynamicFilterProbe::Select(Vector &keys, idx_t size, duckdb::SelectionVector &sel, idx_t count) {
-    const idx_t passed = SelectRows(keys, size, sel, count);
+    idx_t passed;
+    if (dict_data_ && keys.GetVectorType() == duckdb::VectorType::DICTIONARY_VECTOR &&
+        duckdb::DictionaryVector::Child(keys).GetVectorType() == duckdb::VectorType::FLAT_VECTOR &&
+        duckdb::FlatVector::GetData(duckdb::DictionaryVector::Child(keys)) == dict_data_) {
+        passed = SelectDictionaryRows(keys, sel, count);
+    } else {
+        passed = SelectRows(keys, size, sel, count);
+    }
     // The pass rate is judged once, over the first kWarmupRows checked rows.
     if (rows_checked_ < kWarmupRows) {
         rows_checked_ += count;

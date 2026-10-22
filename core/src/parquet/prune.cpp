@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -173,7 +174,10 @@ ExpressionType Flip(ExpressionType op) {
     }
 }
 
-bool ComparisonMayMatch(const ExprNode &cmp, const RowGroupMeta &rgm, const Schema &schema) {
+// The statistics of a file column, nullptr if unknown.
+using StatsOf = std::function<const ColumnStats *(uint32_t column)>;
+
+bool ComparisonMayMatch(const ExprNode &cmp, const StatsOf &stats_of, const Schema &schema) {
     if (cmp.children.size() != 2) {
         return true;
     }
@@ -192,11 +196,12 @@ bool ComparisonMayMatch(const ExprNode &cmp, const RowGroupMeta &rgm, const Sche
     }
 
     const uint32_t idx = ref->ref_index;
-    if (idx >= rgm.columns.size() || idx >= schema.columns.size()) {
+    const ColumnStats *stats = stats_of(idx);
+    if (!stats || idx >= schema.columns.size()) {
         return true;
     }
     const ColumnType &ct = schema.columns[idx].type;
-    auto range = DecodeMinMax(rgm.columns[idx].stats, ct);
+    auto range = DecodeMinMax(*stats, ct);
     if (!range) {
         return true; // no stats ⇒ can't prune
     }
@@ -212,32 +217,48 @@ bool ComparisonMayMatch(const ExprNode &cmp, const RowGroupMeta &rgm, const Sche
     return RangeSatisfies(op, range->first, range->second, rhs);
 }
 
-} // namespace
-
-bool RowGroupMayMatch(const ExprNode &pred, const RowGroupMeta &rgm, const Schema &file_schema) {
+bool PredicateMayMatch(const ExprNode &pred, const StatsOf &stats_of, const Schema &schema) {
     switch (pred.kind) {
     case ExprKind::CONJUNCTION: {
         const auto conj = static_cast<ExpressionType>(pred.expr_type);
         if (conj == ExpressionType::CONJUNCTION_AND) {
             for (const auto &child : pred.children) {
-                if (!RowGroupMayMatch(child, rgm, file_schema)) {
+                if (!PredicateMayMatch(child, stats_of, schema)) {
                     return false;
                 }
             }
             return true;
         }
         for (const auto &child : pred.children) {
-            if (RowGroupMayMatch(child, rgm, file_schema)) {
+            if (PredicateMayMatch(child, stats_of, schema)) {
                 return true;
             }
         }
         return false;
     }
     case ExprKind::COMPARISON:
-        return ComparisonMayMatch(pred, rgm, file_schema);
+        return ComparisonMayMatch(pred, stats_of, schema);
     default:
         return true; // anything we don't model ⇒ keep
     }
+}
+
+bool StatsMayContainAny(const ColumnStats &stats, const ColumnType &type, const std::vector<Value> &sorted_values) {
+    auto range = DecodeMinMax(stats, type);
+    if (!range) {
+        return true;
+    }
+    // The first value >= min must also be <= max.
+    auto it = std::lower_bound(sorted_values.begin(), sorted_values.end(), range->first,
+                               [](const Value &a, const Value &b) { return a < b; });
+    return it != sorted_values.end() && *it <= range->second;
+}
+
+} // namespace
+
+bool RowGroupMayMatch(const ExprNode &pred, const RowGroupMeta &rgm, const Schema &file_schema) {
+    return PredicateMayMatch(pred, [&](uint32_t c) { return c < rgm.columns.size() ? &rgm.columns[c].stats : nullptr; },
+                             file_schema);
 }
 
 std::optional<std::vector<Value>> SortStatValues(const std::vector<Value> &values, const ColumnType &type) {
@@ -260,14 +281,41 @@ bool RowGroupMayContainAny(const RowGroupMeta &rgm, const Schema &file_schema, u
     if (column >= rgm.columns.size() || column >= file_schema.columns.size()) {
         return true;
     }
-    auto range = DecodeMinMax(rgm.columns[column].stats, file_schema.columns[column].type);
-    if (!range) {
-        return true;
+    return StatsMayContainAny(rgm.columns[column].stats, file_schema.columns[column].type, sorted_values);
+}
+
+std::optional<std::vector<RowRange>> SelectPageRows(const ExprNode *pred, const std::vector<Value> *sorted_values,
+                                                    uint32_t column, const Schema &file_schema,
+                                                    const std::vector<PageLocation> &pages, const ColumnIndex &index,
+                                                    uint64_t rg_rows) {
+    if (column >= file_schema.columns.size() || pages.empty() || index.stats.size() != pages.size()) {
+        return std::nullopt;
     }
-    // The first value >= min must also be <= max.
-    auto it = std::lower_bound(sorted_values.begin(), sorted_values.end(), range->first,
-                               [](const Value &a, const Value &b) { return a < b; });
-    return it != sorted_values.end() && *it <= range->second;
+    const ColumnType &type = file_schema.columns[column].type;
+    std::vector<RowRange> rows;
+    for (size_t p = 0; p < pages.size(); p++) {
+        const uint64_t begin = static_cast<uint64_t>(pages[p].first_row);
+        const uint64_t end = p + 1 < pages.size() ? static_cast<uint64_t>(pages[p + 1].first_row) : rg_rows;
+        if (end < begin || end > rg_rows) {
+            return std::nullopt; // doesn't fit the row group
+        }
+        if (index.null_pages[p]) {
+            continue; // NULL keys never match
+        }
+        const ColumnStats &stats = index.stats[p];
+        if (pred && !PredicateMayMatch(*pred, [&](uint32_t c) { return c == column ? &stats : nullptr; }, file_schema)) {
+            continue;
+        }
+        if (sorted_values && !StatsMayContainAny(stats, type, *sorted_values)) {
+            continue;
+        }
+        if (!rows.empty() && rows.back().end == begin) {
+            rows.back().end = end;
+        } else if (end > begin) {
+            rows.push_back({begin, end});
+        }
+    }
+    return rows;
 }
 
 std::optional<double> MeanRowGroupCoverage(const std::vector<FileMeta> &files, uint32_t column) {

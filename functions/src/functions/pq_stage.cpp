@@ -46,6 +46,35 @@ namespace {
 
 uint64_t ParseIdent(const std::string &s) { return s.empty() ? 0 : std::stoull(s); }
 
+// Rows [first, second) of a row group, sorted and disjoint.
+using RowRanges = std::vector<std::pair<uint64_t, uint64_t>>;
+
+RowRanges Intersect(const RowRanges &a, const RowRanges &b) {
+    RowRanges out;
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        const uint64_t begin = std::max(a[i].first, b[j].first);
+        const uint64_t end = std::min(a[i].second, b[j].second);
+        if (begin < end) {
+            out.emplace_back(begin, end);
+        }
+        (a[i].second < b[j].second) ? i++ : j++;
+    }
+    return out;
+}
+
+// The number of rows a column chunk holding only the `covered` rows holds before `row`.
+uint64_t StreamOffset(const RowRanges &covered, uint64_t row) {
+    uint64_t offset = 0;
+    for (auto [begin, end] : covered) {
+        if (begin >= row) {
+            break;
+        }
+        offset += std::min(end, row) - begin;
+    }
+    return offset;
+}
+
 std::vector<uint32_t> RemainingColumns(uint32_t num_cols, const std::vector<uint8_t> &col_is_filter) {
     std::vector<uint32_t> rest;
     for (uint32_t c = 0; c < num_cols; c++) {
@@ -168,14 +197,40 @@ Result<void> RunParquetStage() {
                              ErrorKind::InvalidInput);
             }
 
+            // A column chunk read only in part (DataChunk::pages) is assembled from its dictionary
+            // page and page runs; it holds just the rows of its runs.
             std::vector<const uint8_t *> bases(ncol);
-            for (size_t c = 0; c < ncol; c++) {
-                auto &dc = rg[c];
-                auto it = data_chunk_index.find({region_key, dc.req_idx});
-                if (it == data_chunk_index.end()) {
+            std::vector<size_t> sizes(ncol);
+            std::vector<std::vector<uint8_t>> assembled(ncol);
+            std::vector<RowRanges> covered(ncol);
+            bool partial = false;
+            auto fetched = [&](uint64_t req_idx, uint64_t req_offset, int64_t size) -> Result<const uint8_t *> {
+                auto it = data_chunk_index.find({region_key, req_idx});
+                if (it == data_chunk_index.end() || req_offset + static_cast<uint64_t>(size) > it->second->size()) {
                     return Error("Plume: no fetched buffer for parquet chunk request", ErrorKind::InvalidInput);
                 }
-                bases[c] = it->second->data() + dc.req_offset;
+                return it->second->data() + req_offset;
+            };
+            for (size_t c = 0; c < ncol; c++) {
+                auto &dc = rg[c];
+                if (dc.pages.empty()) {
+                    TRY(bases[c], fetched(dc.req_idx, dc.req_offset, dc.size));
+                    sizes[c] = static_cast<size_t>(dc.size);
+                    continue;
+                }
+                partial = true;
+                auto &buf = assembled[c];
+                if (dc.size > 0) {
+                    TRY(auto dict, fetched(dc.req_idx, dc.req_offset, dc.size));
+                    buf.insert(buf.end(), dict, dict + dc.size);
+                }
+                for (const auto &run : dc.pages) {
+                    TRY(auto pages, fetched(run.req_idx, run.req_offset, run.size));
+                    buf.insert(buf.end(), pages, pages + run.size);
+                    covered[c].emplace_back(run.first_row, run.first_row + run.num_rows);
+                }
+                bases[c] = buf.data();
+                sizes[c] = buf.size();
             }
 
             std::vector<parquet::ColumnChunkReader> readers;
@@ -184,74 +239,122 @@ Result<void> RunParquetStage() {
                 readers.reserve(ncol);
                 for (size_t c = 0; c < ncol; c++) {
                     const auto &col = schema.columns[c];
-                    readers.emplace_back(bases[c], static_cast<size_t>(rg[c].size), col.type, col.nullable,
-                                         rg[c].codec);
+                    readers.emplace_back(bases[c], sizes[c], col.type, col.nullable, rg[c].codec);
                     num_rows = std::max(num_rows, readers.back().TotalRows());
                 }
             }));
 
-            for (size_t start = 0; start < num_rows; start += STANDARD_VECTOR_SIZE) {
-                const size_t n = std::min<size_t>(STANDARD_VECTOR_SIZE, num_rows - start);
-                auto chunk = std::make_unique<DataChunk>();
-                chunk->Initialize(alloc.Get(), types);
+            // The rows to read: those every column holds.
+            RowRanges target = {{0, num_rows}};
+            if (partial) {
+                std::optional<RowRanges> common;
+                for (size_t c = 0; c < ncol; c++) {
+                    if (!rg[c].pages.empty()) {
+                        common = common ? Intersect(*common, covered[c]) : covered[c];
+                    }
+                }
+                target = std::move(*common);
+                for (size_t c = 0; c < ncol; c++) {
+                    if (rg[c].pages.empty()) {
+                        covered[c] = {{0, readers[c].TotalRows()}};
+                    }
+                    if (Intersect(target, covered[c]) != target) {
+                        return Error("Region columns don't hold the same rows.", ErrorKind::InvalidInput);
+                    }
+                }
+            }
 
-                const bool use_filter = scan_filter != nullptr;
-                const bool use_probe = probe && probe->Active();
-                const auto &early_cols = use_probe ? probe_early_cols : filter_cols;
-                const auto &late_cols = use_probe ? probe_rest_cols : rest_cols;
+            if (probe) {
+                // A fully dictionary-encoded key column chunk holds no other values than its
+                // dictionary: check the dictionary once instead of every row.
+                const duckdb::Vector *dict = nullptr;
+                if (probe->Active()) {
+                    TRYV(TryCatch([&] { dict = readers[probe_col].Dictionary(types[probe_col]); }));
+                }
+                const idx_t passed = probe->SetDictionary(dict, dict ? readers[probe_col].DictionaryVectorSize() : 0);
+                if (dict && passed == 0) {
+                    continue; // no key of the row group can find a join partner
+                }
+            }
 
-                bool emit = true;
-                TRYV(TryCatch([&] {
-                    if (!use_filter && !use_probe) {
+            std::vector<uint64_t> stream_pos(ncol, 0); // rows of each column chunk consumed
+            for (auto [range_begin, range_end] : target) {
+                if (partial) {
+                    // Skip the rows of each column chunk before the range.
+                    TRYV(TryCatch([&] {
                         for (size_t c = 0; c < ncol; c++) {
+                            const uint64_t at = StreamOffset(covered[c], range_begin);
+                            readers[c].Skip(at - stream_pos[c]);
+                            stream_pos[c] = at;
+                        }
+                    }));
+                }
+                for (size_t start = range_begin; start < range_end; start += STANDARD_VECTOR_SIZE) {
+                    const size_t n = std::min<size_t>(STANDARD_VECTOR_SIZE, range_end - start);
+                    for (auto &pos : stream_pos) {
+                        pos += n;
+                    }
+                    auto chunk = std::make_unique<DataChunk>();
+                    chunk->Initialize(alloc.Get(), types);
+
+                    const bool use_filter = scan_filter != nullptr;
+                    const bool use_probe = probe && probe->Active();
+                    const auto &early_cols = use_probe ? probe_early_cols : filter_cols;
+                    const auto &late_cols = use_probe ? probe_rest_cols : rest_cols;
+
+                    bool emit = true;
+                    TRYV(TryCatch([&] {
+                        if (!use_filter && !use_probe) {
+                            for (size_t c = 0; c < ncol; c++) {
+                                readers[c].ReadInto(chunk->data[c], n);
+                            }
+                            chunk->SetCardinality(n);
+                            return;
+                        }
+
+                        // 1. Decode the early columns and evaluate the scan and the dynamic filters.
+                        for (auto c : early_cols) {
                             readers[c].ReadInto(chunk->data[c], n);
                         }
                         chunk->SetCardinality(n);
-                        return;
-                    }
-
-                    // 1. Decode the early columns and evaluate the scan and the dynamic filters.
-                    for (auto c : early_cols) {
-                        readers[c].ReadInto(chunk->data[c], n);
-                    }
-                    chunk->SetCardinality(n);
-                    duckdb::SelectionVector sel(n);
-                    duckdb::idx_t sc = n;
-                    if (use_filter) {
-                        sc = scan_filter->Select(*chunk, sel);
-                    } else {
-                        for (duckdb::idx_t j = 0; j < n; j++) {
-                            sel.set_index(j, j);
+                        duckdb::SelectionVector sel(n);
+                        duckdb::idx_t sc = n;
+                        if (use_filter) {
+                            sc = scan_filter->Select(*chunk, sel);
+                        } else {
+                            for (duckdb::idx_t j = 0; j < n; j++) {
+                                sel.set_index(j, j);
+                            }
                         }
-                    }
-                    if (use_probe && sc > 0) {
-                        sc = probe->Select(chunk->data[probe_col], n, sel, sc);
-                    }
-                    if (sc == 0) {
-                        // Whole window rejected: advance the other readers, emit nothing.
+                        if (use_probe && sc > 0) {
+                            sc = probe->Select(chunk->data[probe_col], n, sel, sc);
+                        }
+                        if (sc == 0) {
+                            // Whole window rejected: advance the other readers, emit nothing.
+                            for (auto c : late_cols) {
+                                readers[c].Skip(n);
+                            }
+                            emit = false;
+                            return;
+                        }
+
+                        // 2. Late-materialize the remaining columns for survivors only.
+                        keep.assign(n, 0);
+                        for (duckdb::idx_t j = 0; j < sc; j++) {
+                            keep[sel.get_index(j)] = 1;
+                        }
                         for (auto c : late_cols) {
-                            readers[c].Skip(n);
+                            readers[c].ReadInto(chunk->data[c], n, keep.data());
                         }
-                        emit = false;
-                        return;
-                    }
 
-                    // 2. Late-materialize the remaining columns for survivors only.
-                    keep.assign(n, 0);
-                    for (duckdb::idx_t j = 0; j < sc; j++) {
-                        keep[sel.get_index(j)] = 1;
+                        // 3. Compact every column to the surviving rows.
+                        chunk->Slice(sel, sc);
+                    }));
+                    if (!emit) {
+                        continue;
                     }
-                    for (auto c : late_cols) {
-                        readers[c].ReadInto(chunk->data[c], n, keep.data());
-                    }
-
-                    // 3. Compact every column to the surviving rows.
-                    chunk->Slice(sel, sc);
-                }));
-                if (!emit) {
-                    continue;
+                    TRYV(executor.Push(std::move(chunk)));
                 }
-                TRYV(executor.Push(std::move(chunk)));
             }
         }
     }

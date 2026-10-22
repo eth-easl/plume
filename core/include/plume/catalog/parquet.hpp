@@ -14,10 +14,20 @@ namespace plume::catalog {
 struct RemoteParquetDataSource : public DataSource {
     std::vector<parquet::FileMeta> metadata = {};
     std::vector<std::vector<uint8_t>> footer_bytes = {};
+    // Per file: bytes of the file from page_index_offsets[i] on holding page indexes (see
+    // FetchPageIndexes), empty if none were fetched.
+    std::vector<int64_t> page_index_offsets = {};
+    std::vector<std::vector<uint8_t>> page_index_bytes = {};
 
     RemoteParquetDataSource() : DataSource(DataSourceType::REMOTE_PARQUET) {}
     Result<void> Resolve(const RemoteResolver &resolver) override;
 };
+
+// Queues fetching each file's page indexes pq_prepare needs to select pages by a dynamic filter on
+// file column `key_col`: the key column's column and offset indexes and the read columns' offset
+// indexes (all columns for an empty projection). Files without them are left out.
+void FetchPageIndexes(RemoteParquetDataSource &src, const RemoteResolver &resolver, uint32_t key_col,
+                      const std::vector<uint32_t> &projection);
 
 std::shared_ptr<DataSource> CreateRemoteParquetSource(std::string name, std::vector<std::string> urls);
 

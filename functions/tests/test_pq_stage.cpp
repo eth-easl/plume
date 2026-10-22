@@ -297,13 +297,12 @@ namespace {
 // operators and the dynamic filter attached to the region on column `dyn_col`; returns the rows.
 // With `build_filters`, the region only names the column and the filters arrive per build
 // instance on input set 3 instead (no pq_prepare in between).
-std::vector<std::pair<int32_t, int32_t>> RunIdAmountStage(const std::vector<int32_t> &ids,
-        const std::vector<int32_t> &amounts, std::vector<std::shared_ptr<OperatorTemplate>> operators,
+// Runs pq_stage over one row group of the (id, amount) INT32 column chunks.
+std::vector<std::pair<int32_t, int32_t>> RunChunksStage(const std::vector<uint8_t> &id_chunk,
+        const std::vector<uint8_t> &amt_chunk, std::vector<std::shared_ptr<OperatorTemplate>> operators,
         const DynamicFilter *dyn_filter, int32_t dyn_col = 0,
         const std::optional<std::vector<DynamicFilter>> &build_filters = std::nullopt) {
     mock::Reset();
-    auto id_chunk = PlainInt32Chunk(ids);
-    auto amt_chunk = PlainInt32Chunk(amounts);
 
     parquet::Region region;
     parquet::DataChunk dc0;
@@ -366,6 +365,14 @@ std::vector<std::pair<int32_t, int32_t>> RunIdAmountStage(const std::vector<int3
     return rows;
 }
 
+std::vector<std::pair<int32_t, int32_t>> RunIdAmountStage(const std::vector<int32_t> &ids,
+        const std::vector<int32_t> &amounts, std::vector<std::shared_ptr<OperatorTemplate>> operators,
+        const DynamicFilter *dyn_filter, int32_t dyn_col = 0,
+        const std::optional<std::vector<DynamicFilter>> &build_filters = std::nullopt) {
+    return RunChunksStage(PlainInt32Chunk(ids), PlainInt32Chunk(amounts), std::move(operators), dyn_filter, dyn_col,
+                          build_filters);
+}
+
 DynamicFilter ExactInts(std::vector<int32_t> keys) {
     DynamicFilter f;
     f.max_values = 16;
@@ -411,6 +418,151 @@ TEST_CASE("plume_pq_stage: dynamic filter drops probe rows without a join partne
 
     // No dynamic filter -> everything.
     CHECK(RunIdAmountStage(ids, amounts, {}, nullptr).size() == ids.size());
+}
+
+TEST_CASE("ColumnChunkReader: dictionary of a fully dictionary-encoded chunk") {
+    auto chunk = DictInt32Chunk({10, 20, 30}, {0, 2, 1, 0}, 2);
+    parquet::ColumnChunkReader r(chunk.data(), chunk.size(), I32(), /*nullable=*/false);
+    const auto *dict = r.Dictionary(duckdb::LogicalType::INTEGER);
+    CHECK(dict != nullptr);
+    CHECK(r.DictionaryVectorSize() == 4); // + the NULL sentinel
+    CHECK(duckdb::FlatVector::GetData<int32_t>(*dict)[1] == 20);
+
+    // Reads reference the same dictionary.
+    duckdb::Vector vec(duckdb::LogicalType::INTEGER);
+    CHECK(r.ReadInto(vec, 4) == 4);
+    CHECK(vec.GetVectorType() == duckdb::VectorType::DICTIONARY_VECTOR);
+    CHECK(duckdb::FlatVector::GetData<int32_t>(duckdb::DictionaryVector::Child(vec)) ==
+          duckdb::FlatVector::GetData<int32_t>(*dict));
+    CHECK(vec.GetValue(1) == duckdb::Value::INTEGER(30));
+
+    // A PLAIN chunk has none.
+    auto plain = PlainInt32Chunk({1, 2});
+    parquet::ColumnChunkReader p(plain.data(), plain.size(), I32(), false);
+    CHECK(p.Dictionary(duckdb::LogicalType::INTEGER) == nullptr);
+}
+
+TEST_CASE("plume_pq_stage: dynamic filter checks a dictionary-encoded key column's dictionary") {
+    // ids 10, 30, 20, 10, 20
+    auto ids = DictInt32Chunk({10, 20, 30}, {0, 2, 1, 0, 1}, 2);
+    auto amounts = PlainInt32Chunk({1, 2, 3, 4, 5});
+    auto twenty = ExactInts({20});
+    CHECK(RunChunksStage(ids, amounts, {}, &twenty) == Rows({{20, 3}, {20, 5}}));
+
+    // No dictionary entry passes: the row group is skipped before decoding anything else. The scan
+    // filter would decode amount first otherwise, whose unsupported page encoding fails the stage.
+    auto bad_amounts = Concat(DataPageV1Header(5, /*encoding=*/99, 20, 20), std::vector<uint8_t>(20, 0));
+    auto scan_filter = std::make_shared<FilterTemplate>();
+    scan_filter->filter = expr::ExprNode::Comparison(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                                     expr::ExprNode::Reference(1, I32()),
+                                                     expr::ExprNode::Constant(duckdb::Value::INTEGER(0), I32()));
+    auto fifteen = ExactInts({15});
+    CHECK(RunChunksStage(ids, bad_amounts, {scan_filter}, &fifteen).empty());
+}
+
+namespace {
+
+// A multi-page INT32 column chunk; `offsets` gets each page's offset in it.
+std::vector<uint8_t> PagedInt32Chunk(const std::vector<std::vector<int32_t>> &pages, std::vector<int64_t> &offsets) {
+    std::vector<uint8_t> chunk;
+    for (const auto &p : pages) {
+        offsets.push_back(int64_t(chunk.size()));
+        auto page = PlainInt32Chunk(p);
+        chunk.insert(chunk.end(), page.begin(), page.end());
+    }
+    offsets.push_back(int64_t(chunk.size()));
+    return chunk;
+}
+
+// Runs pq_stage over one row group of which only the given page runs of the (id, amount) chunks
+// are read; runs are {first page, last page} of the column's pages.
+Rows RunPagedStage(const std::vector<std::vector<int32_t>> &id_pages, const std::vector<std::pair<int, int>> &id_runs,
+                   const std::vector<std::vector<int32_t>> &amt_pages, const std::vector<std::pair<int, int>> &amt_runs,
+                   const DynamicFilter *dyn_filter = nullptr) {
+    mock::Reset();
+    std::vector<int64_t> id_offsets, amt_offsets;
+    auto id_chunk = PagedInt32Chunk(id_pages, id_offsets);
+    auto amt_chunk = PagedInt32Chunk(amt_pages, amt_offsets);
+
+    auto column = [](uint64_t col, uint64_t req, const std::vector<std::vector<int32_t>> &pages,
+                     const std::vector<int64_t> &offsets, const std::vector<std::pair<int, int>> &runs) {
+        parquet::DataChunk dc;
+        dc.row_group_idx = 0;
+        dc.column_idx = col;
+        dc.offset = 0;
+        dc.size = 0; // no dictionary page
+        dc.req_idx = req;
+        dc.req_offset = 0;
+        uint64_t first_row = 0;
+        std::vector<uint64_t> page_rows;
+        for (const auto &p : pages) {
+            page_rows.push_back(first_row);
+            first_row += p.size();
+        }
+        page_rows.push_back(first_row);
+        for (auto [first, last] : runs) {
+            parquet::PageRun run;
+            run.offset = offsets[first];
+            run.size = offsets[last + 1] - offsets[first];
+            run.first_row = page_rows[first];
+            run.num_rows = page_rows[last + 1] - page_rows[first];
+            run.req_idx = req;
+            run.req_offset = uint64_t(offsets[first]);
+            dc.pages.push_back(run);
+        }
+        return dc;
+    };
+    parquet::Region region;
+    region.row_groups.push_back({column(0, 0, id_pages, id_offsets, id_runs),
+                                 column(1, 1, amt_pages, amt_offsets, amt_runs)});
+    region.requests.push_back({0, int64_t(id_chunk.size())});
+    region.requests.push_back({0, int64_t(amt_chunk.size())});
+    if (dyn_filter) {
+        auto buf = SerializeToBuffer(*dyn_filter);
+        region.dynamic_filter_column = 0;
+        region.dynamic_filter.assign(buf.data(), buf.data() + buf.size());
+    }
+
+    PipelineTemplate desc;
+    desc.input_schema.columns = {{"id", I32(), false}, {"amount", I32(), false}};
+    auto blob = plume::SerializePipeline(desc);
+    mock::AddInput(0, mock::MakeBuffer(blob.data(), blob.size()), "template", 0);
+    mock::AddInput(1, region.Serialize(), "region", 0);
+    mock::AddInput(2, mock::MakeBuffer(id_chunk.data(), id_chunk.size()), "0", 0);
+    mock::AddInput(2, mock::MakeBuffer(amt_chunk.data(), amt_chunk.size()), "1", 0);
+    CHECK(fn::RunParquetStage().is_ok());
+
+    Rows rows;
+    for (auto *out : mock::OutputsForSet(0)) {
+        Schema schema;
+        auto chunks =
+            memory::ImportBlockChunks(const_cast<uint8_t *>(out->buffer.data()), out->buffer.size(), schema).unwrap();
+        for (auto &c : chunks) {
+            for (idx_t r = 0; r < c->size(); r++) {
+                rows.emplace_back(c->GetValue(0, r).GetValue<int32_t>(), c->GetValue(1, r).GetValue<int32_t>());
+            }
+        }
+    }
+    return rows;
+}
+
+const std::vector<std::vector<int32_t>> kIdPages = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
+const std::vector<std::vector<int32_t>> kAmountPages = {{10, 20}, {30, 40, 50, 60}, {70, 80, 90}};
+
+} // namespace
+
+TEST_CASE("plume_pq_stage: reads only the rows every column's selected pages hold") {
+    // id page 1 holds rows [3, 6); amount page 1 rows [2, 6).
+    CHECK(RunPagedStage(kIdPages, {{1, 1}}, kAmountPages, {{1, 1}}) == Rows({{4, 40}, {5, 50}, {6, 60}}));
+    // id pages 0 and 2: rows [0, 3) and [6, 9) of the amount chunk read whole.
+    CHECK(RunPagedStage(kIdPages, {{0, 0}, {2, 2}}, kAmountPages, {{0, 2}}) ==
+          Rows({{1, 10}, {2, 20}, {3, 30}, {7, 70}, {8, 80}, {9, 90}}));
+    // Same, with amount runs [0, 2) + [2, 6) and [6, 9) apart.
+    CHECK(RunPagedStage(kIdPages, {{0, 0}, {2, 2}}, kAmountPages, {{0, 1}, {2, 2}}) ==
+          Rows({{1, 10}, {2, 20}, {3, 30}, {7, 70}, {8, 80}, {9, 90}}));
+    // Together with the dynamic filter.
+    auto eight = ExactInts({8});
+    CHECK(RunPagedStage(kIdPages, {{0, 0}, {2, 2}}, kAmountPages, {{0, 2}}, &eight) == Rows({{8, 80}}));
 }
 
 TEST_CASE("plume_pq_stage: dynamic filter combines with the pushed-down scan filter") {

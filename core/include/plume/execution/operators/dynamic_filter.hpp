@@ -67,14 +67,25 @@ public:
     // the rows whose key may find a join partner. Returns the number of remaining rows.
     duckdb::idx_t Select(duckdb::Vector &keys, duckdb::idx_t size, duckdb::SelectionVector &sel, duckdb::idx_t count);
 
+    // Evaluates the filter once on each of the `size` entries of the flat vector `dictionary`;
+    // Select() then looks up keys given as a DICTIONARY_VECTOR over it instead of checking each
+    // row. Returns the number of entries that pass. nullptr forgets the dictionary, which must
+    // happen before it's freed.
+    duckdb::idx_t SetDictionary(const duckdb::Vector *dictionary, duckdb::idx_t size);
+
 protected:
     virtual duckdb::idx_t SelectRows(duckdb::Vector &keys, duckdb::idx_t size, duckdb::SelectionVector &sel,
                                      duckdb::idx_t count) = 0;
 
 private:
+    duckdb::idx_t SelectDictionaryRows(duckdb::Vector &keys, duckdb::SelectionVector &sel, duckdb::idx_t count);
+
     bool active_ = true;
     uint64_t rows_checked_ = 0;
     uint64_t rows_passed_ = 0;
+    // The current dictionary (identified by its data) and which of its entries pass.
+    const void *dict_data_ = nullptr;
+    std::vector<uint8_t> dict_pass_;
 };
 
 // Range predicate over the filter's key range. Returns a nullopt if it has no bounds.

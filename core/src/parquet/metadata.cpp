@@ -180,6 +180,14 @@ ColumnChunkMeta ParseColumnChunk(CompactReader &r) {
     while (r.Field(last, type, id)) {
         if (id == 3 && type == CT_STRUCT) {
             ParseColumnMetaData(r, cc);
+        } else if (id == 4 && type == CT_I64) {
+            cc.offset_index_offset = r.ZigZag();
+        } else if (id == 5 && type == CT_I32) {
+            cc.offset_index_length = static_cast<int32_t>(r.ZigZag());
+        } else if (id == 6 && type == CT_I64) {
+            cc.column_index_offset = r.ZigZag();
+        } else if (id == 7 && type == CT_I32) {
+            cc.column_index_length = static_cast<int32_t>(r.ZigZag());
         } else {
             r.Skip(type);
         }
@@ -200,6 +208,8 @@ RowGroupMeta ParseRowGroup(CompactReader &r) {
             for (uint64_t i = 0; i < n; i++) {
                 rg.columns.push_back(ParseColumnChunk(r));
             }
+        } else if (id == 3 && type == CT_I64) {
+            rg.num_rows = r.ZigZag();
         } else {
             r.Skip(type);
         }
@@ -239,7 +249,107 @@ FileMeta ParseFileMetaData(CompactReader &r) {
     return fm;
 }
 
+PageLocation ParsePageLocation(CompactReader &r) {
+    PageLocation loc;
+    int16_t last = 0, id;
+    uint8_t type;
+    while (r.Field(last, type, id)) {
+        if (id == 1 && type == CT_I64) {
+            loc.offset = r.ZigZag();
+        } else if (id == 2 && type == CT_I32) {
+            loc.size = static_cast<int32_t>(r.ZigZag());
+        } else if (id == 3 && type == CT_I64) {
+            loc.first_row = r.ZigZag();
+        } else {
+            r.Skip(type);
+        }
+    }
+    return loc;
+}
+
+std::vector<std::vector<uint8_t>> ReadBinaryList(CompactReader &r) {
+    uint64_t n;
+    uint8_t et;
+    r.ListHeader(n, et);
+    if (et != CT_BINARY) {
+        r.SkipElements(n, et);
+        return {};
+    }
+    std::vector<std::vector<uint8_t>> out;
+    out.reserve(n);
+    for (uint64_t i = 0; i < n; i++) {
+        out.push_back(ReadBinary(r));
+    }
+    return out;
+}
+
 } // namespace
+
+Result<std::vector<PageLocation>> ParseOffsetIndex(const uint8_t *data, size_t size) {
+    return TryCatch([&]() -> std::vector<PageLocation> {
+        CompactReader r(data, size);
+        std::vector<PageLocation> pages;
+        int16_t last = 0, id;
+        uint8_t type;
+        while (r.Field(last, type, id)) {
+            if (id == 1 && type == CT_LIST) {
+                uint64_t n;
+                uint8_t et;
+                r.ListHeader(n, et);
+                if (et != CT_STRUCT) {
+                    throw std::runtime_error("parquet: malformed OffsetIndex");
+                }
+                pages.reserve(n);
+                for (uint64_t i = 0; i < n; i++) {
+                    pages.push_back(ParsePageLocation(r));
+                }
+            } else {
+                r.Skip(type);
+            }
+        }
+        return pages;
+    });
+}
+
+Result<ColumnIndex> ParseColumnIndex(const uint8_t *data, size_t size) {
+    return TryCatch([&]() -> ColumnIndex {
+        CompactReader r(data, size);
+        std::vector<uint8_t> null_pages;
+        std::vector<std::vector<uint8_t>> mins, maxs;
+        int16_t last = 0, id;
+        uint8_t type;
+        while (r.Field(last, type, id)) {
+            if (id == 1 && type == CT_LIST) {
+                uint64_t n;
+                uint8_t et;
+                r.ListHeader(n, et);
+                for (uint64_t i = 0; i < n; i++) {
+                    null_pages.push_back(r.Byte() == CT_BOOL_TRUE); // bool elements: 1 true, else false
+                }
+            } else if (id == 2 && type == CT_LIST) {
+                mins = ReadBinaryList(r);
+            } else if (id == 3 && type == CT_LIST) {
+                maxs = ReadBinaryList(r);
+            } else {
+                r.Skip(type);
+            }
+        }
+        if (mins.size() != null_pages.size() || maxs.size() != null_pages.size()) {
+            throw std::runtime_error("parquet: malformed ColumnIndex");
+        }
+        ColumnIndex index;
+        index.stats.resize(null_pages.size());
+        for (size_t i = 0; i < null_pages.size(); i++) {
+            if (!null_pages[i]) {
+                index.stats[i].has_min = index.stats[i].has_max = true;
+                index.stats[i].min_value = std::move(mins[i]);
+                index.stats[i].max_value = std::move(maxs[i]);
+            }
+        }
+        index.null_pages = std::move(null_pages);
+        return index;
+    });
+}
 
 Result<FileMeta> ParseFooter(const uint8_t *tail, size_t size) {
     if (size < 8 || std::memcmp(tail + size - 4, "PAR1", 4) != 0) {

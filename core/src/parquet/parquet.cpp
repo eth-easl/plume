@@ -18,6 +18,10 @@ void ParquetConfig::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(106, "dynamic_filter_column", dynamic_filter_column);
     s.WriteList(107, "file_row_group_offsets", file_row_group_offsets.size(),
                 [&](duckdb::Serializer::List &list, duckdb::idx_t i) { list.WriteElement(file_row_group_offsets[i]); });
+    s.WriteList(108, "page_index_offsets", page_index_offsets.size(),
+                [&](duckdb::Serializer::List &list, duckdb::idx_t i) { list.WriteElement(page_index_offsets[i]); });
+    s.WriteList(109, "page_index_sizes", page_index_sizes.size(),
+                [&](duckdb::Serializer::List &list, duckdb::idx_t i) { list.WriteElement(page_index_sizes[i]); });
 }
 
 ParquetConfig ParquetConfig::Deserialize(duckdb::Deserializer &d) {
@@ -33,6 +37,12 @@ ParquetConfig ParquetConfig::Deserialize(duckdb::Deserializer &d) {
     c.dynamic_filter_column = d.ReadPropertyWithExplicitDefault<int32_t>(106, "dynamic_filter_column", -1);
     d.ReadList(107, "file_row_group_offsets", [&](duckdb::Deserializer::List &list, duckdb::idx_t /*i*/) {
         c.file_row_group_offsets.push_back(list.ReadElement<uint64_t>());
+    });
+    d.ReadList(108, "page_index_offsets", [&](duckdb::Deserializer::List &list, duckdb::idx_t /*i*/) {
+        c.page_index_offsets.push_back(list.ReadElement<int64_t>());
+    });
+    d.ReadList(109, "page_index_sizes", [&](duckdb::Deserializer::List &list, duckdb::idx_t /*i*/) {
+        c.page_index_sizes.push_back(list.ReadElement<uint64_t>());
     });
     return c;
 }

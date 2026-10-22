@@ -30,11 +30,35 @@ struct ColumnChunkMeta {
     int64_t size = 0;
     int32_t codec = 0; // parquet CompressionCodec
     ColumnStats stats;
+    // Where the chunk's page index lives in the file (-1 -> none).
+    int64_t column_index_offset = -1;
+    int32_t column_index_length = 0;
+    int64_t offset_index_offset = -1;
+    int32_t offset_index_length = 0;
 };
 
 struct RowGroupMeta {
     std::vector<ColumnChunkMeta> columns;
+    int64_t num_rows = 0;
 };
+
+// A data page of a column chunk (parquet OffsetIndex PageLocation).
+struct PageLocation {
+    int64_t offset = 0;    // in the file
+    int32_t size = 0;      // compressed page size, header included
+    int64_t first_row = 0; // within the row group
+};
+
+// Parses a column chunk's OffsetIndex: its data pages in order.
+Result<std::vector<PageLocation>> ParseOffsetIndex(const uint8_t *data, size_t size);
+
+// A column chunk's ColumnIndex: per data page min/max statistics.
+struct ColumnIndex {
+    std::vector<uint8_t> null_pages; // 1 -> the page holds only NULLs (and no min/max)
+    std::vector<ColumnStats> stats;
+};
+
+Result<ColumnIndex> ParseColumnIndex(const uint8_t *data, size_t size);
 
 struct FileMeta {
     std::vector<RowGroupMeta> row_groups;

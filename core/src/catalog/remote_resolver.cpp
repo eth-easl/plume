@@ -52,6 +52,7 @@ Result<void> RemoteResolver::Execute() {
     for (auto &t : threads) {
         t.join();
     }
+    jobs_.clear();
 
     return status;
 }

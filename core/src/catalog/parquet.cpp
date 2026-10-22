@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <numeric>
 #include <string>
 
 namespace plume::catalog {
@@ -19,6 +21,7 @@ namespace plume::catalog {
 namespace {
 
 constexpr int64_t kFooterProbe = 256 << 10; // 256 KiB
+constexpr int64_t kMaxPageIndexBytes = 16 << 20; // fetch no more of a file's page indexes
 
 int64_t LE(const uint8_t *p, size_t n) {
     uint64_t v = 0;
@@ -208,6 +211,69 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
     return Ok();
 }
 
+void FetchPageIndexes(RemoteParquetDataSource &src, const RemoteResolver &resolver, uint32_t key_col,
+                      const std::vector<uint32_t> &projection) {
+    src.page_index_offsets.resize(src.metadata.size(), 0);
+    src.page_index_bytes.resize(src.metadata.size());
+    for (size_t i = 0; i < src.metadata.size() && i < src.paths.size(); i++) {
+        const parquet::FileMeta &meta = src.metadata[i];
+        if (key_col >= meta.schema.columns.size()) {
+            continue;
+        }
+        std::vector<uint32_t> read_cols = projection;
+        if (read_cols.empty()) {
+            read_cols.resize(meta.schema.columns.size());
+            std::iota(read_cols.begin(), read_cols.end(), 0u);
+        }
+        // The page indexes are stored together, between the row groups and the footer: fetch the
+        // byte range spanning the ones needed.
+        int64_t begin = std::numeric_limits<int64_t>::max();
+        int64_t end = 0;
+        bool complete = true;
+        auto span = [&](int64_t offset, int32_t length) {
+            if (offset < 0 || length <= 0) {
+                complete = false;
+                return;
+            }
+            begin = std::min(begin, offset);
+            end = std::max(end, offset + length);
+        };
+        for (const auto &rg : meta.row_groups) {
+            if (key_col >= rg.columns.size()) {
+                complete = false;
+                break;
+            }
+            span(rg.columns[key_col].column_index_offset, rg.columns[key_col].column_index_length);
+            for (uint32_t c : read_cols) {
+                if (c < rg.columns.size()) {
+                    span(rg.columns[c].offset_index_offset, rg.columns[c].offset_index_length);
+                }
+            }
+        }
+        if (!complete || end <= begin || end - begin > kMaxPageIndexBytes) {
+            continue;
+        }
+        const auto have_begin = src.page_index_offsets[i];
+        const auto have_end = have_begin + static_cast<int64_t>(src.page_index_bytes[i].size());
+        if (!src.page_index_bytes[i].empty()) {
+            if (have_begin <= begin && end <= have_end) {
+                continue; // already fetched for another scan of the source
+            }
+            begin = std::min(begin, have_begin);
+            end = std::max(end, have_end);
+        }
+        resolver.Add([&src, &resolver, i, begin, end]() -> Result<void> {
+            TRY(auto bytes, resolver.fetcher().range(src.paths[i], begin, end - begin));
+            if (static_cast<int64_t>(bytes.size()) != end - begin) {
+                return Ok(); // short read: go without the page index
+            }
+            src.page_index_offsets[i] = begin;
+            src.page_index_bytes[i] = std::move(bytes);
+            return Ok();
+        });
+    }
+}
+
 std::shared_ptr<DataSource> CreateRemoteParquetSource(std::string name, std::vector<std::string> urls) {
     auto pq_src = std::make_shared<RemoteParquetDataSource>();
     pq_src->name = std::move(name);
@@ -297,15 +363,31 @@ ParquetPrepareInputs BuildParquetPrepareInputs(const RemoteParquetDataSource &sr
         cfg.file_row_group_offsets.push_back(rg_offset);
         rg_offset += meta.row_groups.size();
     }
-    auto cfg_buf = SerializeToBuffer(cfg);
-    out.cfg.push_back({0, "config", dandelion::BinaryData(cfg_buf.data(), cfg_buf.data() + cfg_buf.size())});
+    // A file's page index bytes go in front of its footer (see ParquetConfig).
+    const bool page_index = dyn_filter_col >= 0 &&
+        std::any_of(src.page_index_bytes.begin(), src.page_index_bytes.end(), [](const auto &b) { return !b.empty(); });
+    if (page_index) {
+        cfg.page_index_offsets.assign(src.footer_bytes.size(), 0);
+        cfg.page_index_sizes.assign(src.footer_bytes.size(), 0);
+    }
 
     for (uint64_t i = 0; i < src.footer_bytes.size(); i++) {
         const auto &footer = src.footer_bytes[i];
-        out.footers.push_back({i, "footer", dandelion::BinaryData(footer.data(), footer.data() + footer.size())});
+        dandelion::BinaryData item;
+        if (page_index && i < src.page_index_bytes.size()) {
+            const auto &pi = src.page_index_bytes[i];
+            cfg.page_index_offsets[i] = src.page_index_offsets[i];
+            cfg.page_index_sizes[i] = pi.size();
+            item.assign(pi.begin(), pi.end());
+        }
+        item.insert(item.end(), footer.begin(), footer.end());
+        out.footers.push_back({i, "footer", std::move(item)});
         const std::string &url = src.paths[i];
         out.urls.push_back({i, "url", dandelion::BinaryData(url.begin(), url.end())});
     }
+
+    auto cfg_buf = SerializeToBuffer(cfg);
+    out.cfg.push_back({0, "config", dandelion::BinaryData(cfg_buf.data(), cfg_buf.data() + cfg_buf.size())});
 
     return out;
 }

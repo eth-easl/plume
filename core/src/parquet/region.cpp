@@ -33,6 +33,17 @@ DataBuffer Region::Serialize() const {
                     cs.WriteProperty(104, "req_idx", dc.req_idx);
                     cs.WriteProperty(105, "req_offset", dc.req_offset);
                     cs.WriteProperty(106, "codec", dc.codec);
+                    cs.WriteList(107, "pages", dc.pages.size(), [&](duckdb::Serializer::List &p_list, idx_t k) {
+                        const PageRun &run = dc.pages[k];
+                        p_list.WriteObject([&](duckdb::Serializer &ps) {
+                            ps.WriteProperty(100, "offset", run.offset);
+                            ps.WriteProperty(101, "size", run.size);
+                            ps.WriteProperty(102, "first_row", run.first_row);
+                            ps.WriteProperty(103, "num_rows", run.num_rows);
+                            ps.WriteProperty(104, "req_idx", run.req_idx);
+                            ps.WriteProperty(105, "req_offset", run.req_offset);
+                        });
+                    });
                 });
             });
         });
@@ -74,7 +85,19 @@ Region Region::Deserialize(DataBuffer &buf) {
                     dc.req_idx = cd.ReadProperty<uint64_t>(104, "req_idx");
                     dc.req_offset = cd.ReadProperty<uint64_t>(105, "req_offset");
                     dc.codec = cd.ReadProperty<int32_t>(106, "codec");
-                    cols.push_back(dc);
+                    cd.ReadList(107, "pages", [&](duckdb::Deserializer::List &p_list, idx_t /*k*/) {
+                        p_list.ReadObject([&](duckdb::Deserializer &pd) {
+                            PageRun run;
+                            run.offset = pd.ReadProperty<int64_t>(100, "offset");
+                            run.size = pd.ReadProperty<int64_t>(101, "size");
+                            run.first_row = pd.ReadProperty<uint64_t>(102, "first_row");
+                            run.num_rows = pd.ReadProperty<uint64_t>(103, "num_rows");
+                            run.req_idx = pd.ReadProperty<uint64_t>(104, "req_idx");
+                            run.req_offset = pd.ReadProperty<uint64_t>(105, "req_offset");
+                            dc.pages.push_back(run);
+                        });
+                    });
+                    cols.push_back(std::move(dc));
                 });
             });
             region.row_groups.push_back(std::move(cols));
@@ -101,7 +124,8 @@ Region Region::Deserialize(DataBuffer &buf) {
 
 std::vector<Region> DefineRegions(const FileMeta &meta, uint32_t num_splits, uint64_t coalesce_distance,
                                   const std::vector<uint32_t> &projection,
-                                  const std::vector<uint32_t> &keep_row_groups, uint64_t max_region_size) {
+                                  const std::vector<uint32_t> &keep_row_groups, uint64_t max_region_size,
+                                  const std::map<uint32_t, RowGroupPages> &page_selection) {
     std::vector<Region> regions;
 
     std::vector<uint32_t> rgs;
@@ -118,6 +142,17 @@ std::vector<Region> DefineRegions(const FileMeta &meta, uint32_t num_splits, uin
     auto rg_size = [&](uint32_t rg) -> uint64_t {
         const auto &rgm = meta.row_groups[rg];
         uint64_t bytes = 0;
+        if (auto it = page_selection.find(rg); it != page_selection.end()) {
+            for (auto dict : it->second.dict_sizes) {
+                bytes += static_cast<uint64_t>(dict);
+            }
+            for (const auto &runs : it->second.runs) {
+                for (const auto &run : runs) {
+                    bytes += static_cast<uint64_t>(run.size);
+                }
+            }
+            return bytes;
+        }
         if (projection.empty()) {
             for (const auto &c : rgm.columns) {
                 bytes += static_cast<uint64_t>(c.size);
@@ -160,30 +195,52 @@ std::vector<Region> DefineRegions(const FileMeta &meta, uint32_t num_splits, uin
                     }
                 }
             }
+            if (auto it = page_selection.find(rg); it != page_selection.end()) {
+                for (size_t c = 0; c < cols.size() && c < it->second.runs.size(); c++) {
+                    cols[c].size = it->second.dict_sizes[c];
+                    cols[c].pages = it->second.runs[c];
+                }
+            }
             region.row_groups.push_back(std::move(cols));
         }
 
-        std::vector<DataChunk *> ptrs;
+        // A byte range to fetch: a whole column chunk, its dictionary page or a page run.
+        struct Piece {
+            int64_t offset;
+            int64_t size;
+            uint64_t *req_idx;
+            uint64_t *req_offset;
+        };
+        std::vector<Piece> pieces;
         for (auto &rgcols : region.row_groups) {
             for (auto &dc : rgcols) {
-                ptrs.push_back(&dc);
+                if (dc.pages.empty() || dc.size > 0) {
+                    pieces.push_back({dc.offset, dc.size, &dc.req_idx, &dc.req_offset});
+                } else {
+                    dc.req_idx = 0;
+                    dc.req_offset = 0;
+                }
+                for (auto &run : dc.pages) {
+                    pieces.push_back({run.offset, run.size, &run.req_idx, &run.req_offset});
+                }
             }
         }
-        std::sort(ptrs.begin(), ptrs.end(), [](DataChunk *a, DataChunk *b) { return a->offset < b->offset; });
-        for (auto *dc : ptrs) {
+        std::sort(pieces.begin(), pieces.end(), [](const Piece &a, const Piece &b) { return a.offset < b.offset; });
+        for (auto &piece : pieces) {
+            const uint64_t end = static_cast<uint64_t>(piece.offset + piece.size);
             if (region.requests.empty() ||
-                static_cast<uint64_t>(dc->offset) > region.requests.back().end() + coalesce_distance) {
+                static_cast<uint64_t>(piece.offset) > region.requests.back().end() + coalesce_distance) {
                 ChunkRequest req;
-                req.offset = dc->offset;
-                req.size = dc->size;
+                req.offset = piece.offset;
+                req.size = piece.size;
                 region.requests.push_back(req);
             } else {
                 auto &req = region.requests.back();
-                const uint64_t new_end = std::max<uint64_t>(req.end(), dc->end());
+                const uint64_t new_end = std::max<uint64_t>(req.end(), end);
                 req.size = static_cast<int64_t>(new_end - static_cast<uint64_t>(req.offset));
             }
-            dc->req_idx = region.requests.size() - 1;
-            dc->req_offset = static_cast<uint64_t>(dc->offset - region.requests.back().offset);
+            *piece.req_idx = region.requests.size() - 1;
+            *piece.req_offset = static_cast<uint64_t>(piece.offset - region.requests.back().offset);
         }
         regions.push_back(std::move(region));
     };

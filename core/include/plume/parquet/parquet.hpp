@@ -34,8 +34,33 @@ struct ParquetConfig {
     // footer item's key). Empty -> single-file source.
     std::vector<uint64_t> file_row_group_offsets;
 
+    // Per file (indexed by the footer item's key): the footer item starts with
+    // page_index_sizes[i] bytes of the file from page_index_offsets[i] on, which hold the page
+    // indexes the dynamic filter needs. Empty or a size of 0 -> no page index.
+    std::vector<int64_t> page_index_offsets;
+    std::vector<uint64_t> page_index_sizes;
+
     void Serialize(duckdb::Serializer &s) const;
     static ParquetConfig Deserialize(duckdb::Deserializer &d);
+};
+
+// A run of consecutive data pages of a column chunk.
+struct PageRun {
+    // The offset in the original file.
+    int64_t offset;
+    // The size of the run in bytes.
+    int64_t size;
+    // The rows [first_row, first_row + num_rows) of the row group the run holds.
+    uint64_t first_row;
+    uint64_t num_rows;
+    // Index of the request loading this run in the Region requests vector.
+    uint64_t req_idx;
+    // Offset in the request loading this run in the Region requests vector.
+    uint64_t req_offset;
+
+    inline uint64_t end() const {
+        return offset + size;
+    }
 };
 
 // Represents a Parquet ColumnChunk.
@@ -54,6 +79,9 @@ struct DataChunk {
     uint64_t req_offset;
     // The parquet CompressionCodec.
     int32_t codec = 0;
+    // Only these data pages are read if not empty; the chunk's own byte range then only covers
+    // its dictionary page (size 0 -> none).
+    std::vector<PageRun> pages;
 
     inline uint64_t end() const {
         return offset + size;

@@ -13,6 +13,7 @@
 #include "plume/parquet/parquet.hpp"
 #include "plume/parquet/prune.hpp"
 #include "plume/parquet/regions.hpp"
+#include "plume/parquet/thrift.hpp"
 
 #include "duckdb/common/types/value.hpp"
 
@@ -855,6 +856,234 @@ TEST_CASE("MeanRowGroupCoverage: VARCHAR and TIME key columns") {
     auto times = parquet::MeanRowGroupCoverage(
         {StatsFile({TypeId::TIME}, {{Int64Stat(0), Int64Stat(9)}, {Int64Stat(10), Int64Stat(19)}})}, 0);
     CHECK(times.value_or(1.0) < 0.5);
+}
+
+// --- page index ----------------------------------------------------------------
+
+namespace {
+
+using parquet::CompactWriter;
+
+std::vector<uint8_t> EncodeOffsetIndex(const std::vector<parquet::PageLocation> &pages) {
+    CompactWriter w;
+    w.List(1, parquet::CT_STRUCT, pages.size());
+    for (const auto &p : pages) {
+        w.ElementBegin();
+        w.I64(1, p.offset);
+        w.I32(2, p.size);
+        w.I64(3, p.first_row);
+        w.StructEnd();
+    }
+    w.Stop();
+    return w.bytes();
+}
+
+// INT32 pages of [min, max], or only NULLs for nullopt.
+std::vector<uint8_t> EncodeColumnIndex(const std::vector<std::optional<std::pair<int32_t, int32_t>>> &pages) {
+    CompactWriter w;
+    w.List(1, parquet::CT_BOOL_TRUE, pages.size());
+    for (const auto &p : pages) {
+        const uint8_t null_page = p ? 2 : 1; // compact bool elements: 1 true, 2 false
+        w.Raw(&null_page, 1);
+    }
+    auto bound = [](int32_t v) { return std::string(reinterpret_cast<const char *>(&v), 4); };
+    w.List(2, parquet::CT_BINARY, pages.size());
+    for (const auto &p : pages) {
+        w.StringElem(p ? bound(p->first) : std::string());
+    }
+    w.List(3, parquet::CT_BINARY, pages.size());
+    for (const auto &p : pages) {
+        w.StringElem(p ? bound(p->second) : std::string());
+    }
+    w.I32(4, 0); // boundary order: unordered
+    w.Stop();
+    return w.bytes();
+}
+
+// A file of one 300-row row group and two required INT32 columns:
+//   k (key): dictionary page [4, 100), data pages [100, 150) rows [0, 100), [150, 200) rows
+//            [100, 200), [200, 250) rows [200, 300), whose ColumnIndex `k_pages` gives
+//   v:       data pages [300, 380) rows [0, 150), [380, 460) rows [150, 300).
+// The page indexes are stored at kPageIndexAt; returns the page index bytes and the footer item
+// (page index bytes followed by the footer).
+constexpr int64_t kPageIndexAt = 1000;
+
+std::pair<size_t, DataBuffer> EncodePageIndexFile(
+        const std::vector<std::optional<std::pair<int32_t, int32_t>>> &k_pages) {
+    const auto k_ci = EncodeColumnIndex(k_pages);
+    const auto k_oi = EncodeOffsetIndex({{100, 50, 0}, {150, 50, 100}, {200, 50, 200}});
+    const auto v_oi = EncodeOffsetIndex({{300, 80, 0}, {380, 80, 150}});
+    std::vector<uint8_t> page_index;
+    const int64_t k_ci_at = kPageIndexAt;
+    page_index.insert(page_index.end(), k_ci.begin(), k_ci.end());
+    const int64_t k_oi_at = kPageIndexAt + int64_t(page_index.size());
+    page_index.insert(page_index.end(), k_oi.begin(), k_oi.end());
+    const int64_t v_oi_at = kPageIndexAt + int64_t(page_index.size());
+    page_index.insert(page_index.end(), v_oi.begin(), v_oi.end());
+
+    CompactWriter w;
+    w.List(2, parquet::CT_STRUCT, 3); // schema: root + k + v
+    w.ElementBegin();
+    w.String(4, "schema");
+    w.I32(5, 2);
+    w.StructEnd();
+    for (const char *name : {"k", "v"}) {
+        w.ElementBegin();
+        w.I32(1, 1); // INT32
+        w.I32(3, 0); // REQUIRED
+        w.String(4, name);
+        w.StructEnd();
+    }
+    w.I64(3, 300);
+    w.List(4, parquet::CT_STRUCT, 1);
+    w.ElementBegin();
+    w.List(1, parquet::CT_STRUCT, 2);
+    auto column = [&](int64_t total, int64_t data_page, int64_t dict_page, int64_t oi_at, int32_t oi_len,
+                      int64_t ci_at, int32_t ci_len) {
+        w.ElementBegin();
+        w.StructField(3);
+        w.I64(7, total);
+        w.I64(9, data_page);
+        if (dict_page >= 0) {
+            w.I64(11, dict_page);
+        }
+        w.StructEnd();
+        w.I64(4, oi_at);
+        w.I32(5, oi_len);
+        if (ci_at >= 0) {
+            w.I64(6, ci_at);
+            w.I32(7, ci_len);
+        }
+        w.StructEnd();
+    };
+    column(246, 100, 4, k_oi_at, int32_t(k_oi.size()), k_ci_at, int32_t(k_ci.size()));
+    column(160, 300, -1, v_oi_at, int32_t(v_oi.size()), -1, 0);
+    w.I64(3, 300); // RowGroup.num_rows
+    w.StructEnd();
+    w.Stop();
+
+    std::vector<uint8_t> item = page_index;
+    const auto &meta = w.bytes();
+    item.insert(item.end(), meta.begin(), meta.end());
+    const uint32_t len = static_cast<uint32_t>(meta.size());
+    for (int i = 0; i < 4; i++) {
+        item.push_back(static_cast<uint8_t>(len >> (8 * i)));
+    }
+    const char *magic = "PAR1";
+    item.insert(item.end(), magic, magic + 4);
+    return {page_index.size(), mock::MakeBuffer(item.data(), item.size())};
+}
+
+const std::vector<std::optional<std::pair<int32_t, int32_t>>> kSortedPages = {{{0, 99}}, {{100, 149}}, {{200, 299}}};
+
+// Runs pq_prepare over EncodePageIndexFile with an exact-key dynamic filter on k.
+void RunPageIndexPrepare(const std::vector<std::optional<std::pair<int32_t, int32_t>>> &k_pages,
+                         std::vector<int32_t> keys, bool with_page_index = true) {
+    auto [pi_size, item] = EncodePageIndexFile(k_pages);
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filter_column = 0;
+    if (with_page_index) {
+        cfg.page_index_offsets = {kPageIndexAt};
+        cfg.page_index_sizes = {pi_size};
+    }
+    std::vector<Value> values;
+    for (int32_t k : keys) {
+        values.push_back(Value::INTEGER(k));
+    }
+    RunprepareWithDynFilter(cfg, std::move(item), EncodeValues(std::move(values)));
+}
+
+} // namespace
+
+TEST_CASE("ParseOffsetIndex / ParseColumnIndex") {
+    auto oi = EncodeOffsetIndex({{100, 50, 0}, {150, 60, 70}});
+    auto pages = parquet::ParseOffsetIndex(oi.data(), oi.size()).unwrap();
+    CHECK(pages.size() == 2);
+    CHECK(pages[1].offset == 150);
+    CHECK(pages[1].size == 60);
+    CHECK(pages[1].first_row == 70);
+
+    auto ci = EncodeColumnIndex({{{1, 5}}, std::nullopt});
+    auto index = parquet::ParseColumnIndex(ci.data(), ci.size()).unwrap();
+    CHECK((index.null_pages == std::vector<uint8_t>{0, 1}));
+    CHECK(index.stats[0].has_min);
+    CHECK(index.stats[0].max_value == Int32Stat(5));
+    CHECK(!index.stats[1].has_min);
+
+    CHECK(parquet::ParseOffsetIndex(oi.data(), oi.size() - 3).is_error());
+}
+
+TEST_CASE("SelectPageRows: rows of the pages that may hold a key") {
+    Schema schema;
+    schema.columns = {{"k", {TypeId::INT32}, false}};
+    const std::vector<parquet::PageLocation> pages = {{0, 10, 0}, {10, 10, 100}, {20, 10, 200}, {30, 10, 250}};
+    auto ci = EncodeColumnIndex({{{0, 99}}, {{100, 199}}, std::nullopt, {{250, 400}}});
+    auto index = parquet::ParseColumnIndex(ci.data(), ci.size()).unwrap();
+    using parquet::RowRange;
+    auto rows = [&](const ExprNode *pred, std::vector<Value> keys) {
+        auto sorted = *parquet::SortStatValues(keys, {TypeId::INT32});
+        return parquet::SelectPageRows(pred, keys.empty() ? nullptr : &sorted, 0, schema, pages, index, 300);
+    };
+    CHECK((*rows(nullptr, {Value::INTEGER(150)}) == std::vector<RowRange>{{100, 200}}));
+    // Adjacent pages merge; the NULL page never matches.
+    CHECK((*rows(nullptr, {Value::INTEGER(5), Value::INTEGER(150), Value::INTEGER(300)}) ==
+           std::vector<RowRange>{{0, 200}, {250, 300}}));
+    CHECK(rows(nullptr, {Value::INTEGER(1000)})->empty());
+    // A predicate on the key column.
+    auto ge = VCompare(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, 150);
+    CHECK((*rows(&ge, {}) == std::vector<RowRange>{{100, 200}, {250, 300}}));
+    // First rows beyond the row group -> the index doesn't fit.
+    CHECK(!parquet::SelectPageRows(nullptr, nullptr, 0, schema, pages, index, 220).has_value());
+}
+
+TEST_CASE("pq_prepare: page index selects the pages a dynamic filter key may be in") {
+    RunPageIndexPrepare(kSortedPages, {120});
+    CHECK(mock::OutputsForSet(0).size() == 1);
+    auto region = RegionAt(0);
+    const auto &k = region.row_groups[0][0];
+    const auto &v = region.row_groups[0][1];
+    CHECK(k.size == 96); // only the dictionary page
+    CHECK(k.pages.size() == 1);
+    CHECK(k.pages[0].offset == 150);
+    CHECK(k.pages[0].size == 50);
+    CHECK(k.pages[0].first_row == 100);
+    CHECK(k.pages[0].num_rows == 100);
+    // Rows [100, 200) are in both of v's pages.
+    CHECK(v.size == 0);
+    CHECK(v.pages.size() == 1);
+    CHECK(v.pages[0].offset == 300);
+    CHECK(v.pages[0].size == 160);
+    CHECK(v.pages[0].num_rows == 300);
+    // Requests cover the dictionary page and each run (coalesced, 1 KiB distance by default).
+    const auto &req = region.requests[k.pages[0].req_idx];
+    CHECK(req.offset + int64_t(k.pages[0].req_offset) == 150);
+    CHECK(region.requests[k.req_idx].offset + int64_t(k.req_offset) == 4);
+    CHECK(region.requests.back().end() == 460);
+
+    // Two adjacent pages: one run.
+    RunPageIndexPrepare(kSortedPages, {120, 250});
+    auto two = RegionAt(0);
+    CHECK(two.row_groups[0][0].pages.size() == 1);
+    CHECK(two.row_groups[0][0].pages[0].size == 100);
+    CHECK(two.row_groups[0][0].pages[0].num_rows == 200);
+}
+
+TEST_CASE("pq_prepare: page index prunes a row group none of whose pages may match") {
+    // 170 lies between the pages [100, 149] and [200, 299].
+    RunPageIndexPrepare(kSortedPages, {170});
+    CHECK(mock::OutputsForSet(0).empty());
+    CHECK(mock::OutputsForSet(1).empty());
+
+    // Every page may match: the whole chunks.
+    RunPageIndexPrepare(kSortedPages, {50, 120, 250});
+    auto region = RegionAt(0);
+    CHECK(region.row_groups[0][0].pages.empty());
+    CHECK(region.row_groups[0][0].size == 246);
+
+    // Without the page index: the whole chunks.
+    RunPageIndexPrepare(kSortedPages, {170}, /*with_page_index=*/false);
+    CHECK(mock::OutputsForSet(0).size() == 1);
+    CHECK(RegionAt(0).row_groups[0][0].pages.empty());
 }
 
 TEST_CASE("ScanColumnIndex: file column -> position in the projection") {

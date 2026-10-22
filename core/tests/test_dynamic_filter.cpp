@@ -780,6 +780,61 @@ TEST_CASE("DynamicFilterProbe: VARCHAR exact keys and bounds") {
     CHECK(sel.get_index(1) == 3);
 }
 
+TEST_CASE("DynamicFilterProbe: dictionary entries are checked once, rows by lookup") {
+    auto f = IntRange(10, 30);
+    f.has_values = true;
+    f.values = {Value::INTEGER(20)};
+    auto probe = DynamicFilterProbe::Create(std::move(f), LogicalType::INTEGER).unwrap();
+
+    // Dictionary [10, 20, 30, NULL].
+    duckdb::Vector dict(LogicalType::INTEGER, 4);
+    auto *d = FlatVector::GetData<int32_t>(dict);
+    d[0] = 10;
+    d[1] = 20;
+    d[2] = 30;
+    FlatVector::Validity(dict).SetInvalid(3);
+    CHECK(probe->SetDictionary(&dict, 4) == 1);
+
+    auto select = [&](duckdb::Vector &keys, idx_t n) {
+        duckdb::SelectionVector sel(n);
+        for (idx_t i = 0; i < n; i++) {
+            sel.set_index(i, i);
+        }
+        std::vector<idx_t> rows;
+        const idx_t passed = probe->Select(keys, n, sel, n);
+        for (idx_t i = 0; i < passed; i++) {
+            rows.push_back(sel.get_index(i));
+        }
+        return rows;
+    };
+    // Rows referencing entries 0, 1, 2, 3 (NULL), 1.
+    duckdb::SelectionVector idx(5);
+    const std::vector<idx_t> entries = {0, 1, 2, 3, 1};
+    for (idx_t i = 0; i < entries.size(); i++) {
+        idx.set_index(i, entries[i]);
+    }
+    duckdb::Vector keys(LogicalType::INTEGER);
+    keys.Dictionary(dict, 4, idx, 5);
+    CHECK(select(keys, 5) == std::vector<idx_t>({1, 4}));
+
+    // Keys over another dictionary, or flat keys, are checked row by row.
+    duckdb::Vector other(LogicalType::INTEGER, 4);
+    auto *o = FlatVector::GetData<int32_t>(other);
+    o[0] = 20;
+    o[1] = 40;
+    o[2] = 20;
+    o[3] = 10;
+    duckdb::Vector other_keys(LogicalType::INTEGER);
+    other_keys.Dictionary(other, 4, idx, 5);
+    CHECK(select(other_keys, 5) == std::vector<idx_t>({0, 2}));
+    CHECK(select(other, 4) == std::vector<idx_t>({0, 2}));
+
+    // Forgetting the dictionary goes back to checking rows.
+    CHECK(probe->SetDictionary(nullptr, 0) == 0);
+    d[0] = 20; // the dictionary's own rows now pass by value
+    CHECK(select(keys, 5) == std::vector<idx_t>({0, 1, 4}));
+}
+
 TEST_CASE("DynamicFilterProbe: nothing to check -> no probe") {
     CHECK(DynamicFilterProbe::Create(DynamicFilter(), LogicalType::INTEGER).unwrap() == nullptr);
     // Build keys typed BIGINT can't be checked against an INTEGER probe column.
