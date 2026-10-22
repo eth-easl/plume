@@ -19,6 +19,7 @@ class LogicalAggregate;
 class LogicalMaterializedCTE;
 class LogicalComparisonJoin;
 class LogicalColumnDataGet;
+class LogicalEmptyResult;
 class LogicalCrossProduct;
 } // namespace duckdb
 
@@ -93,6 +94,7 @@ private:
     
     Result<PlanBuilder::SharedOpNode> BuildGet(duckdb::LogicalGet &get);
     Result<PlanBuilder::SharedOpNode> BuildChunkGet(duckdb::LogicalColumnDataGet &get);
+    Result<PlanBuilder::SharedOpNode> BuildEmptyResult(duckdb::LogicalEmptyResult &empty);
     Result<PlanBuilder::SharedOpNode> BuildAggregate(duckdb::LogicalAggregate &agg, PlanBuilder::SharedOpNode child);
     Result<PlanBuilder::SharedOpNode> BuildDistinct(PlanBuilder::SharedOpNode child, const std::vector<uint32_t> &cols, uint64_t card);
     Result<PlanBuilder::SharedOpNode> BuildMaterializedCTE(duckdb::LogicalMaterializedCTE &cte);
@@ -112,6 +114,7 @@ private:
     std::map<uint64_t, PlanBuilder::SharedOpNode> cte_subs_;
     std::vector<PlanBuilder::SharedOpNode> delim_stack_;
     std::vector<PendingDynamicFilter> pending_dynamic_filters_;
+    size_t num_empty_results_ = 0;
 };
 
 Result<std::unique_ptr<PhysicalPlan>> BuildPhysicalPlan(duckdb::Connection &con, 

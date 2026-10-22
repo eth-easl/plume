@@ -248,7 +248,7 @@ duckdb::unique_ptr<duckdb::BaseStatistics> PlumeRemoteStatistics(duckdb::ClientC
         duckdb::TableFunctionGetStatisticsInput &input) {
     auto &data_source = input.bind_data->Cast<PlumeRemoteBindData>().info;
     auto col_idx = input.column_index.GetPrimaryIndex();
-    if (col_idx >= data_source->col_stats.size() || data_source->schema || col_idx >= data_source->schema->columns.size()) {
+    if (col_idx >= data_source->col_stats.size() || !data_source->schema || col_idx >= data_source->schema->columns.size()) {
         return nullptr;
     }
 

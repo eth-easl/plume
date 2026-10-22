@@ -82,27 +82,32 @@ bool DecodeNumeric(const ColumnType &t, const std::vector<uint8_t> &b, double &k
 RemoteColumnStats AggregateColumnStats(const ColumnType &type,
                                        const std::vector<const parquet::ColumnStats *> &chunks) {
     RemoteColumnStats out;
-    double min_key = 0, max_key = 0;
+    bool min_known = !chunks.empty();
+    bool max_known = !chunks.empty();
     uint64_t null_sum = 0;
     bool all_have_null_count = !chunks.empty();
     for (const auto *cs : chunks) {
-        if (cs->has_min) {
-            double k;
-            duckdb::Value v;
-            if (DecodeNumeric(type, cs->min_value, k, v) && (!out.has_min || k < min_key)) {
+        if (!cs) {
+            min_known = max_known = all_have_null_count = false;
+            continue;
+        }
+        double k;
+        duckdb::Value v;
+        if (min_known && cs->has_min && DecodeNumeric(type, cs->min_value, k, v)) {
+            if (!out.has_min || v < out.min_value) {
                 out.has_min = true;
-                min_key = k;
                 out.min_value = std::move(v);
             }
+        } else {
+            min_known = false;
         }
-        if (cs->has_max) {
-            double k;
-            duckdb::Value v;
-            if (DecodeNumeric(type, cs->max_value, k, v) && (!out.has_max || k > max_key)) {
+        if (max_known && cs->has_max && DecodeNumeric(type, cs->max_value, k, v)) {
+            if (!out.has_max || out.max_value < v) {
                 out.has_max = true;
-                max_key = k;
                 out.max_value = std::move(v);
             }
+        } else {
+            max_known = false;
         }
         if (cs->has_distinct_count) {
             out.has_distinct = true;
@@ -114,6 +119,8 @@ RemoteColumnStats AggregateColumnStats(const ColumnType &type,
             all_have_null_count = false;
         }
     }
+    out.has_min = out.has_min && min_known;
+    out.has_max = out.has_max && max_known;
     out.not_null = all_have_null_count && null_sum == 0;
     return out;
 }
@@ -165,9 +172,7 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
             for (size_t c = 0; c < meta.schema.columns.size(); c++) {
                 std::vector<const parquet::ColumnStats *> chunks;
                 for (const auto &rg : meta.row_groups) {
-                    if (c < rg.columns.size()) {
-                        chunks.push_back(&rg.columns[c].stats);
-                    }
+                    chunks.push_back(c < rg.columns.size() ? &rg.columns[c].stats : nullptr);
                 }
                 stats[c] = AggregateColumnStats(meta.schema.columns[c].type, chunks);
             }
@@ -180,25 +185,38 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
                 if (!schema) {
                     schema = meta.schema;
                 }
+                const size_t merged_cols = col_stats.size();
                 if (col_stats.size() < stats.size()) {
                     col_stats.resize(stats.size());
                 }
                 cardinality_total += rows;
 
                 for (size_t c = 0; c < stats.size(); c++) {
-                    if (stats[c].has_min && (!col_stats[c].has_min || stats[c].min_value < col_stats[c].min_value)) {
-                        col_stats[c].has_min = true;
-                        col_stats[c].min_value = std::move(stats[c].min_value);
+                    auto &merged = col_stats[c];
+                    if (c >= merged_cols) {
+                        merged = std::move(stats[c]);
+                        continue;
                     }
-                    if (stats[c].has_max && (!col_stats[c].has_max || stats[c].max_value < col_stats[c].max_value)) {
-                        col_stats[c].has_max = true;
-                        col_stats[c].max_value = std::move(stats[c].max_value);
+                    // A bound holds for the source only if it holds for every file.
+                    if (merged.has_min && stats[c].has_min) {
+                        if (stats[c].min_value < merged.min_value) {
+                            merged.min_value = std::move(stats[c].min_value);
+                        }
+                    } else {
+                        merged.has_min = false;
+                    }
+                    if (merged.has_max && stats[c].has_max) {
+                        if (merged.max_value < stats[c].max_value) {
+                            merged.max_value = std::move(stats[c].max_value);
+                        }
+                    } else {
+                        merged.has_max = false;
                     }
                     if (stats[c].has_distinct) {
-                        col_stats[c].has_distinct = true;
-                        col_stats[c].distinct_count = std::max(col_stats[c].distinct_count, stats[c].distinct_count);
+                        merged.has_distinct = true;
+                        merged.distinct_count = std::max(merged.distinct_count, stats[c].distinct_count);
                     }
-                    col_stats[c].not_null = col_stats[c].not_null && stats[c].not_null;
+                    merged.not_null = merged.not_null && stats[c].not_null;
                 }
             }
             cardinalities[i] = rows;

@@ -35,6 +35,7 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
@@ -595,6 +596,35 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildChunkGet(duckdb::LogicalColumn
     return builder_.Scan(std::move(blocks_source), schema, nullptr, nullptr);
 }
 
+Result<PlanBuilder::SharedOpNode> Converter::BuildEmptyResult(duckdb::LogicalEmptyResult &empty) {
+    // DuckDB replaces subtrees it proves empty (e.g. by the sources' statistics) with an empty
+    // result: scan an empty table of its types instead.
+    Schema schema;
+    std::string cols_ddl;
+    for (size_t c = 0; c < empty.return_types.size(); c++) {
+        Column col;
+        col.name = "col" + std::to_string(c);
+        col.type = FromLogicalType(empty.return_types[c]);
+        col.nullable = true;
+        if (c) cols_ddl += ", ";
+        cols_ddl += duckdb::KeywordHelper::WriteQuoted(col.name, '"') + " " + empty.return_types[c].ToString();
+        schema.columns.push_back(std::move(col));
+    }
+    if (schema.columns.empty()) {
+        return Error("EMPTY_RESULT without columns.", ErrorKind::NotImplemented);
+    }
+
+    const std::string table_name = "__empty_result_" + std::to_string(num_empty_results_++);
+    auto create = con_.Query("CREATE OR REPLACE TABLE " + duckdb::KeywordHelper::WriteQuoted(table_name, '"') +
+                             " (" + cols_ddl + ")");
+    if (create->HasError()) {
+        return Error("Failed to materialize EMPTY_RESULT table: " + create->GetError(), ErrorKind::RuntimeError);
+    }
+    auto source = CreateTableSource(table_name, schema);
+    source->cardinality_total = 0;
+    return builder_.Scan(std::move(source), schema, nullptr, nullptr);
+}
+
 Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggregate &agg, 
         PlanBuilder::SharedOpNode prev) {
     std::vector<ExprNode> groups;
@@ -1041,6 +1071,9 @@ Result<PlanBuilder::SharedOpNode> Converter::Build(duckdb::LogicalOperator &op) 
 
     case LogicalOperatorType::LOGICAL_CHUNK_GET:
         return BuildChunkGet(op.Cast<duckdb::LogicalColumnDataGet>());
+
+    case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+        return BuildEmptyResult(op.Cast<duckdb::LogicalEmptyResult>());
 
     case LogicalOperatorType::LOGICAL_PROJECTION: {
         TRY(auto prev, Build(*op.children[0]));

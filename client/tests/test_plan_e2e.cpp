@@ -5,6 +5,7 @@
 #include "plume/catalog/catalog.hpp"
 #include "plume/catalog/parquet.hpp"
 #include "plume/catalog/plume_remote.hpp"
+#include "plume/catalog/remote_resolver.hpp"
 #include "plume/dandelion/composition.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/join.hpp"
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
@@ -1280,6 +1282,63 @@ TEST_CASE("dynamic filter: not attached when the probe side isn't a remote parqu
     for (auto &s : plan->stages) {
         CHECK(FindDynamicFilterBuild(*s) == nullptr);
     }
+}
+
+TEST_CASE("e2e: filters DuckDB proves empty by statistics") {
+    // amount <= 200 in every row: DuckDB replaces these subtrees with an EMPTY_RESULT.
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeDb(db);
+    ExpectMatch(con, "SELECT o_id, amount FROM orders WHERE amount > 1000", false);
+    ExpectMatch(con, "SELECT region, count(*) FROM orders WHERE amount > 1000 GROUP BY region", false);
+    ExpectMatch(con, "SELECT count(*), sum(amount) FROM orders WHERE amount > 1000", false);
+    ExpectMatch(con, "SELECT o.o_id, c.name FROM orders o JOIN customers c ON o.cust = c.c_id "
+                     "WHERE o.amount > 1000", false);
+}
+
+TEST_CASE("plume_remote: column statistics reach DuckDB's optimizer") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    auto orders = std::make_shared<FakeRemoteOrders>(1'000'000);
+    orders->col_stats.resize(2);
+    orders->col_stats[1].has_min = orders->col_stats[1].has_max = true;
+    orders->col_stats[1].min_value = duckdb::Value::INTEGER(1);
+    orders->col_stats[1].max_value = duckdb::Value::INTEGER(50);
+    auto catalog_ptr = std::make_shared<SourceCatalog>();
+    CHECK(catalog_ptr->Add(orders).is_ok());
+    auto registry = duckdb::make_shared_ptr<PlumeRemoteInfo>();
+    registry->catalog = catalog_ptr;
+    RegisterPlumeRemote(con, std::move(registry));
+
+    // cust > 100 can't hold for cust in [1, 50]: the remote scan is optimized away.
+    auto empty = BuildPhysicalPlan(con, "SELECT o_id FROM plume_remote('remote_orders') WHERE cust > 100").unwrap();
+    CHECK(CountLeaves(*empty, DataSourceType::REMOTE_PARQUET) == 0);
+    auto kept = BuildPhysicalPlan(con, "SELECT o_id FROM plume_remote('remote_orders') WHERE cust > 10").unwrap();
+    CHECK(CountLeaves(*kept, DataSourceType::REMOTE_PARQUET) == 1);
+}
+
+TEST_CASE("RemoteParquetDataSource: column min/max bound every file") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "plume_test_remote_stats";
+    fs::create_directories(dir);
+    const std::string a = (dir / "a.parquet").string();
+    const std::string b = (dir / "b.parquet").string();
+    {
+        duckdb::DuckDB db(nullptr);
+        duckdb::Connection con(db);
+        CHECK(!con.Query("COPY (SELECT range AS k FROM range(100, 300)) TO '" + a + "' (FORMAT PARQUET)")->HasError());
+        CHECK(!con.Query("COPY (SELECT range AS k FROM range(0, 100)) TO '" + b + "' (FORMAT PARQUET)")->HasError());
+    }
+
+    auto src = CreateRemoteParquetSource("stats", {"file://" + a, "file://" + b});
+    RemoteResolver resolver(AutoFetcher(), 2);
+    CHECK(src->Resolve(resolver).is_ok());
+    CHECK(resolver.Execute().is_ok());
+    CHECK(src->col_stats.size() == 1);
+    const auto &k = src->col_stats[0];
+    CHECK(k.has_min && k.min_value == duckdb::Value::BIGINT(0));
+    CHECK(k.has_max && k.max_value == duckdb::Value::BIGINT(299));
+    CHECK(k.not_null);
+    fs::remove_all(dir);
 }
 
 int main() { return plume_test::RunAll(); }
