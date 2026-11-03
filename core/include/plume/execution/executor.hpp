@@ -54,9 +54,9 @@ public:
     // Fails if the execution has started already.
     Result<FilterOperator *> TakeLeadingScanFilter();
 
-    // Returns a pointer to the pipeline's DynamicFilterBuildOperator operator if there is one,
-    // otherwise returns a nullptr.
-    DynamicFilterBuildOperator *FindDynamicFilterBuild() const;
+    // Returns the pipeline's DynamicFilterBuildOperators in pipeline order (ownership remains with
+    // the Executor).
+    std::vector<DynamicFilterBuildOperator *> DynamicFilterBuilds() const;
 
     // Schema of the produced output chunks.
     const Schema &OutputSchema() const { return output_schema_; }

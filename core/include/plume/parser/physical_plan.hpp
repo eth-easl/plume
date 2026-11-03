@@ -5,7 +5,6 @@
 #include "plume/execution/pipeline.hpp"
 
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -18,10 +17,23 @@ enum class StageType {
     LEAF,
 };
 
-inline constexpr uint32_t kNoDynamicFilter = std::numeric_limits<uint32_t>::max();
+// A dynamic filter a stage consumes.
+struct DynamicFilterInput {
+    // Id of the filter (the build template's filter_id).
+    uint32_t filter_id;
+    // Index of the stage producing the filter.
+    uint32_t source_stage;
+    // The key column in the scan schema (pq_stage probe).
+    uint32_t scan_column;
+    // The key column in the file schema (pq_prepare pruning / page selection).
+    uint32_t file_column;
+    // Whether pq_prepare waits for this filter to prune row groups and pages before fetching.
+    bool prune = false;
+};
 
 struct Stage {
     Stage(StageType type, size_t idx) : type(type), idx(idx) {}
+    virtual ~Stage() = default;
 
     // The type of the stage.
     StageType type;
@@ -36,13 +48,19 @@ struct Stage {
     // The output schema of this stage.
     Schema output_schema;
 
-    // Index of the stage that consumes the dynamic filter produced by this stage.
-    uint32_t dynamic_filter_consumer_stage = kNoDynamicFilter;
+    // Ids of the dynamic filters this stage emits (one per DynamicFilterBuildTemplate).
+    std::vector<uint32_t> dynamic_filter_outputs;
+    // The dynamic filters this stage consumes.
+    std::vector<DynamicFilterInput> dynamic_filter_inputs;
 
     std::string ToString() const;
     const bool LeadsWithJoin() const { return type == StageType::JOIN; }
     const bool IsLeaf() const { return type == StageType::LEAF; }
-    bool ProducesDynFilter() const { return dynamic_filter_consumer_stage != kNoDynamicFilter; }
+    bool ProducesDynFilter() const { return !dynamic_filter_outputs.empty(); }
+    bool ConsumesDynFilter() const { return !dynamic_filter_inputs.empty(); }
+    bool PrunesByDynFilter() const;
+    // The distinct stages producing the consumed dynamic filters in ascending order.
+    std::vector<uint32_t> DynFilterSourceStages(bool prune_only = false) const;
 };
 
 struct LeafStage : Stage {
@@ -58,14 +76,6 @@ struct LeafStage : Stage {
     std::shared_ptr<std::vector<uint32_t>> projection;
     // Filter pushdown.
     std::shared_ptr<expr::ExprNode> pushed_filter;
-
-    // Runtime dynamic filter.
-    int32_t dynamic_filter_column = -1;
-    uint32_t dynamic_filter_source_stage = kNoDynamicFilter;
-    // Use `pq_prepare` to prune row groups using dynamic filters instead of doing it upfront.
-    bool dynamic_filter_prune = false;
-
-    bool HasDynFilter() const { return dynamic_filter_column != -1; }
 };
 
 struct PhysicalPlan {

@@ -49,6 +49,17 @@ std::string RemoteReqVar(int stage) { return "req_" + std::to_string(stage); }
 std::string OutVar(int stage) { return "out_" + std::to_string(stage); }
 std::string DynFilterVar(int stage) { return "dfltr_" + std::to_string(stage); }
 
+std::string DynFilterBinding(const std::vector<uint32_t> &stages) {
+    if (stages.size() == 1) {
+        return "all " + DynFilterVar(static_cast<int>(stages[0]));
+    }
+    std::string out = "all {";
+    for (size_t i = 0; i < stages.size(); i++) {
+        out += (i ? ", " : "") + DynFilterVar(static_cast<int>(stages[i]));
+    }
+    return out + "}";
+}
+
 struct DeclarationTracker {
     bool using_http = false;    // -> the runtime-provided HTTP function (file fetches)
     bool using_stage = false;   // -> plume_stage (BLOCKS / join / compute stages)
@@ -129,16 +140,25 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
                     dt.using_pq = true;
 
                     auto pq_src = std::static_pointer_cast<RemoteParquetDataSource>(leaf_stage->data_source);
-                    // A pruning dynamic filter goes through pq_prepare before the fetch, a
-                    // probe-only one straight to pq_stage.
+                    // Pruning dynamic filters go through pq_prepare before the fetch. pq_stage
+                    // evaluates every filter (pruning or probe-only) on the rows.
                     std::string stage_dyn_filter;
-                    if (leaf_stage->HasDynFilter() && leaf_stage->dynamic_filter_prune) {
+                    if (leaf_stage->ConsumesDynFilter()) {
+                        stage_dyn_filter = ", dynFilter = " + DynFilterBinding(leaf_stage->DynFilterSourceStages());
+                    }
+                    if (leaf_stage->PrunesByDynFilter()) {
+                        std::vector<parquet::DynamicFilterColumn> prune_filters;
+                        for (const auto &in : leaf_stage->dynamic_filter_inputs) {
+                            if (in.prune) {
+                                prune_filters.push_back({in.filter_id, in.file_column});
+                            }
+                        }
                         dt.using_pq_prep = true;
                         std::string cfg_var = "cfg_" + std::to_string(stage->idx);
                         std::string footer_var = "ftr_" + std::to_string(stage->idx);
                         std::string url_var = "url_" + std::to_string(stage->idx);
-                        auto pq_prepare_inputs = BuildParquetPrepareInputs(*pq_src, projection, filter, 
-                            leaf_stage->dynamic_filter_column, leaf_stage->source_splits, 
+                        auto pq_prepare_inputs = BuildParquetPrepareInputs(*pq_src, projection, filter,
+                            std::move(prune_filters), leaf_stage->source_splits,
                             config.coalesce_distance, config.max_region_bytes);
                         add_input(std::move(pq_prepare_inputs.cfg), cfg_var);
                         add_input(std::move(pq_prepare_inputs.footers), footer_var);
@@ -146,18 +166,15 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
 
                         fappls << "  plume_pq_prepare (config = all " << cfg_var
                               << ", footer = anyKeyed " << footer_var
-                              << ", url = anyKeyed " << url_var << ", dynFilter = all " 
-                              << DynFilterVar(leaf_stage->dynamic_filter_source_stage) << ") => (" << info_var << " = region, " 
+                              << ", url = anyKeyed " << url_var << ", dynFilter = "
+                              << DynFilterBinding(leaf_stage->DynFilterSourceStages(/*prune_only=*/true))
+                              << ") => (" << info_var << " = region, " 
                               << req_var << " = chunkReq) by footer inner url;\n";
                     } else {
                         TRY(auto pq_stage_inputs, BuildParquetStageInputs(*pq_src, projection, filter,
-                            leaf_stage->source_splits, config.coalesce_distance, config.max_region_bytes,
-                            leaf_stage->dynamic_filter_column));
+                            leaf_stage->source_splits, config.coalesce_distance, config.max_region_bytes));
                         add_input(std::move(pq_stage_inputs.region_info), info_var);
                         add_input(std::move(pq_stage_inputs.chunk_reqs), req_var);
-                        if (leaf_stage->HasDynFilter()) {
-                            stage_dyn_filter = ", dynFilter = all " + DynFilterVar(leaf_stage->dynamic_filter_source_stage);
-                        }
                     }
 
                     fappls << "  HTTP (requests = each " << req_var << ") => (" << data << " = bodies);\n";

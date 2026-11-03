@@ -13,6 +13,14 @@ class Deserializer;
 
 namespace plume::parquet {
 
+struct DynamicFilterColumn {
+    uint32_t filter_id = 0;
+    uint32_t file_column = 0;
+
+    void Serialize(duckdb::Serializer &s) const;
+    static DynamicFilterColumn Deserialize(duckdb::Deserializer &d);
+};
+
 // Parquet reading configuration. The information used by pq_prepare.
 struct ParquetConfig {
     uint32_t num_splits = 1;
@@ -26,9 +34,8 @@ struct ParquetConfig {
     bool has_pushed_filter = false;
     expr::ExprNode pushed_filter;
 
-    // Dynamic filter: file column index a runtime-computed DynamicFilter input applies to.
-    // -1 means this scan doesn't take a dynamic filter.
-    int32_t dynamic_filter_column = -1;
+    // The prune-mode dynamic filters (input set 3), all ANDed. Empty -> none.
+    std::vector<DynamicFilterColumn> dynamic_filters;
 
     // Per-file prefix sums of the source's row group counts (one entry per file, indexed by the
     // footer item's key). Empty -> single-file source.
@@ -36,7 +43,7 @@ struct ParquetConfig {
 
     // Per file (indexed by the footer item's key): the footer item starts with
     // page_index_sizes[i] bytes of the file from page_index_offsets[i] on, which hold the page
-    // indexes the dynamic filter needs. Empty or a size of 0 -> no page index.
+    // indexes the dynamic filters need. Empty or a size of 0 -> no page index.
     std::vector<int64_t> page_index_offsets;
     std::vector<uint64_t> page_index_sizes;
 
@@ -105,9 +112,6 @@ struct Region {
     std::vector<std::vector<DataChunk>> row_groups;
     // The data fetching requests.
     std::vector<ChunkRequest> requests;
-    // Runtime filter for the rows of scan column `dynamic_filter_column` (-1 -> none).
-    int32_t dynamic_filter_column = -1;
-    std::vector<uint8_t> dynamic_filter;
 
     inline bool empty() const {
         return row_groups.empty();

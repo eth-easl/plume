@@ -1,10 +1,10 @@
 #include "plume/abi/abi.hpp"
-#include "plume/common/serial.hpp"
 #include "plume/execution/executor.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/pipeline.hpp"
-#include "plume/functions/output_split.hpp"
+#include "plume/util/dynamic_filter.hpp"
+#include "plume/util/output_split.hpp"
 #include "plume/functions/parquet.hpp"
 #include "plume/memory/allocator.hpp"
 #include "plume/parquet/decoder.hpp"
@@ -28,12 +28,12 @@
 #define SET_IDX_IN_REGION_INFO 1
 // The third input set (index 2) should have items containing the resolved data chunk buffers.
 #define SET_IDX_IN_DATA_CHUNKS 2
-// The fourth input set (index 3) optionally holds the DynamicFilter of a join build side.
+// The fourth input set (index 3) is optional and holds the dynamic filters computed by upstream
+// stages.
 #define SET_IDX_IN_DYNAMIC_FILTER 3
 
 // The first output set (index 0) contains the normal row output.
-// The second output set (index 1) optionally contains a single serialized DynamicFilter item,
-// emitted only if the pipeline contains a DynamicFilterBuildTemplate operator.
+// The second output set (index 1) contains the dynamic filters each as a single item.
 #define SET_IDX_OUT_DYNAMIC_FILTER 1
 
 namespace plume::fn {
@@ -85,6 +85,12 @@ std::vector<uint32_t> RemainingColumns(uint32_t num_cols, const std::vector<uint
     return rest;
 }
 
+// A dynamic filter evaluated on a scan column.
+struct ColumnProbe {
+    uint32_t column;
+    std::unique_ptr<exec::DynamicFilterProbe> probe;
+};
+
 } // namespace
 
 Result<void> RunParquetStage() {
@@ -98,15 +104,13 @@ Result<void> RunParquetStage() {
     exec::Executor executor(alloc);
     {
         PLUME_TRACE_STAGE(trace::Phase::SETUP);
-        TRYV(executor.Build(desc, MakeSink(desc.output_sink, abi::AddOutput)));
+        TRYV(executor.Build(desc, util::MakeSink(desc.output_sink, abi::AddOutput)));
     }
 
     TRY(auto region_itms, abi::GetInputSet(SET_IDX_IN_REGION_INFO));
     TRY(auto data_chunk_itms, abi::GetInputSet(SET_IDX_IN_DATA_CHUNKS));
     if (region_itms.empty()) {
-        if (auto *dyn_filter = executor.FindDynamicFilterBuild()) {
-            abi::AddOutput("dynamic_filter", SET_IDX_OUT_DYNAMIC_FILTER, SerializeToBuffer(dyn_filter->Filter()));
-        }
+        util::EmitDynamicFilters(executor, SET_IDX_OUT_DYNAMIC_FILTER);
         return Ok();
     }
 
@@ -144,51 +148,63 @@ Result<void> RunParquetStage() {
         }
     }
     std::vector<uint32_t> rest_cols = RemainingColumns(num_cols, col_is_filter);
+
+    // One probe per dynamic filter (and column) the pipeline names. A filter that isn't bound has
+    // nothing to apply.
+    std::vector<ColumnProbe> probes;
+    {
+        TRY(auto dyn_filters, util::ReadDynamicFilters(SET_IDX_IN_DYNAMIC_FILTER));
+        for (const auto &spec : desc.dynamic_filter_probes) {
+            if (spec.column >= num_cols) {
+                return Error("Dynamic filter probe column exceeds the scan schema.", ErrorKind::OutOfRange);
+            }
+            auto it = dyn_filters.find(spec.filter_id);
+            if (it == dyn_filters.end()) {
+                continue;
+            }
+            if (!it->second.has_bounds) {
+                // The build side has no non-NULL key at all: the inner join can't produce any
+                // row, so nothing of the scan is needed.
+                util::EmitDynamicFilters(executor, SET_IDX_OUT_DYNAMIC_FILTER);
+                return Ok();
+            }
+            TRY(auto probe, exec::DynamicFilterProbe::Create(it->second, types[spec.column]));
+            if (probe) {
+                probes.push_back({spec.column, std::move(probe)});
+            }
+        }
+    }
+    // The columns decoded before (early) and after (late) evaluating the scan filter and the
+    // active probes, recomputed whenever a probe disables itself.
     std::vector<uint32_t> probe_early_cols, probe_rest_cols;
-    std::unique_ptr<exec::DynamicFilterProbe> probe;
-    uint32_t probe_col = 0;
-    bool probe_checked = false; // every region carries the same filter -> set up once
+    std::vector<uint8_t> active_probes; // the probes the columns were computed for
+    bool probe_cols_computed = false;
+    auto update_probe_cols = [&]() {
+        std::vector<uint8_t> active(probes.size());
+        for (size_t p = 0; p < probes.size(); p++) {
+            active[p] = probes[p].probe->Active() ? 1 : 0;
+        }
+        if (probe_cols_computed && active == active_probes) {
+            return;
+        }
+        probe_cols_computed = true;
+        active_probes = std::move(active);
+        std::vector<uint8_t> is_early = col_is_filter;
+        probe_early_cols = filter_cols;
+        for (size_t p = 0; p < probes.size(); p++) {
+            const uint32_t c = probes[p].column;
+            if (active_probes[p] && is_early[c] == 0) {
+                is_early[c] = 1;
+                probe_early_cols.push_back(c);
+            }
+        }
+        probe_rest_cols = RemainingColumns(num_cols, is_early);
+    };
     std::vector<uint8_t> keep; // reused per window (survivor mask for late materialization)
 
     for (auto &region_itm : region_itms) {
         const size_t region_key = region_itm.key;
         auto region = parquet::Region::Deserialize(region_itm.buffer);
-
-        if (!probe_checked && region.dynamic_filter_column >= 0) {
-            probe_checked = true;
-            if (static_cast<uint32_t>(region.dynamic_filter_column) >= num_cols) {
-                return Error("Region.dynamic_filter_column exceeds the scan schema.", ErrorKind::OutOfRange);
-            }
-            probe_col = static_cast<uint32_t>(region.dynamic_filter_column);
-            std::optional<exec::DynamicFilter> filter;
-            if (!region.dynamic_filter.empty()) {
-                filter = DeserializeFromBytes<exec::DynamicFilter>(region.dynamic_filter.data(),
-                                                                   region.dynamic_filter.size());
-            } else if (auto itms = abi::GetOptionalInputSet(SET_IDX_IN_DYNAMIC_FILTER); itms && !itms->empty()) {
-                filter = DeserializeFromBytes<exec::DynamicFilter>((*itms)[0].buffer.data(), (*itms)[0].buffer.size());
-                for (size_t i = 1; i < itms->size(); i++) {
-                    auto &itm = (*itms)[i];
-                    filter->Merge(DeserializeFromBytes<exec::DynamicFilter>(itm.buffer.data(), itm.buffer.size()));
-                }
-                if (!filter->has_bounds) {
-                    // The build side has no non-NULL key at all: the inner join can't produce any
-                    // row, so nothing of the scan is needed.
-                    if (auto *dyn_filter = executor.FindDynamicFilterBuild()) {
-                        abi::AddOutput("dynamic_filter", SET_IDX_OUT_DYNAMIC_FILTER, SerializeToBuffer(dyn_filter->Filter()));
-                    }
-                    return Ok();
-                }
-            }
-            if (filter) {
-                TRY(probe, exec::DynamicFilterProbe::Create(std::move(*filter), types[probe_col]));
-            }
-            probe_early_cols = filter_cols;
-            if (col_is_filter[probe_col] == 0) {
-                probe_early_cols.push_back(probe_col);
-            }
-            col_is_filter[probe_col] = 1;
-            probe_rest_cols = RemainingColumns(num_cols, col_is_filter);
-        }
 
         for (auto &rg : region.row_groups) {
             const size_t ncol = rg.size();
@@ -264,26 +280,30 @@ Result<void> RunParquetStage() {
                 }
             }
 
-            if (probe) {
-                // A fully dictionary-encoded key column chunk holds no other values than its
-                // dictionary: check the dictionary once instead of every row.
+            // A fully dictionary-encoded key column chunk holds no other values than its
+            // dictionary: check the dictionary once instead of every row.
+            bool rg_rejected = false;
+            for (auto &[probe_col, probe] : probes) {
                 const duckdb::Vector *dict = nullptr;
-                if (probe->Active()) {
-                    TRYV(TryCatch([&] { dict = readers[probe_col].Dictionary(types[probe_col]); }));
+                if (probe->Active() && !rg_rejected) {
+                    TRYV(TryCatch([&, col = probe_col] { dict = readers[col].Dictionary(types[col]); }));
                 }
                 const idx_t passed = probe->SetDictionary(dict, dict ? readers[probe_col].DictionaryVectorSize() : 0);
                 if (dict && passed == 0) {
-                    continue; // no key of the row group can find a join partner
+                    rg_rejected = true; // no key of the row group can find a join partner
                 }
+            }
+            if (rg_rejected) {
+                continue;
             }
 
             std::vector<uint64_t> stream_pos(ncol, 0); // rows of each column chunk consumed
             for (auto [range_begin, range_end] : target) {
                 if (partial) {
                     // Skip the rows of each column chunk before the range.
-                    TRYV(TryCatch([&] {
+                    TRYV(TryCatch([&, begin = range_begin] {
                         for (size_t c = 0; c < ncol; c++) {
-                            const uint64_t at = StreamOffset(covered[c], range_begin);
+                            const uint64_t at = StreamOffset(covered[c], begin);
                             readers[c].Skip(at - stream_pos[c]);
                             stream_pos[c] = at;
                         }
@@ -298,7 +318,11 @@ Result<void> RunParquetStage() {
                     chunk->Initialize(alloc.Get(), types);
 
                     const bool use_filter = scan_filter != nullptr;
-                    const bool use_probe = probe && probe->Active();
+                    const bool use_probe = std::any_of(probes.begin(), probes.end(),
+                                                       [](const ColumnProbe &p) { return p.probe->Active(); });
+                    if (use_probe) {
+                        update_probe_cols();
+                    }
                     const auto &early_cols = use_probe ? probe_early_cols : filter_cols;
                     const auto &late_cols = use_probe ? probe_rest_cols : rest_cols;
 
@@ -326,8 +350,13 @@ Result<void> RunParquetStage() {
                                 sel.set_index(j, j);
                             }
                         }
-                        if (use_probe && sc > 0) {
-                            sc = probe->Select(chunk->data[probe_col], n, sel, sc);
+                        if (use_probe) {
+                            for (size_t p = 0; p < probes.size() && sc > 0; p++) {
+                                // Only the probes the early columns were decoded for.
+                                if (active_probes[p]) {
+                                    sc = probes[p].probe->Select(chunk->data[probes[p].column], n, sel, sc);
+                                }
+                            }
                         }
                         if (sc == 0) {
                             // Whole window rejected: advance the other readers, emit nothing.
@@ -360,9 +389,7 @@ Result<void> RunParquetStage() {
     }
 
     TRYV(executor.Finish());
-    if (auto *dyn_filter = executor.FindDynamicFilterBuild()) {
-        abi::AddOutput("dynamic_filter", SET_IDX_OUT_DYNAMIC_FILTER, SerializeToBuffer(dyn_filter->Filter()));
-    }
+    util::EmitDynamicFilters(executor, SET_IDX_OUT_DYNAMIC_FILTER);
 
 #if defined(PLUME_VERBOSE) && PLUME_VERBOSE >= 1
     alloc.PrintStats();

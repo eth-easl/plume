@@ -9,6 +9,10 @@
 
 #include "duckdb/main/connection.hpp"
 
+#include <map>
+#include <set>
+#include <vector>
+
 namespace plume::parser {
 
 using catalog::AutoFetcher;
@@ -27,22 +31,45 @@ Result<CompiledComposition> CompileQuery(duckdb::Connection &con, SourceCatalog 
     CompiledComposition out;
     TRY(out.plan, BuildPhysicalPlan(con, resolved_sql, catalog, config));
 
-    // pq_prepare selects pages by the dynamic filter if it has the page indexes.
+    struct PageIndexRequest {
+        std::set<uint32_t> key_cols;
+        std::set<uint32_t> read_cols;
+        bool all_cols = false;
+    };
+    std::map<catalog::RemoteParquetDataSource *, PageIndexRequest> page_index_requests;
     for (auto &stage : out.plan->stages) {
-        if (!stage->IsLeaf()) {
+        if (!stage->IsLeaf() || !stage->PrunesByDynFilter()) {
             continue;
         }
         auto &leaf = static_cast<LeafStage &>(*stage);
-        if (leaf.HasDynFilter() && leaf.dynamic_filter_prune &&
-            leaf.data_source->type == catalog::DataSourceType::REMOTE_PARQUET) {
-            catalog::FetchPageIndexes(static_cast<catalog::RemoteParquetDataSource &>(*leaf.data_source), resolver,
-                                      static_cast<uint32_t>(leaf.dynamic_filter_column),
-                                      leaf.projection ? *leaf.projection : std::vector<uint32_t>{});
+        if (leaf.data_source->type != catalog::DataSourceType::REMOTE_PARQUET) {
+            continue;
+        }
+
+        auto &req = page_index_requests[static_cast<catalog::RemoteParquetDataSource *>(leaf.data_source.get())];
+        for (const auto &in : leaf.dynamic_filter_inputs) {
+            if (in.prune) {
+                req.key_cols.insert(in.file_column);
+            }
+        }
+        if (!leaf.projection || leaf.projection->empty()) {
+            req.all_cols = true;
+        } else {
+            req.read_cols.insert(leaf.projection->begin(), leaf.projection->end());
         }
     }
-    TRYV(resolver.Execute());
-    TRY(out.composition, dandelion::BuildDandelionComposition(con, *out.plan, name, config));
 
+    for (auto &[src, req] : page_index_requests) {
+        std::vector<uint32_t> key_cols(req.key_cols.begin(), req.key_cols.end());
+        std::vector<uint32_t> read_cols;
+        if (!req.all_cols) {
+            read_cols.assign(req.read_cols.begin(), req.read_cols.end());
+        }
+        src->ResolvePageIndexes(resolver, key_cols, read_cols);
+    }
+    TRYV(resolver.Execute());
+    
+    TRY(out.composition, dandelion::BuildDandelionComposition(con, *out.plan, name, config));
     return out;
 }
 

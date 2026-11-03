@@ -8,6 +8,7 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
+#include <limits>
 #include <type_traits>
 #include <unordered_set>
 
@@ -137,10 +138,37 @@ std::optional<expr::ExprNode> BuildRangeFilter(uint32_t column, const ColumnType
 // DynamicFilterBuildTemplate
 //===----------------------------------------------------------------------===//
 
+std::string DynamicFilterIdent(uint32_t filter_id) {
+    return "dynfilter_" + std::to_string(filter_id);
+}
+
+Result<uint32_t> ParseDynamicFilterIdent(const std::string &ident) {
+    static const std::string kPrefix = "dynfilter_";
+    if (ident.size() <= kPrefix.size() || ident.compare(0, kPrefix.size(), kPrefix) != 0) {
+        return Error("Dynamic filter identifier has wrong prefix (ident = '" + ident + "').", 
+                     ErrorKind::InvalidInput);
+    }
+    uint64_t id = 0;
+    for (size_t i = kPrefix.size(); i < ident.size(); i++) {
+        const char c = ident[i];
+        if (c < '0' || c > '9') {
+            return Error("Dynamic filter identifier id is not an integer (ident = '" + ident + "').", 
+                         ErrorKind::InvalidInput);
+        }
+        id = id * 10 + static_cast<uint64_t>(c - '0');
+        if (id > std::numeric_limits<uint32_t>::max()) {
+            return Error("Dynamic filter identifier id exceeds uint32 (ident = '" + ident + "').", 
+                         ErrorKind::InvalidInput);
+        }
+    }
+    return static_cast<uint32_t>(id);
+}
+
 bool DynamicFilterBuildTemplate::Equals(const OperatorTemplate &other) const {
     if (other.type != type) return false;
     auto &o = static_cast<const DynamicFilterBuildTemplate &>(other);
-    return column == o.column && key_type == o.key_type && max_values == o.max_values && bloom_bits == o.bloom_bits;
+    return filter_id == o.filter_id && column == o.column && key_type == o.key_type &&
+           max_values == o.max_values && bloom_bits == o.bloom_bits;
 }
 
 void DynamicFilterBuildTemplate::Serialize(duckdb::Serializer &s) const {
@@ -148,6 +176,7 @@ void DynamicFilterBuildTemplate::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(102, "key_type", key_type);
     s.WriteProperty(103, "max_values", max_values);
     s.WriteProperty(104, "bloom_bits", bloom_bits);
+    s.WriteProperty(105, "filter_id", filter_id);
 }
 
 //===----------------------------------------------------------------------===//
@@ -512,7 +541,8 @@ Result<std::unique_ptr<KeyCollector>> CreateKeyCollector(const DynamicFilterBuil
 
 DynamicFilterBuildOperator::DynamicFilterBuildOperator(const DynamicFilterBuildTemplate &templ,
         std::unique_ptr<KeyCollector> collector, duckdb::vector<LogicalType> output_types)
-    : Operator(std::move(output_types)), column_(templ.column), key_type_(ToLogicalType(templ.key_type)),
+    : Operator(std::move(output_types)), filter_id_(templ.filter_id), column_(templ.column),
+      key_type_(ToLogicalType(templ.key_type)),
       state_(std::move(collector)) {}
 
 DynamicFilterBuildOperator::~DynamicFilterBuildOperator() = default;

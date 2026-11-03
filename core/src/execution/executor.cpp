@@ -210,14 +210,14 @@ Result<FilterOperator *> Executor::TakeLeadingScanFilter() {
     return filter;
 }
 
-DynamicFilterBuildOperator *Executor::FindDynamicFilterBuild() const {
-    // assumes only one DynamicFilterBuildOperator in the pipeline
+std::vector<DynamicFilterBuildOperator *> Executor::DynamicFilterBuilds() const {
+    std::vector<DynamicFilterBuildOperator *> out;
     for (auto &op : operators_) {
         if (auto *df = dynamic_cast<DynamicFilterBuildOperator *>(op.get())) {
-            return df;
+            out.push_back(df);
         }
     }
-    return nullptr;
+    return out;
 }
 
 } // namespace plume::exec

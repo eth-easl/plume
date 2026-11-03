@@ -416,7 +416,7 @@ DataBuffer EncodeBounds(bool valid, duckdb::Value min, duckdb::Value max) {
 }
 
 // Wires config/footer/url as usual (set 0/1/2); `dyn_filter`, if present, is wired as the
-// (optional, at most one item) dynamic filter input at set 3 -- nullopt leaves set 3 entirely
+// (optional) dynamic filter input at set 3, as filter 0 -- nullopt leaves set 3 entirely
 // unwired, exercising the "caller doesn't know about it" (out-of-range) path.
 void RunprepareWithDynFilter(parquet::ParquetConfig cfg, DataBuffer footer, std::optional<DataBuffer> dyn_filter) {
     mock::Reset();
@@ -437,9 +437,7 @@ void RunprepareWithDynFilter(parquet::ParquetConfig cfg, DataBuffer footer, std:
         return v;
     }());
     if (dyn_filter) {
-        std::vector<DataBuffer> v;
-        v.push_back(std::move(*dyn_filter));
-        mock::SetInput(3, std::move(v));
+        mock::AddInput(3, std::move(*dyn_filter), exec::DynamicFilterIdent(0), 0);
     }
     CHECK(fn::RunParquetPrepare().is_ok());
 }
@@ -450,14 +448,14 @@ TEST_CASE("pq_prepare: no dynamic filter input set behaves exactly as before") {
     // EncodeStatsFooter's single INT32 column ("v"); set as the dynamic filter's target
     // column, but set 3 is never wired -- must not error, must not prune.
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     RunprepareWithDynFilter(cfg, EncodeStatsFooter(), std::nullopt);
     CHECK(mock::OutputsForSet(0).size() == 1);
 }
 
 TEST_CASE("pq_prepare: an explicitly empty dynamic filter set behaves as no filter") {
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     mock::Reset();
     mock::SetInput(0, [&] {
         std::vector<DataBuffer> v;
@@ -482,9 +480,10 @@ TEST_CASE("pq_prepare: an explicitly empty dynamic filter set behaves as no filt
 
 namespace {
 
-// Wires config/footer/url like RunprepareWithDynFilter, with one dynamic filter item per build
-// instance at set 3.
-void RunprepareWithDynFilters(parquet::ParquetConfig cfg, DataBuffer footer, std::vector<DataBuffer> dyn_filters) {
+// Wires config/footer/url like RunprepareWithDynFilter, with one dynamic filter item per filter
+// and build instance at set 3 (filter id, serialized filter).
+void RunprepareWithIdentifiedFilters(parquet::ParquetConfig cfg, DataBuffer footer,
+                                     std::vector<std::pair<uint32_t, DataBuffer>> dyn_filters) {
     mock::Reset();
     mock::SetInput(0, [&] {
         std::vector<DataBuffer> v;
@@ -502,8 +501,20 @@ void RunprepareWithDynFilters(parquet::ParquetConfig cfg, DataBuffer footer, std
         v.push_back(mock::MakeBuffer(url, std::char_traits<char>::length(url)));
         return v;
     }());
-    mock::SetInput(3, std::move(dyn_filters));
+    mock::SetInput(3, std::vector<DataBuffer>{});
+    for (auto &[id, buf] : dyn_filters) {
+        mock::AddInput(3, std::move(buf), exec::DynamicFilterIdent(id), 0);
+    }
     CHECK(fn::RunParquetPrepare().is_ok());
+}
+
+// Like RunprepareWithIdentifiedFilters, every item being a build instance of filter 0.
+void RunprepareWithDynFilters(parquet::ParquetConfig cfg, DataBuffer footer, std::vector<DataBuffer> dyn_filters) {
+    std::vector<std::pair<uint32_t, DataBuffer>> items;
+    for (auto &buf : dyn_filters) {
+        items.emplace_back(0, std::move(buf));
+    }
+    RunprepareWithIdentifiedFilters(std::move(cfg), std::move(footer), std::move(items));
 }
 
 } // namespace
@@ -512,7 +523,7 @@ TEST_CASE("pq_prepare: dynamic filter items of several build instances are merge
     // EncodeStatsFooter's row group is [-7, 999]. Each instance's range alone would prune it,
     // but the merged range [-100, 1100] overlaps it -> kept.
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     std::vector<DataBuffer> items;
     items.push_back(EncodeBounds(true, Value::INTEGER(1000), Value::INTEGER(1100)));
     items.push_back(EncodeBounds(true, Value::INTEGER(-100), Value::INTEGER(-50)));
@@ -529,7 +540,7 @@ TEST_CASE("pq_prepare: dynamic filter items of several build instances are merge
 
 TEST_CASE("pq_prepare: an empty build instance doesn't widen the merged range") {
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     std::vector<DataBuffer> items;
     items.push_back(EncodeBounds(/*valid=*/false, Value(), Value()));
     items.push_back(EncodeBounds(true, Value::INTEGER(2000), Value::INTEGER(3000)));
@@ -539,7 +550,7 @@ TEST_CASE("pq_prepare: an empty build instance doesn't widen the merged range") 
 
 TEST_CASE("pq_prepare: all-invalid dynamic filter (empty build side) prunes the entire scan") {
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     std::vector<DataBuffer> items;
     items.push_back(EncodeBounds(/*valid=*/false, Value(), Value()));
     items.push_back(EncodeBounds(/*valid=*/false, Value(), Value()));
@@ -552,7 +563,7 @@ TEST_CASE("pq_prepare: dynamic filter prunes a row group its range excludes") {
     // EncodeStatsFooter's only row group has min=-7, max=999; a [2000,3000] dynamic
     // range can't overlap it.
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
                             EncodeBounds(true, Value::INTEGER(2000), Value::INTEGER(3000)));
     CHECK(mock::OutputsForSet(0).empty());
@@ -561,7 +572,7 @@ TEST_CASE("pq_prepare: dynamic filter prunes a row group its range excludes") {
 
 TEST_CASE("pq_prepare: dynamic filter keeps a row group its range overlaps") {
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
                             EncodeBounds(true, Value::INTEGER(-100), Value::INTEGER(100)));
     CHECK(mock::OutputsForSet(0).size() == 1);
@@ -574,7 +585,7 @@ TEST_CASE("pq_prepare: dynamic filter still prunes alongside a (non-pruning) sta
     parquet::ParquetConfig cfg;
     cfg.has_pushed_filter = true;
     cfg.pushed_filter = VCompare(duckdb::ExpressionType::COMPARE_GREATERTHAN, 0);
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
                             EncodeBounds(true, Value::INTEGER(2000), Value::INTEGER(3000)));
     CHECK(mock::OutputsForSet(0).empty());
@@ -586,7 +597,7 @@ TEST_CASE("pq_prepare: static filter still prunes alongside a (non-pruning) dyna
     parquet::ParquetConfig cfg;
     cfg.has_pushed_filter = true;
     cfg.pushed_filter = VCompare(duckdb::ExpressionType::COMPARE_GREATERTHAN, 2000);
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     RunprepareWithDynFilter(cfg, EncodeStatsFooter(),
                             EncodeBounds(true, Value::INTEGER(-100), Value::INTEGER(100)));
     CHECK(mock::OutputsForSet(0).empty());
@@ -629,44 +640,66 @@ TEST_CASE("pq_prepare: per-file split share and region keys unique across files"
     CHECK(region_keys[1] == 2);
 }
 
-TEST_CASE("pq_prepare: every region carries the merged dynamic filter for pq_stage") {
-    auto region_of = [](const mock::Output *out) {
-        auto buf = mock::MakeBuffer(out->buffer.data(), out->buffer.size());
-        return parquet::Region::Deserialize(buf);
-    };
+TEST_CASE("pq_prepare: several dynamic filters are ANDed, filters not in the config are ignored") {
+    // EncodeStatsFooter's row group is [-7, 999].
+    auto overlapping = [] { return EncodeBounds(true, Value::INTEGER(-100), Value::INTEGER(100)); };
+    auto excluding = [] { return EncodeBounds(true, Value::INTEGER(2000), Value::INTEGER(3000)); };
 
+    // Filter 0 alone keeps the row group, filter 1 alone prunes it -> both together prune.
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
-    cfg.projection = {0};
-    exec::DynamicFilter a, b;
-    a.MergeBounds(Value::INTEGER(1), Value::INTEGER(1));
-    a.has_values = true;
-    a.values = {Value::INTEGER(1)};
-    a.max_values = 4;
-    b = a;
-    b.MergeBounds(Value::INTEGER(5), Value::INTEGER(5));
-    b.values = {Value::INTEGER(5)};
-    std::vector<DataBuffer> items;
-    items.push_back(SerializeToBuffer(a));
-    items.push_back(SerializeToBuffer(b));
-    RunprepareWithDynFilters(cfg, EncodeStatsFooter(), std::move(items));
+    cfg.dynamic_filters = {{0, 0}, {1, 0}};
+    std::vector<std::pair<uint32_t, DataBuffer>> items;
+    items.emplace_back(0, overlapping());
+    items.emplace_back(1, excluding());
+    RunprepareWithIdentifiedFilters(cfg, EncodeStatsFooter(), std::move(items));
+    CHECK(mock::OutputsForSet(0).empty());
 
-    auto regions = mock::OutputsForSet(0);
-    CHECK(regions.size() == 1);
-    auto region = region_of(regions[0]);
-    CHECK(region.dynamic_filter_column == 0); // scan column of file column 0
-    auto f = DeserializeFromBytes<exec::DynamicFilter>(region.dynamic_filter.data(), region.dynamic_filter.size());
-    CHECK(f.min == Value::INTEGER(1));
-    CHECK(f.max == Value::INTEGER(5));
-    CHECK(f.has_values);
-    CHECK(f.values.size() == 2);
+    // Filter 1 is bound but not one of the config's (a probe-only filter of the same producer).
+    cfg.dynamic_filters = {{0, 0}};
+    items.clear();
+    items.emplace_back(0, overlapping());
+    items.emplace_back(1, excluding());
+    RunprepareWithIdentifiedFilters(cfg, EncodeStatsFooter(), std::move(items));
+    CHECK(mock::OutputsForSet(0).size() == 1);
 
-    // Without a dynamic filter, regions carry none.
-    parquet::ParquetConfig plain;
-    RunprepareWithDynFilter(plain, EncodeStatsFooter(), std::nullopt);
-    auto plain_region = region_of(mock::OutputsForSet(0)[0]);
-    CHECK(plain_region.dynamic_filter_column == -1);
-    CHECK(plain_region.dynamic_filter.empty());
+    // A configured filter that isn't bound prunes nothing; an empty one prunes the entire scan.
+    cfg.dynamic_filters = {{0, 0}, {5, 0}};
+    items.clear();
+    items.emplace_back(0, overlapping());
+    RunprepareWithIdentifiedFilters(cfg, EncodeStatsFooter(), std::move(items));
+    CHECK(mock::OutputsForSet(0).size() == 1);
+    items.clear();
+    items.emplace_back(0, overlapping());
+    items.emplace_back(5, EncodeBounds(/*valid=*/false, Value(), Value()));
+    RunprepareWithIdentifiedFilters(cfg, EncodeStatsFooter(), std::move(items));
+    CHECK(mock::OutputsForSet(0).empty());
+}
+
+TEST_CASE("pq_prepare: a dynamic filter item with an unexpected ident is an error") {
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filters = {{0, 0}};
+    mock::Reset();
+    mock::AddInput(0, SerializeToBuffer(cfg), "config", 0);
+    mock::AddInput(1, EncodeStatsFooter(), "footer", 0);
+    const char *url = "s3://b/f.parquet";
+    mock::AddInput(2, mock::MakeBuffer(url, std::char_traits<char>::length(url)), "url", 0);
+    mock::AddInput(3, EncodeBounds(true, Value::INTEGER(1), Value::INTEGER(2)), "dynamic_filter", 0);
+    CHECK(fn::RunParquetPrepare().is_error());
+}
+
+TEST_CASE("ParquetConfig: dynamic_filters round-trip") {
+    parquet::ParquetConfig cfg;
+    cfg.dynamic_filters = {{3, 1}, {9, 0}};
+    auto buf = SerializeToBuffer(cfg);
+    auto back = DeserializeFromBytes<parquet::ParquetConfig>(buf.data(), buf.size());
+    CHECK(back.dynamic_filters.size() == 2);
+    CHECK(back.dynamic_filters[0].filter_id == 3);
+    CHECK(back.dynamic_filters[0].file_column == 1);
+    CHECK(back.dynamic_filters[1].filter_id == 9);
+    CHECK(back.dynamic_filters[1].file_column == 0);
+    parquet::ParquetConfig empty_cfg;
+    auto plain = SerializeToBuffer(empty_cfg);
+    CHECK(DeserializeFromBytes<parquet::ParquetConfig>(plain.data(), plain.size()).dynamic_filters.empty());
 }
 
 namespace {
@@ -800,7 +833,7 @@ TEST_CASE("pq_prepare: dynamic filter's exact keys prune a row group its range o
     // EncodeStatsFooter's only row group has min=-7, max=999; the keys' range [-50, 2000] overlaps
     // it but neither key falls into it.
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
+    cfg.dynamic_filters = {{0, 0}};
     RunprepareWithDynFilter(cfg, EncodeStatsFooter(), EncodeValues({Value::INTEGER(-50), Value::INTEGER(2000)}));
     CHECK(mock::OutputsForSet(0).empty());
     CHECK(mock::OutputsForSet(1).empty());
@@ -976,21 +1009,30 @@ std::pair<size_t, DataBuffer> EncodePageIndexFile(
 
 const std::vector<std::optional<std::pair<int32_t, int32_t>>> kSortedPages = {{{0, 99}}, {{100, 149}}, {{200, 299}}};
 
-// Runs pq_prepare over EncodePageIndexFile with an exact-key dynamic filter on k.
+// Runs pq_prepare over EncodePageIndexFile with one exact-key dynamic filter on k per key set.
 void RunPageIndexPrepare(const std::vector<std::optional<std::pair<int32_t, int32_t>>> &k_pages,
-                         std::vector<int32_t> keys, bool with_page_index = true) {
+                         std::vector<std::vector<int32_t>> key_sets, bool with_page_index = true) {
     auto [pi_size, item] = EncodePageIndexFile(k_pages);
     parquet::ParquetConfig cfg;
-    cfg.dynamic_filter_column = 0;
     if (with_page_index) {
         cfg.page_index_offsets = {kPageIndexAt};
         cfg.page_index_sizes = {pi_size};
     }
-    std::vector<Value> values;
-    for (int32_t k : keys) {
-        values.push_back(Value::INTEGER(k));
+    std::vector<std::pair<uint32_t, DataBuffer>> filters;
+    for (uint32_t f = 0; f < key_sets.size(); f++) {
+        cfg.dynamic_filters.push_back({f, 0});
+        std::vector<Value> values;
+        for (int32_t k : key_sets[f]) {
+            values.push_back(Value::INTEGER(k));
+        }
+        filters.emplace_back(f, EncodeValues(std::move(values)));
     }
-    RunprepareWithDynFilter(cfg, std::move(item), EncodeValues(std::move(values)));
+    RunprepareWithIdentifiedFilters(cfg, std::move(item), std::move(filters));
+}
+
+void RunPageIndexPrepare(const std::vector<std::optional<std::pair<int32_t, int32_t>>> &k_pages,
+                         std::vector<int32_t> keys, bool with_page_index = true) {
+    RunPageIndexPrepare(k_pages, std::vector<std::vector<int32_t>>{std::move(keys)}, with_page_index);
 }
 
 } // namespace
@@ -1084,6 +1126,22 @@ TEST_CASE("pq_prepare: page index prunes a row group none of whose pages may mat
     RunPageIndexPrepare(kSortedPages, {170}, /*with_page_index=*/false);
     CHECK(mock::OutputsForSet(0).size() == 1);
     CHECK(RegionAt(0).row_groups[0][0].pages.empty());
+}
+
+TEST_CASE("pq_prepare: page index selects the pages every dynamic filter's key may be in") {
+    // {120, 250} alone selects pages [100, 149] and [200, 299]; {250, 50} alone [0, 99] and
+    // [200, 299]: together only [200, 299].
+    RunPageIndexPrepare(kSortedPages, std::vector<std::vector<int32_t>>{{120, 250}, {250, 50}});
+    CHECK(mock::OutputsForSet(0).size() == 1);
+    auto region = RegionAt(0);
+    const auto &k = region.row_groups[0][0];
+    CHECK(k.pages.size() == 1);
+    CHECK(k.pages[0].first_row == 200);
+    CHECK(k.pages[0].num_rows == 100);
+
+    // Disjoint page selections: the row group is pruned.
+    RunPageIndexPrepare(kSortedPages, std::vector<std::vector<int32_t>>{{120}, {250}});
+    CHECK(mock::OutputsForSet(0).empty());
 }
 
 TEST_CASE("ScanColumnIndex: file column -> position in the projection") {

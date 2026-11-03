@@ -181,8 +181,8 @@ int main(int argc, char **argv) {
                 for (const auto &blk : *blocks) {
                     us.table_blocks.push_back(FromDataItem(blk));
                 }
-            } else if (leaf.data_source->type == DataSourceType::REMOTE_PARQUET && leaf.HasDynFilter()) {
-                // Runtime-dynamic-filter parquet leaves consume 3 sets (cfg/footer/url)
+            } else if (leaf.data_source->type == DataSourceType::REMOTE_PARQUET && leaf.PrunesByDynFilter()) {
+                // Prune-mode dynamic-filter parquet leaves consume 3 sets (cfg/footer/url)
                 // and are prepared server-side via plume_pq_prepare at invocation time --
                 // there's no precomputed region/chunk-info for ubench to replay yet.
                 std::cerr << "ubench_export: stage " << us.id

@@ -30,7 +30,8 @@ endfunction()
 plume_function(plume_stage
   src/bin/plume_stage.cpp
   src/functions/stage.cpp
-  src/functions/output_split.cpp)
+  src/util/dynamic_filter.cpp
+  src/util/output_split.cpp)
 
 plume_function(plume_csv_prepare
   src/bin/plume_csv_prepare.cpp
@@ -39,16 +40,19 @@ plume_function(plume_csv_prepare
 plume_function(plume_csv_stage
   src/bin/plume_csv_stage.cpp
   src/functions/csv_stage.cpp
-  src/functions/output_split.cpp)
+  src/util/dynamic_filter.cpp
+  src/util/output_split.cpp)
 
 plume_function(plume_pq_prepare
   src/bin/plume_pq_prepare.cpp
-  src/functions/pq_prepare.cpp)
+  src/functions/pq_prepare.cpp
+  src/util/dynamic_filter.cpp)
 
 plume_function(plume_pq_stage
   src/bin/plume_pq_stage.cpp
   src/functions/pq_stage.cpp
-  src/functions/output_split.cpp)
+  src/util/dynamic_filter.cpp
+  src/util/output_split.cpp)
 
 # ---------------------------------------------------------------------------
 #  Tests

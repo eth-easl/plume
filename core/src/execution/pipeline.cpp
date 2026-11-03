@@ -47,6 +47,22 @@ OutputSink OutputSink::Deserialize(duckdb::Deserializer &d) {
 }
 
 //===----------------------------------------------------------------------===//
+// DynamicFilterProbeSpec
+//===----------------------------------------------------------------------===//
+
+void DynamicFilterProbeSpec::Serialize(duckdb::Serializer &s) const {
+    s.WriteProperty(100, "filter_id", filter_id);
+    s.WriteProperty(101, "column", column);
+}
+
+DynamicFilterProbeSpec DynamicFilterProbeSpec::Deserialize(duckdb::Deserializer &d) {
+    DynamicFilterProbeSpec spec;
+    spec.filter_id = d.ReadProperty<uint32_t>(100, "filter_id");
+    spec.column = d.ReadProperty<uint32_t>(101, "column");
+    return spec;
+}
+
+//===----------------------------------------------------------------------===//
 // PipelineTemplate
 //===----------------------------------------------------------------------===//
 
@@ -60,6 +76,8 @@ void PipelineTemplate::Serialize(duckdb::Serializer &s) const {
     });
     s.WriteProperty(102, "output_split", output_split);
     s.WriteProperty(103, "output_sink", output_sink);
+    s.WritePropertyWithDefault(104, "dynamic_filter_probes",
+        duckdb::vector<DynamicFilterProbeSpec>(dynamic_filter_probes.begin(), dynamic_filter_probes.end()));
 }
 
 PipelineTemplate PipelineTemplate::Deserialize(duckdb::Deserializer &d) {
@@ -73,6 +91,8 @@ PipelineTemplate PipelineTemplate::Deserialize(duckdb::Deserializer &d) {
     });
     pt.output_split = d.ReadProperty<OutputSplit>(102, "output_split");
     pt.output_sink = d.ReadPropertyWithExplicitDefault<OutputSink>(103, "output_sink", OutputSink{});
+    auto probes = d.ReadPropertyWithDefault<duckdb::vector<DynamicFilterProbeSpec>>(104, "dynamic_filter_probes");
+    pt.dynamic_filter_probes.assign(probes.begin(), probes.end());
     return pt;
 }
 

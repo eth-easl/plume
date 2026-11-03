@@ -2,6 +2,7 @@
 #include "plume/common/serial.hpp"
 #include "plume/dandelion/s3.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
+#include "plume/util/dynamic_filter.hpp"
 #include "plume/functions/parquet.hpp"
 #include "plume/parquet/metadata.hpp"
 #include "plume/parquet/parquet.hpp"
@@ -23,8 +24,8 @@
 #define SET_IDX_IN_FOOTER 1
 // The third input set (index 2) should have items containing source urls of the parquet.
 #define SET_IDX_IN_URL 2
-// The fourth input set (index 3) is optional and holds the DynamicFilter computed by an
-// upstream stage's join build side, one item per build instance.
+// The fourth input set (index 3) is optional and holds the dynamic filters computed by upstream
+// stages.
 #define SET_IDX_IN_DYNAMIC_FILTER 3
 
 // The first output set (index 0) contains the region infos.
@@ -89,12 +90,34 @@ std::optional<ColumnPages> PageRunsFor(const parquet::ColumnChunkMeta &cc, uint6
     return ColumnPages{locs.front().offset, std::move(runs)};
 }
 
-// Narrows the row groups to read by the page index of the dynamic filter's key column: drops the
-// row groups none of whose pages can match and selects the pages to read of the others.
+// A dynamic filter's key column and, if it carries them, its exact keys (sorted, cast to the
+// column type).
+struct KeyFilter {
+    uint32_t column;
+    std::optional<std::vector<duckdb::Value>> values;
+};
+
+std::vector<parquet::RowRange> IntersectRows(const std::vector<parquet::RowRange> &a,
+                                             const std::vector<parquet::RowRange> &b) {
+    std::vector<parquet::RowRange> out;
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        const uint64_t begin = std::max(a[i].begin, b[j].begin);
+        const uint64_t end = std::min(a[i].end, b[j].end);
+        if (begin < end) {
+            out.push_back({begin, end});
+        }
+        (a[i].end < b[j].end) ? i++ : j++;
+    }
+    return out;
+}
+
+// Narrows the row groups to read by the page indexes of the dynamic filters' key columns: drops
+// the row groups none of whose pages can match and selects the pages to read of the others (the
+// rows every key column's selected pages hold).
 void SelectPages(const parquet::FileMeta &meta, const parquet::ParquetConfig &config, const expr::ExprNode *filter,
-                 const std::vector<duckdb::Value> *dyn_values, const PageIndexBytes &page_index,
+                 const std::vector<KeyFilter> &key_filters, const PageIndexBytes &page_index,
                  std::vector<uint32_t> &row_groups, std::map<uint32_t, parquet::RowGroupPages> &selection) {
-    const uint32_t key_col = static_cast<uint32_t>(config.dynamic_filter_column);
     std::vector<uint32_t> read_cols = config.projection;
     if (read_cols.empty()) {
         read_cols.resize(meta.schema.columns.size());
@@ -105,21 +128,33 @@ void SelectPages(const parquet::FileMeta &meta, const parquet::ParquetConfig &co
     for (uint32_t rg : row_groups) {
         const auto &rgm = meta.row_groups[rg];
         const uint64_t rg_rows = static_cast<uint64_t>(std::max<int64_t>(rgm.num_rows, 0));
-        const auto &key_cc = rgm.columns[key_col];
-        const uint8_t *ci = page_index.Slice(key_cc.column_index_offset, key_cc.column_index_length);
-        const uint8_t *oi = page_index.Slice(key_cc.offset_index_offset, key_cc.offset_index_length);
-        if (!ci || !oi) {
-            kept.push_back(rg);
-            continue;
+        // A key column without a (usable) page index doesn't narrow the rows.
+        std::optional<std::vector<parquet::RowRange>> rows;
+        for (const auto &kf : key_filters) {
+            if (kf.column >= rgm.columns.size()) {
+                continue;
+            }
+            const auto &key_cc = rgm.columns[kf.column];
+            const uint8_t *ci = page_index.Slice(key_cc.column_index_offset, key_cc.column_index_length);
+            const uint8_t *oi = page_index.Slice(key_cc.offset_index_offset, key_cc.offset_index_length);
+            if (!ci || !oi) {
+                continue;
+            }
+            auto index = parquet::ParseColumnIndex(ci, static_cast<size_t>(key_cc.column_index_length));
+            auto pages = parquet::ParseOffsetIndex(oi, static_cast<size_t>(key_cc.offset_index_length));
+            if (index.is_error() || pages.is_error()) {
+                continue;
+            }
+            auto key_rows = parquet::SelectPageRows(filter, kf.values ? &*kf.values : nullptr, kf.column, meta.schema,
+                                                    pages.unwrap(), index.unwrap(), rg_rows);
+            if (!key_rows) {
+                continue;
+            }
+            rows = rows ? IntersectRows(*rows, *key_rows) : std::move(*key_rows);
+            if (rows->empty()) {
+                break;
+            }
         }
-        auto index = parquet::ParseColumnIndex(ci, static_cast<size_t>(key_cc.column_index_length));
-        auto pages = parquet::ParseOffsetIndex(oi, static_cast<size_t>(key_cc.offset_index_length));
-        if (index.is_error() || pages.is_error()) {
-            kept.push_back(rg);
-            continue;
-        }
-        auto rows = parquet::SelectPageRows(filter, dyn_values, key_col, meta.schema, pages.unwrap(), index.unwrap(),
-                                            rg_rows);
         if (!rows) {
             kept.push_back(rg);
             continue;
@@ -161,33 +196,21 @@ Result<void> RunParquetPrepare() {
     auto config = DeserializeFromBytes<parquet::ParquetConfig>(config_itm.buffer.data(), config_itm.buffer.size());
     const uint32_t num_splits = config.num_splits == 0 ? 1 : config.num_splits;
 
-    std::optional<exec::DynamicFilter> dyn_filter = std::nullopt;
-    auto dyn_filter_itms = abi::GetOptionalInputSet(SET_IDX_IN_DYNAMIC_FILTER);
-    if (config.dynamic_filter_column >= 0 && dyn_filter_itms && !dyn_filter_itms->empty()) {
-        auto &first = (*dyn_filter_itms)[0];
-        auto merged = DeserializeFromBytes<exec::DynamicFilter>(first.buffer.data(), first.buffer.size());
-        for (size_t i = 1; i < dyn_filter_itms->size(); i++) {
-            auto &itm = (*dyn_filter_itms)[i];
-            merged.Merge(DeserializeFromBytes<exec::DynamicFilter>(itm.buffer.data(), itm.buffer.size()));
+    // The prune-mode dynamic filters (all ANDed) and their file key columns. A filter that isn't
+    // bound has nothing to prune by.
+    TRY(auto all_dyn_filters, util::ReadDynamicFilters(SET_IDX_IN_DYNAMIC_FILTER));
+    std::vector<std::pair<uint32_t, const exec::DynamicFilter *>> dyn_filters;
+    for (const auto &df : config.dynamic_filters) {
+        auto it = all_dyn_filters.find(df.filter_id);
+        if (it == all_dyn_filters.end()) {
+            continue;
         }
-        if (!merged.has_bounds) {
+        if (!it->second.has_bounds) {
             // The build side has no non-NULL key at all: the inner join can't produce any row,
             // so the entire probe scan is pruned.
             return Ok();
         }
-        dyn_filter = std::move(merged);
-    }
-
-    // The merged filter goes along with every region, for pq_stage to evaluate on the key column
-    // (an index into the scan schema, i.e. the projected columns).
-    int32_t dyn_filter_scan_column = -1;
-    std::vector<uint8_t> dyn_filter_bytes;
-    if (dyn_filter) {
-        dyn_filter_scan_column = parquet::ScanColumnIndex(config.projection, config.dynamic_filter_column);
-        if (dyn_filter_scan_column >= 0) {
-            auto buf = SerializeToBuffer(*dyn_filter);
-            dyn_filter_bytes.assign(buf.data(), buf.data() + buf.size());
-        }
+        dyn_filters.emplace_back(df.file_column, &it->second);
     }
 
     TRY(auto footer_itms, abi::GetInputSet(SET_IDX_IN_FOOTER));
@@ -219,16 +242,18 @@ Result<void> RunParquetPrepare() {
 
         TRY(auto meta, parquet::ParseFooter(footer_itm.buffer.data(), footer_itm.buffer.size()));
 
-        // combine any dynamic filter with static pushed filters
+        // combine the dynamic filters with static pushed filters
         bool has_filter = config.has_pushed_filter;
         expr::ExprNode filter = config.pushed_filter;
-        std::optional<std::vector<duckdb::Value>> dyn_values;
-        if (dyn_filter && config.dynamic_filter_column >= 0) {
-            if (static_cast<size_t>(config.dynamic_filter_column) >= meta.schema.columns.size()) {
-                return Error("ParquetConfig.dynamic_filter_column exceeds metadata schema columns.", ErrorKind::OutOfRange);
+        std::vector<KeyFilter> key_filters;
+        bool has_values = false;
+        for (const auto &[key_col, dyn_filter] : dyn_filters) {
+            if (key_col >= meta.schema.columns.size()) {
+                return Error("ParquetConfig.dynamic_filters column exceeds metadata schema columns.",
+                             ErrorKind::OutOfRange);
             }
-            const auto &col_type = meta.schema.columns[config.dynamic_filter_column].type;
-            auto range = exec::BuildRangeFilter(config.dynamic_filter_column, col_type, *dyn_filter);
+            const auto &col_type = meta.schema.columns[key_col].type;
+            auto range = exec::BuildRangeFilter(key_col, col_type, *dyn_filter);
             if (range) {
                 filter = has_filter ? expr::ExprNode::Conjunction(
                              duckdb::ExpressionType::CONJUNCTION_AND, {std::move(filter), std::move(*range)}
@@ -236,20 +261,26 @@ Result<void> RunParquetPrepare() {
                 has_filter = true;
             }
             // An exact key set additionally prunes the row groups none of its keys falls into.
+            KeyFilter kf{key_col, std::nullopt};
             if (dyn_filter->has_values) {
-                dyn_values = parquet::SortStatValues(dyn_filter->values, col_type);
+                kf.values = parquet::SortStatValues(dyn_filter->values, col_type);
+                has_values = has_values || kf.values.has_value();
             }
+            key_filters.push_back(std::move(kf));
         }
 
         // filter pushdown
-        const bool prune = has_filter || dyn_values;
+        const bool prune = has_filter || has_values;
         std::vector<uint32_t> keep_row_groups;
         if (prune) {
             for (uint32_t rg = 0; rg < meta.row_groups.size(); rg++) {
                 const auto &rgm = meta.row_groups[rg];
-                if ((!has_filter || parquet::RowGroupMayMatch(filter, rgm, meta.schema)) &&
-                    (!dyn_values || parquet::RowGroupMayContainAny(rgm, meta.schema, config.dynamic_filter_column,
-                                                                   *dyn_values))) {
+                bool may_match = !has_filter || parquet::RowGroupMayMatch(filter, rgm, meta.schema);
+                for (size_t k = 0; may_match && k < key_filters.size(); k++) {
+                    const auto &kf = key_filters[k];
+                    may_match = !kf.values || parquet::RowGroupMayContainAny(rgm, meta.schema, kf.column, *kf.values);
+                }
+                if (may_match) {
                     keep_row_groups.push_back(rg);
                 }
             }
@@ -266,14 +297,14 @@ Result<void> RunParquetPrepare() {
             page_index = {footer_itm.buffer.data(), config.page_index_offsets[file_idx],
                           config.page_index_sizes[file_idx]};
         }
-        const bool use_page_index = dyn_filter && config.dynamic_filter_column >= 0 && page_index.size > 0;
+        const bool use_page_index = !key_filters.empty() && page_index.size > 0;
         if (use_page_index) {
             if (!prune) {
                 keep_row_groups.resize(meta.row_groups.size());
                 std::iota(keep_row_groups.begin(), keep_row_groups.end(), 0u);
             }
-            SelectPages(meta, config, has_filter ? &filter : nullptr, dyn_values ? &*dyn_values : nullptr,
-                        page_index, keep_row_groups, page_selection);
+            SelectPages(meta, config, has_filter ? &filter : nullptr, key_filters, page_index, keep_row_groups,
+                        page_selection);
             if (keep_row_groups.empty()) {
                 continue; // entire file pruned for this footer
             }
@@ -291,10 +322,6 @@ Result<void> RunParquetPrepare() {
         const size_t key_base = rg_offsets.empty() ? 0 : rg_offsets[file_idx];
         for (size_t r = 0; r < regions.size(); r++) {
             const size_t key = key_base + r;
-            if (dyn_filter_scan_column >= 0) {
-                regions[r].dynamic_filter_column = dyn_filter_scan_column;
-                regions[r].dynamic_filter = dyn_filter_bytes;
-            }
             abi::AddOutput("region", SET_IDX_OUT_REGION, regions[r].Serialize(), key);
             for (size_t ri = 0; ri < regions[r].requests.size(); ri++) {
                 const auto &req = regions[r].requests[ri];

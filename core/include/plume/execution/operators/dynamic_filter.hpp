@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -92,7 +93,14 @@ private:
 std::optional<expr::ExprNode> BuildRangeFilter(uint32_t column, const ColumnType &type,
                                                const DynamicFilter &filter);
 
+// The ident of the items carrying the filter with id `filter_id`.
+std::string DynamicFilterIdent(uint32_t filter_id);
+// The filter id of an item ident written by DynamicFilterIdent, nullopt for any other ident.
+Result<uint32_t> ParseDynamicFilterIdent(const std::string &ident);
+
 struct DynamicFilterBuildTemplate : OperatorTemplate {
+    // Plan-wide id of the filter, identifying its items to consumers.
+    uint32_t filter_id = 0;
     // The column over which a dynamic filter is built.
     uint32_t column = 0;
     // Type the keys are cast to before they're collected/hashed.
@@ -103,8 +111,9 @@ struct DynamicFilterBuildTemplate : OperatorTemplate {
     uint64_t bloom_bits = 0;
 
     DynamicFilterBuildTemplate() : OperatorTemplate(OpType::DYNAMIC_FILTER_BUILD) {}
-    DynamicFilterBuildTemplate(uint32_t column, ColumnType key_type, uint32_t max_values = 0, uint64_t bloom_bits = 0)
-        : OperatorTemplate(OpType::DYNAMIC_FILTER_BUILD), column(column), key_type(key_type),
+    DynamicFilterBuildTemplate(uint32_t column, ColumnType key_type, uint32_t max_values = 0, uint64_t bloom_bits = 0,
+                               uint32_t filter_id = 0)
+        : OperatorTemplate(OpType::DYNAMIC_FILTER_BUILD), filter_id(filter_id), column(column), key_type(key_type),
           max_values(max_values), bloom_bits(bloom_bits) {}
 
     bool Equals(const OperatorTemplate &other) const override;
@@ -126,9 +135,12 @@ public:
     // The collected filter. Ends the collection if Finish() wasn't called yet.
     const DynamicFilter &Filter();
 
+    uint32_t FilterId() const { return filter_id_; }
+
 private:
     void EndCollection();
 
+    uint32_t filter_id_;
     uint32_t column_;
     duckdb::LogicalType key_type_;
     std::variant<std::unique_ptr<KeyCollector>, DynamicFilter> state_;

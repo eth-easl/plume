@@ -1,6 +1,7 @@
 #include "abi_ubench.hpp"
 
 #include <map>
+#include <optional>
 
 namespace {
 
@@ -36,6 +37,17 @@ Result<std::vector<InputItem>> GetInputSet(size_t set_idx) {
                                 item.ident, item.key});
     }
     return out;
+}
+
+std::optional<std::vector<InputItem>> GetOptionalInputSet(size_t set_idx) {
+    if (t_io.inputs.find(set_idx) == t_io.inputs.end()) {
+        return std::nullopt;
+    }
+    auto items = GetInputSet(set_idx);
+    if (items.is_error()) {
+        return std::nullopt;
+    }
+    return std::make_optional(std::move(items).unwrap());
 }
 
 Result<std::vector<InputItem>> GetInputSetWithSize(size_t set_idx, size_t expected_size) {

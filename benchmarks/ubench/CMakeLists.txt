@@ -36,7 +36,8 @@ set(UBENCH_FUNCTION_SOURCES
   ${CMAKE_SOURCE_DIR}/functions/src/functions/stage.cpp
   ${CMAKE_SOURCE_DIR}/functions/src/functions/csv_stage.cpp
   ${CMAKE_SOURCE_DIR}/functions/src/functions/pq_stage.cpp
-  ${CMAKE_SOURCE_DIR}/functions/src/functions/output_split.cpp)
+  ${CMAKE_SOURCE_DIR}/functions/src/util/dynamic_filter.cpp
+  ${CMAKE_SOURCE_DIR}/functions/src/util/output_split.cpp)
 
 # An OBJECT library so every object is linked unconditionally (the fn <-> abi
 # back-references never hit archive-ordering issues).

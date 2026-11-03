@@ -1,12 +1,14 @@
 #include "plume/parser/physical_plan.hpp"
 
 #include "plume/execution/operators/aggregate.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/operators/join.hpp"
 #include "plume/execution/operators/limit.hpp"
 #include "plume/execution/operators/projection.hpp"
 #include "plume/execution/operators/sort.hpp"
 
+#include <algorithm>
 #include <sstream>
 
 namespace plume::parser {
@@ -244,6 +246,13 @@ static void PrintOperators(std::ostream &out, const exec::PipelineTemplate &pipe
             out << " ] }";
             break;
         }
+        case exec::OpType::DYNAMIC_FILTER_BUILD: {
+            const auto *d = static_cast<const exec::DynamicFilterBuildTemplate*>(op.get());
+            out << "DYNAMIC_FILTER_BUILD { filter: " << d->filter_id << ", column: "
+                << (d->column < s->columns.size() ? s->columns[d->column].name : "#" + std::to_string(d->column))
+                << ", max_values: " << d->max_values << ", bloom_bits: " << d->bloom_bits << " }";
+            break;
+        }
         default:
             out << "OP(" << static_cast<int>(op->type) << ")";
         }
@@ -327,6 +336,29 @@ static void PrintStageTree(std::ostream &out, const PhysicalPlan &plan, size_t i
         out << ")" << std::endl;
     }
 
+    // dynamic filters (the filter graph isn't part of the stage tree, so name both ends)
+    const auto &in_cols = stage.pipeline.input_schema.columns;
+    for (const auto &in : stage.dynamic_filter_inputs) {
+        out << body_ident << "dynfilter #" << in.filter_id << ": "
+            << (in.scan_column < in_cols.size() ? in_cols[in.scan_column].name : "#" + std::to_string(in.scan_column))
+            << " (file column " << in.file_column << ") <- Stage #" << in.source_stage
+            << (in.prune ? "  (prune)" : "  (probe)") << std::endl;
+    }
+    for (uint32_t f : stage.dynamic_filter_outputs) {
+        out << body_ident << "dynfilter #" << f << " -> ";
+        bool first = true;
+        for (const auto &consumer : plan.stages) {
+            for (const auto &in : consumer->dynamic_filter_inputs) {
+                if (in.filter_id == f && in.source_stage == idx) {
+                    out << (first ? "" : ", ") << "Stage #" << consumer->idx;
+                    first = false;
+                    break;
+                }
+            }
+        }
+        out << std::endl;
+    }
+
     // stage operators
     PrintOperators(out, stage.pipeline, body_ident);
 
@@ -350,6 +382,23 @@ static void PrintStageTree(std::ostream &out, const PhysicalPlan &plan, size_t i
 // Stage
 //===----------------------------------------------------------------------===//
 
+bool Stage::PrunesByDynFilter() const {
+    return std::any_of(dynamic_filter_inputs.begin(), dynamic_filter_inputs.end(),
+                       [](const DynamicFilterInput &in) { return in.prune; });
+}
+
+std::vector<uint32_t> Stage::DynFilterSourceStages(bool prune_only) const {
+    std::vector<uint32_t> out;
+    for (const auto &in : dynamic_filter_inputs) {
+        if (!prune_only || in.prune) {
+            out.push_back(in.source_stage);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 std::string Stage::ToString() const {
     std::ostringstream out;
     out << "Stage " << idx << "  ["
@@ -371,14 +420,14 @@ std::string Stage::ToString() const {
     if (IsLeaf()) {
         auto &leaf = static_cast<const LeafStage &>(*this);
         out << body << "source: " << leaf.data_source->name << std::endl;
-        if (leaf.HasDynFilter()) {
-            out << body << "dynamic filter: column " << leaf.dynamic_filter_column << " <- Stage "
-                << leaf.dynamic_filter_source_stage << (leaf.dynamic_filter_prune ? " (prune)" : " (probe)")
-                << std::endl;
-        }
     }
-    if (ProducesDynFilter()) {
-        out << body << "dynamic filter -> Stage " << dynamic_filter_consumer_stage << std::endl;
+    for (const auto &in : dynamic_filter_inputs) {
+        out << body << "dynamic filter " << in.filter_id << ": column " << in.scan_column << " (file column "
+            << in.file_column << ") <- Stage " << in.source_stage << (in.prune ? " (prune)" : " (probe)")
+            << std::endl;
+    }
+    for (uint32_t f : dynamic_filter_outputs) {
+        out << body << "emits dynamic filter " << f << std::endl;
     }
 
     PrintOperators(out, pipeline, body);

@@ -7,7 +7,6 @@
 
 #include <cstdint>
 #include <map>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -65,6 +64,9 @@ struct ConverterConfig {
     uint32_t dynamic_filter_bloom_bits_per_key = 10;
     // Upper limit on a dynamic filter's Bloom filter size.
     uint64_t dynamic_filter_max_bloom_bytes = 4 << 20;
+    // Upper limit on the length of a chain of dynamic filters, each one's build side reading the
+    // next one's filtered scan. Each level puts a build and a filtered scan on the critical path.
+    uint32_t dynamic_filter_max_chain_depth = 2;
 };
 
 // Converts a bound + optimized DuckDB logical plan into Plume PhysicalPlan.
@@ -78,31 +80,28 @@ public:
 private:
     uint32_t SplitCount(uint64_t estimated_rows) const;
 
-    // A dynamic filter from a join's build side to a probe-side scan.
-    struct PendingDynamicFilter {
-        PlanBuilder::SharedOpNode build; // the DynamicFilterBuildTemplate node
-        PlanBuilder::SharedOpNode join;  // the join whose probe side it filters
-        uint32_t probe_key;              // the key column in the join's probe input
-        LeafStage *leaf;                 // the filtered scan
-    };
+    void ProposeDynamicFilters(const PlanBuilder::SharedOpNode &left, const PlanBuilder::SharedOpNode &right,
+        exec::JoinKind kind, const std::vector<uint32_t> &left_keys, const std::vector<uint32_t> &right_keys,
+        const std::vector<bool> &keys_match_null, uint64_t left_card, uint64_t right_card);
 
-    std::optional<PendingDynamicFilter> AttachDynamicFilter(PlanBuilder::SharedOpNode &left,
-        PlanBuilder::SharedOpNode &right, exec::JoinKind kind, const std::vector<uint32_t> &left_keys,
-        const std::vector<uint32_t> &right_keys, const std::vector<bool> &keys_match_null,
-        uint64_t left_card, uint64_t right_card);
-    void DropSharedDynamicFilters(const PlanBuilder::SharedOpNode &root);
-    
+    Result<PlanBuilder::SharedOpNode> BuildProjection(duckdb::LogicalOperator &op);
+    Result<PlanBuilder::SharedOpNode> BuildFilter(duckdb::LogicalFilter &filter);
+    Result<PlanBuilder::SharedOpNode> BuildAggregate(duckdb::LogicalAggregate &agg);
+    Result<PlanBuilder::SharedOpNode> BuildLimit(duckdb::LogicalLimit &limit);
+    Result<PlanBuilder::SharedOpNode> BuildOrder(duckdb::LogicalOrder &order);
+    Result<PlanBuilder::SharedOpNode> BuildTopN(duckdb::LogicalTopN &top);
+
     Result<PlanBuilder::SharedOpNode> BuildGet(duckdb::LogicalGet &get);
     Result<PlanBuilder::SharedOpNode> BuildChunkGet(duckdb::LogicalColumnDataGet &get);
     Result<PlanBuilder::SharedOpNode> BuildEmptyResult(duckdb::LogicalEmptyResult &empty);
-    Result<PlanBuilder::SharedOpNode> BuildAggregate(duckdb::LogicalAggregate &agg, PlanBuilder::SharedOpNode child);
-    Result<PlanBuilder::SharedOpNode> BuildDistinct(PlanBuilder::SharedOpNode child, const std::vector<uint32_t> &cols, uint64_t card);
-    Result<PlanBuilder::SharedOpNode> BuildMaterializedCTE(duckdb::LogicalMaterializedCTE &cte);
+
     Result<PlanBuilder::SharedOpNode> BuildJoin(PlanBuilder::SharedOpNode left, PlanBuilder::SharedOpNode right, 
         duckdb::LogicalComparisonJoin &join, exec::JoinKind kind, uint64_t left_card, uint64_t right_card);
     Result<PlanBuilder::SharedOpNode> BuildComparisonJoin(duckdb::LogicalComparisonJoin &join);
     Result<PlanBuilder::SharedOpNode> BuildDelimJoin(duckdb::LogicalComparisonJoin &join);
     Result<PlanBuilder::SharedOpNode> BuildCrossProduct(duckdb::LogicalCrossProduct &cp);
+    
+    Result<PlanBuilder::SharedOpNode> BuildMaterializedCTE(duckdb::LogicalMaterializedCTE &cte);
 
     Result<PlanBuilder::SharedOpNode> Build(duckdb::LogicalOperator &op);
 
@@ -113,7 +112,6 @@ private:
 
     std::map<uint64_t, PlanBuilder::SharedOpNode> cte_subs_;
     std::vector<PlanBuilder::SharedOpNode> delim_stack_;
-    std::vector<PendingDynamicFilter> pending_dynamic_filters_;
     size_t num_empty_results_ = 0;
 };
 

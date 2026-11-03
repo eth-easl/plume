@@ -1,7 +1,7 @@
 // Dynamic filter tests:
 //  (1) DynamicFilterBuildTemplate survives pipeline serialize/deserialize
 //  (2) DynamicFilterBuildOperator passes every row through unchanged while collecting the
-//      key range, retrievable via Executor::FindDynamicFilterBuild() once the collection ended
+//      key range, retrievable via Executor::DynamicFilterBuilds() once the collection ended
 //  (3) DynamicFilter key-range merging
 //  (4) BuildRangeFilter produces a predicate that actually prunes as expected
 //  (5) BloomFilter: no false negatives, expected false positive rate, merge, wire format
@@ -111,8 +111,10 @@ TEST_CASE("DynamicFilterBuildTemplate: pipeline serialize/deserialize round-trip
     PipelineTemplate p;
     p.input_schema = AB();
 
-    auto dyn = std::make_shared<DynamicFilterBuildTemplate>(1, I32(), /*max_values=*/16, /*bloom_bits=*/1024);
+    auto dyn = std::make_shared<DynamicFilterBuildTemplate>(1, I32(), /*max_values=*/16, /*bloom_bits=*/1024,
+                                                            /*filter_id=*/7);
     p.operators = {dyn};
+    p.dynamic_filter_probes = {{3, 0}, {7, 1}};
 
     auto bytes = plume::SerializePipeline(p);
     auto q = plume::DeserializePipeline(bytes).unwrap();
@@ -124,10 +126,52 @@ TEST_CASE("DynamicFilterBuildTemplate: pipeline serialize/deserialize round-trip
     CHECK(t.key_type == I32());
     CHECK(t.max_values == 16);
     CHECK(t.bloom_bits == 1024);
+    CHECK(t.filter_id == 7);
     CHECK(t.Equals(*dyn));
+    CHECK(!t.Equals(DynamicFilterBuildTemplate(1, I32(), 16, 1024, /*filter_id=*/8)));
+    CHECK(q.dynamic_filter_probes.size() == 2);
+    CHECK(q.dynamic_filter_probes[0] == (exec::DynamicFilterProbeSpec{3, 0}));
+    CHECK(q.dynamic_filter_probes[1] == (exec::DynamicFilterProbeSpec{7, 1}));
 
     auto bytes2 = plume::SerializePipeline(q);
     CHECK_MSG(bytes == bytes2, "re-serialized pipeline differs");
+}
+
+TEST_CASE("DynamicFilterIdent: round-trips the filter id, rejects anything else") {
+    auto zero = exec::ParseDynamicFilterIdent(exec::DynamicFilterIdent(0));
+    CHECK(zero.is_ok() && zero.unwrap() == 0);
+    auto max = exec::ParseDynamicFilterIdent(exec::DynamicFilterIdent(4294967295u));
+    CHECK(max.is_ok() && max.unwrap() == 4294967295u);
+    CHECK(exec::ParseDynamicFilterIdent("dynamic_filter").is_error());
+    CHECK(exec::ParseDynamicFilterIdent(exec::DynamicFilterIdent(1) + "x").is_error());
+    CHECK(exec::ParseDynamicFilterIdent("dynfilter_").is_error());
+    CHECK(exec::ParseDynamicFilterIdent("dynfilter_4294967296").is_error());
+}
+
+TEST_CASE("Executor: DynamicFilterBuilds returns every build operator in pipeline order") {
+    Allocator alloc;
+    auto schema = AB();
+    auto b0 = MakeBlock(alloc, schema, {{1, 5}, {20, 10}});
+
+    PipelineTemplate desc;
+    desc.input_schema = schema;
+    desc.operators = {std::make_shared<DynamicFilterBuildTemplate>(0, I32(), 8, 0, /*filter_id=*/4),
+                      std::make_shared<DynamicFilterBuildTemplate>(1, I32(), 8, 0, /*filter_id=*/2)};
+    exec::OutputEmit emit = [](const std::string &, size_t, DataBuffer, size_t) {};
+    Executor exec(alloc);
+    exec.Build(desc, emit).unwrap();
+    exec.PushBlocks({{b0.data, b0.size}}).unwrap();
+    exec.Finish().unwrap();
+
+    auto builds = exec.DynamicFilterBuilds();
+    CHECK(builds.size() == 2);
+    CHECK(builds[0]->FilterId() == 4);
+    CHECK(builds[0]->Filter().min == Value::INTEGER(1));
+    CHECK(builds[0]->Filter().max == Value::INTEGER(5));
+    CHECK(builds[1]->FilterId() == 2);
+    CHECK(builds[1]->Filter().min == Value::INTEGER(10));
+    CHECK(builds[1]->Filter().max == Value::INTEGER(20));
+    alloc.Free(b0.data, b0.size);
 }
 
 TEST_CASE("DynamicFilterBuildOperator: passthrough + running min/max across blocks") {
@@ -156,7 +200,7 @@ TEST_CASE("DynamicFilterBuildOperator: passthrough + running min/max across bloc
     Executor exec(alloc);
     exec.Build(desc, emit).unwrap();
 
-    auto *dyn = exec.FindDynamicFilterBuild();
+    auto *dyn = exec.DynamicFilterBuilds().at(0);
     CHECK(dyn != nullptr);
 
     exec.PushBlocks({{b0.data, b0.size}}).unwrap();
@@ -202,7 +246,7 @@ TEST_CASE("DynamicFilterBuildOperator: VARCHAR min/max, including a non-inlined 
     Executor exec(alloc);
     auto out = plume_test::RunBlocks(exec, desc, {{b0.data, b0.size}}, alloc);
 
-    auto *dyn = exec.FindDynamicFilterBuild();
+    auto *dyn = exec.DynamicFilterBuilds().at(0);
     CHECK(dyn != nullptr);
     const auto &bounds = dyn->Filter();
     CHECK(bounds.has_bounds);
@@ -226,7 +270,7 @@ TEST_CASE("DynamicFilterBuildOperator: empty input yields an invalid bounds") {
     Executor exec(alloc);
     plume_test::RunBlocks(exec, desc, {}, alloc);
 
-    auto *dyn = exec.FindDynamicFilterBuild();
+    auto *dyn = exec.DynamicFilterBuilds().at(0);
     CHECK(dyn != nullptr);
     CHECK_MSG(!dyn->Filter().has_bounds, "no rows ever pushed -> bounds must stay invalid");
 }
@@ -386,7 +430,7 @@ DynamicFilter BuildFilter(Allocator &alloc, const Schema &schema, std::shared_pt
     }
     Executor exec(alloc);
     plume_test::RunBlocks(exec, desc, in, alloc);
-    return exec.FindDynamicFilterBuild()->Filter();
+    return exec.DynamicFilterBuilds().at(0)->Filter();
 }
 
 // One-column block of arbitrary Values (a NULL Value marks a NULL row).
@@ -503,7 +547,7 @@ TEST_CASE("DynamicFilterBuildOperator: no push after the filter was read") {
     Executor exec(alloc);
     exec.Build(desc, emit).unwrap();
 
-    CHECK(!exec.FindDynamicFilterBuild()->Filter().has_bounds); // e.g. a stage without input
+    CHECK(!exec.DynamicFilterBuilds().at(0)->Filter().has_bounds); // e.g. a stage without input
     CHECK(exec.PushBlocks({{b0.data, b0.size}}).is_error());
     alloc.Free(b0.data, b0.size);
 }

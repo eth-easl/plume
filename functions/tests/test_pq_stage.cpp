@@ -240,7 +240,8 @@ TEST_CASE("plume_pq_stage: emits dynamic filter bounds when the pipeline builds 
 
     PipelineTemplate desc;
     desc.input_schema.columns = {{"amount", I32(), false}};
-    desc.operators = {std::make_shared<DynamicFilterBuildTemplate>(/*column=*/0, I32())};
+    desc.operators = {std::make_shared<DynamicFilterBuildTemplate>(/*column=*/0, I32(), 0, 0, /*filter_id=*/3),
+                      std::make_shared<DynamicFilterBuildTemplate>(/*column=*/0, I32(), 8, 0, /*filter_id=*/1)};
     auto blob = plume::SerializePipeline(desc);
 
     mock::SetInput(0, [&] {
@@ -257,13 +258,19 @@ TEST_CASE("plume_pq_stage: emits dynamic filter bounds when the pipeline builds 
 
     CHECK(fn::RunParquetStage().is_ok());
 
+    // One item per build operator, identified by its filter id.
     auto dyn_outs = mock::OutputsForSet(1);
-    CHECK(dyn_outs.size() == 1);
+    CHECK(dyn_outs.size() == 2);
+    CHECK(dyn_outs[0]->ident == exec::DynamicFilterIdent(3));
+    CHECK(dyn_outs[1]->ident == exec::DynamicFilterIdent(1));
     auto bounds =
         DeserializeFromBytes<DynamicFilter>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
     CHECK(bounds.has_bounds);
     CHECK(bounds.min == duckdb::Value::INTEGER(-3));
     CHECK(bounds.max == duckdb::Value::INTEGER(70));
+    auto exact = DeserializeFromBytes<DynamicFilter>(dyn_outs[1]->buffer.data(), dyn_outs[1]->buffer.size());
+    CHECK(exact.has_values);
+    CHECK(exact.values.size() == 3);
 }
 
 TEST_CASE("plume_pq_stage: emits invalid dynamic filter bounds without any region") {
@@ -293,15 +300,19 @@ TEST_CASE("plume_pq_stage: emits invalid dynamic filter bounds without any regio
 
 namespace {
 
-// Runs pq_stage over one row group of (id, amount) INT32 columns, with the given pipeline
-// operators and the dynamic filter attached to the region on column `dyn_col`; returns the rows.
-// With `build_filters`, the region only names the column and the filters arrive per build
-// instance on input set 3 instead (no pq_prepare in between).
-// Runs pq_stage over one row group of the (id, amount) INT32 column chunks.
-std::vector<std::pair<int32_t, int32_t>> RunChunksStage(const std::vector<uint8_t> &id_chunk,
+// A dynamic filter input of pq_stage: the pipeline probes column `column` (if set) with filter
+// `id`, whose build instances arrive on input set 3.
+struct FilterInput {
+    uint32_t id;
+    std::optional<uint32_t> column;
+    std::vector<DynamicFilter> instances;
+};
+
+// Runs pq_stage over one row group of the (id, amount) INT32 column chunks, with the given
+// pipeline operators and dynamic filter inputs; returns the rows.
+std::vector<std::pair<int32_t, int32_t>> RunChunksStageWith(const std::vector<uint8_t> &id_chunk,
         const std::vector<uint8_t> &amt_chunk, std::vector<std::shared_ptr<OperatorTemplate>> operators,
-        const DynamicFilter *dyn_filter, int32_t dyn_col = 0,
-        const std::optional<std::vector<DynamicFilter>> &build_filters = std::nullopt) {
+        const std::vector<FilterInput> &filters) {
     mock::Reset();
 
     parquet::Region region;
@@ -318,18 +329,15 @@ std::vector<std::pair<int32_t, int32_t>> RunChunksStage(const std::vector<uint8_
     region.row_groups.push_back({dc0, dc1});
     region.requests.push_back({0, dc0.size});
     region.requests.push_back({0, dc1.size});
-    if (dyn_filter) {
-        auto buf = SerializeToBuffer(*dyn_filter);
-        region.dynamic_filter_column = dyn_col;
-        region.dynamic_filter.assign(buf.data(), buf.data() + buf.size());
-    }
-    if (build_filters) {
-        region.dynamic_filter_column = dyn_col;
-    }
 
     PipelineTemplate desc;
     desc.input_schema.columns = {{"id", I32(), false}, {"amount", I32(), false}};
     desc.operators = std::move(operators);
+    for (const auto &f : filters) {
+        if (f.column) {
+            desc.dynamic_filter_probes.push_back({f.id, *f.column});
+        }
+    }
     auto blob = plume::SerializePipeline(desc);
 
     mock::SetInput(0, [&] {
@@ -344,9 +352,9 @@ std::vector<std::pair<int32_t, int32_t>> RunChunksStage(const std::vector<uint8_
     }());
     mock::AddInput(2, mock::MakeBuffer(id_chunk.data(), id_chunk.size()), "0", 0);
     mock::AddInput(2, mock::MakeBuffer(amt_chunk.data(), amt_chunk.size()), "1", 0);
-    if (build_filters) {
-        for (const auto &f : *build_filters) {
-            mock::AddInput(3, SerializeToBuffer(f), "dynamic_filter", 0);
+    for (const auto &f : filters) {
+        for (const auto &instance : f.instances) {
+            mock::AddInput(3, SerializeToBuffer(instance), exec::DynamicFilterIdent(f.id), 0);
         }
     }
     CHECK(fn::RunParquetStage().is_ok());
@@ -365,9 +373,24 @@ std::vector<std::pair<int32_t, int32_t>> RunChunksStage(const std::vector<uint8_
     return rows;
 }
 
+// Like RunChunksStageWith, with `dyn_filter` (if given) as the only build instance of filter 0 on
+// column `dyn_col`, or the build instances `build_filters` of it.
+std::vector<std::pair<int32_t, int32_t>> RunChunksStage(const std::vector<uint8_t> &id_chunk,
+        const std::vector<uint8_t> &amt_chunk, std::vector<std::shared_ptr<OperatorTemplate>> operators,
+        const DynamicFilter *dyn_filter, uint32_t dyn_col = 0,
+        const std::optional<std::vector<DynamicFilter>> &build_filters = std::nullopt) {
+    std::vector<FilterInput> filters;
+    if (dyn_filter) {
+        filters.push_back({0, dyn_col, {*dyn_filter}});
+    } else if (build_filters) {
+        filters.push_back({0, dyn_col, *build_filters});
+    }
+    return RunChunksStageWith(id_chunk, amt_chunk, std::move(operators), filters);
+}
+
 std::vector<std::pair<int32_t, int32_t>> RunIdAmountStage(const std::vector<int32_t> &ids,
         const std::vector<int32_t> &amounts, std::vector<std::shared_ptr<OperatorTemplate>> operators,
-        const DynamicFilter *dyn_filter, int32_t dyn_col = 0,
+        const DynamicFilter *dyn_filter, uint32_t dyn_col = 0,
         const std::optional<std::vector<DynamicFilter>> &build_filters = std::nullopt) {
     return RunChunksStage(PlainInt32Chunk(ids), PlainInt32Chunk(amounts), std::move(operators), dyn_filter, dyn_col,
                           build_filters);
@@ -517,14 +540,13 @@ Rows RunPagedStage(const std::vector<std::vector<int32_t>> &id_pages, const std:
                                  column(1, 1, amt_pages, amt_offsets, amt_runs)});
     region.requests.push_back({0, int64_t(id_chunk.size())});
     region.requests.push_back({0, int64_t(amt_chunk.size())});
-    if (dyn_filter) {
-        auto buf = SerializeToBuffer(*dyn_filter);
-        region.dynamic_filter_column = 0;
-        region.dynamic_filter.assign(buf.data(), buf.data() + buf.size());
-    }
 
     PipelineTemplate desc;
     desc.input_schema.columns = {{"id", I32(), false}, {"amount", I32(), false}};
+    if (dyn_filter) {
+        desc.dynamic_filter_probes.push_back({0, 0});
+        mock::AddInput(3, SerializeToBuffer(*dyn_filter), exec::DynamicFilterIdent(0), 0);
+    }
     auto blob = plume::SerializePipeline(desc);
     mock::AddInput(0, mock::MakeBuffer(blob.data(), blob.size()), "template", 0);
     mock::AddInput(1, region.Serialize(), "region", 0);
@@ -589,8 +611,69 @@ TEST_CASE("plume_pq_stage: merges the build instances' dynamic filters from inpu
     empty.has_values = true;
     CHECK(RunIdAmountStage(ids, amounts, {}, nullptr, 0, std::vector<DynamicFilter>{empty, empty}).empty());
 
-    // The region names a column but no filter arrives -> everything.
+    // The pipeline names a filter but none arrives -> everything.
     CHECK(RunIdAmountStage(ids, amounts, {}, nullptr, 0, std::vector<DynamicFilter>{}).size() == ids.size());
+}
+
+TEST_CASE("plume_pq_stage: several dynamic filters on different columns are ANDed") {
+    const std::vector<int32_t> ids = {1, 2, 3, 4, 5, 6};
+    const std::vector<int32_t> amounts = {10, 20, 30, 40, 50, 60};
+    auto ids_chunk = PlainInt32Chunk(ids);
+    auto amounts_chunk = PlainInt32Chunk(amounts);
+
+    // id in {2, 3, 5} and amount in {30, 50, 60}.
+    std::vector<FilterInput> filters = {{4, 0u, {ExactInts({2, 3}), ExactInts({5})}},
+                                        {1, 1u, {ExactInts({30, 50, 60})}}};
+    CHECK(RunChunksStageWith(ids_chunk, amounts_chunk, {}, filters) == Rows({{3, 30}, {5, 50}}));
+
+    // Two filters on the same column.
+    filters = {{4, 0u, {ExactInts({2, 3, 5})}}, {1, 0u, {ExactInts({3, 4, 5})}}};
+    CHECK(RunChunksStageWith(ids_chunk, amounts_chunk, {}, filters) == Rows({{3, 30}, {5, 50}}));
+
+    // One filter on two columns (a tap feeding two probes): id in {30, 2} and amount in {30, 2}.
+    std::vector<FilterInput> twice = {{2, 0u, {ExactInts({30, 2})}}, {2, 1u, {}}};
+    CHECK(RunChunksStageWith(ids_chunk, amounts_chunk, {}, twice).empty());
+
+    // A bound filter the pipeline doesn't probe is ignored.
+    filters = {{4, 0u, {ExactInts({2, 3, 5})}}, {9, std::nullopt, {ExactInts({100})}}};
+    CHECK(RunChunksStageWith(ids_chunk, amounts_chunk, {}, filters) == Rows({{2, 20}, {3, 30}, {5, 50}}));
+
+    // Any empty filter: no rows at all.
+    DynamicFilter empty;
+    empty.has_values = true;
+    filters = {{4, 0u, {ExactInts({2, 3, 5})}}, {1, 1u, {empty}}};
+    CHECK(RunChunksStageWith(ids_chunk, amounts_chunk, {}, filters).empty());
+
+    // Scan filter (amount > 25) together with both.
+    auto scan_filter = std::make_shared<FilterTemplate>();
+    scan_filter->filter = expr::ExprNode::Comparison(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                                     expr::ExprNode::Reference(1, I32()),
+                                                     expr::ExprNode::Constant(duckdb::Value::INTEGER(25), I32()));
+    filters = {{4, 0u, {ExactInts({2, 3, 5, 6})}}, {1, 1u, {ExactInts({20, 30, 60})}}};
+    CHECK(RunChunksStageWith(ids_chunk, amounts_chunk, {scan_filter}, filters) == Rows({{3, 30}, {6, 60}}));
+}
+
+TEST_CASE("plume_pq_stage: a dynamic filter item with an unexpected ident is an error") {
+    mock::Reset();
+    PipelineTemplate desc;
+    desc.input_schema.columns = {{"id", I32(), false}};
+    desc.dynamic_filter_probes.push_back({0, 0});
+    auto blob = plume::SerializePipeline(desc);
+    auto chunk = PlainInt32Chunk({1});
+    parquet::Region region;
+    parquet::DataChunk dc;
+    dc.row_group_idx = 0;
+    dc.column_idx = 0;
+    dc.size = int64_t(chunk.size());
+    dc.req_idx = 0;
+    dc.req_offset = 0;
+    region.row_groups.push_back({dc});
+    region.requests.push_back({0, dc.size});
+    mock::AddInput(0, mock::MakeBuffer(blob.data(), blob.size()), "template", 0);
+    mock::AddInput(1, region.Serialize(), "region", 0);
+    mock::AddInput(2, mock::MakeBuffer(chunk.data(), chunk.size()), "0", 0);
+    mock::AddInput(3, SerializeToBuffer(ExactInts({1})), "dynamic_filter", 0);
+    CHECK(fn::RunParquetStage().is_error());
 }
 
 TEST_CASE("ColumnChunkReader matches DecodeColumnChunk (fixed-width, boundaries)") {

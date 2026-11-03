@@ -1,11 +1,10 @@
 #include "plume/functions/stage.hpp"
 
 #include "plume/abi/abi.hpp"
-#include "plume/common/serial.hpp"
 #include "plume/execution/executor.hpp"
-#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/pipeline.hpp"
-#include "plume/functions/output_split.hpp"
+#include "plume/util/dynamic_filter.hpp"
+#include "plume/util/output_split.hpp"
 #include "plume/memory/allocator.hpp"
 
 #include <cstdint>
@@ -20,8 +19,7 @@
 #define SET_IDX_IN_DATA_CHUNKS_RIGHT 2
 
 // The first output set (index 0) contains the normal row output.
-// The second output set (index 1) optionally contains a single serialized DynamicFilter item,
-// emitted only if the pipeline contains a DynamicFilterBuildTemplate operator.
+// The second output set (index 1) contains the dynamic filters each as a single item.
 #define SET_IDX_OUT_DYNAMIC_FILTER 1
 
 namespace plume::fn {
@@ -37,7 +35,7 @@ Result<void> RunStage() {
     exec::Executor executor(alloc);
     {
         PLUME_TRACE_STAGE(trace::Phase::SETUP);
-        TRYV(executor.Build(desc, MakeSink(desc.output_sink, abi::AddOutput)));
+        TRYV(executor.Build(desc, util::MakeSink(desc.output_sink, abi::AddOutput)));
     }
 
     TRY(auto inputs, abi::GetInputSet(SET_IDX_IN_DATA_CHUNKS));
@@ -61,9 +59,7 @@ Result<void> RunStage() {
     TRYV(executor.PushBlocks(in_blocks));
     TRYV(executor.Finish());
 
-    if (auto *dyn_filter = executor.FindDynamicFilterBuild()) {
-        abi::AddOutput("dynamic_filter", SET_IDX_OUT_DYNAMIC_FILTER, SerializeToBuffer(dyn_filter->Filter()));
-    }
+    util::EmitDynamicFilters(executor, SET_IDX_OUT_DYNAMIC_FILTER);
 
 #if defined(PLUME_VERBOSE) && PLUME_VERBOSE >= 1
     alloc.PrintStats();

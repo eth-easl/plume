@@ -9,7 +9,7 @@
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/expression/expression.hpp"
-#include "plume/functions/output_split.hpp"
+#include "split_output.hpp"
 #include "plume/functions/stage.hpp"
 #include "plume/memory/adapter.hpp"
 #include "plume/memory/allocator.hpp"
@@ -138,7 +138,7 @@ struct SplitStats {
     std::map<uint32_t, uint32_t> blocks_per_key;
 };
 
-SplitStats Inspect(const std::vector<fn::SplitBlock> &parts) {
+SplitStats Inspect(const std::vector<plume_test::SplitBlock> &parts) {
     SplitStats s;
     for (auto &sb : parts) {
         s.blocks_per_key[sb.key]++;
@@ -164,14 +164,14 @@ TEST_CASE("SplitOutput: coalesces a partition into one ~target block") {
     ChunkList chunks = MakeChunks(alloc, kRows, 7);
 
     // Large cap: the whole partition coalesces into ONE multi-chunk block.
-    auto big = fn::SplitOutput(split, RegionAmount(), chunks, 1u << 20).unwrap();
+    auto big = plume_test::SplitOutput(split, RegionAmount(), chunks, 1u << 20).unwrap();
     auto bs = Inspect(big);
     CHECK(bs.total_rows == kRows);
     CHECK(bs.blocks_per_key.size() == 1);            // a single partition received rows
     CHECK(bs.blocks_per_key.begin()->second == 1);   // coalesced into one block
 
     // Tiny cap: the same rows spill across several blocks (still all data).
-    auto small = fn::SplitOutput(split, RegionAmount(), chunks, 4096).unwrap();
+    auto small = plume_test::SplitOutput(split, RegionAmount(), chunks, 4096).unwrap();
     auto ss = Inspect(small);
     CHECK(ss.total_rows == kRows);
     CHECK(ss.blocks_per_key.begin()->second > 1);    // flushed at the byte cap
@@ -214,7 +214,7 @@ TEST_CASE("SplitOutput: hash round-trip preserves rows and routes by key") {
         chunks.push_back(std::move(c));
     }
 
-    auto parts = fn::SplitOutput(split, RegionAmount(), chunks, 1u << 20).unwrap();
+    auto parts = plume_test::SplitOutput(split, RegionAmount(), chunks, 1u << 20).unwrap();
     std::multiset<std::pair<int32_t, int32_t>> got;
     for (auto &sb : parts) {
         Schema schema;
@@ -241,7 +241,7 @@ TEST_CASE("SplitOutput: coalesced blocks respect the byte cap") {
     ChunkList chunks = MakeChunks(alloc, kRows, 7);
 
     const size_t cap = 8192;
-    auto parts = fn::SplitOutput(split, RegionAmount(), chunks, cap).unwrap();
+    auto parts = plume_test::SplitOutput(split, RegionAmount(), chunks, cap).unwrap();
     CHECK(parts.size() > 1); // spilled across many blocks, not one giant block
 
     // Flushing is chunk-granular (a whole input chunk is the smallest unit that gets
@@ -292,7 +292,7 @@ TEST_CASE("SplitOutput: varchar heap gather round-trips") {
         chunks.push_back(std::move(c));
     }
 
-    auto parts = fn::SplitOutput(split, schema, chunks, 1u << 20).unwrap();
+    auto parts = plume_test::SplitOutput(split, schema, chunks, 1u << 20).unwrap();
     std::multiset<std::pair<int32_t, std::string>> got;
     for (auto &sb : parts) {
         Schema out_schema;
