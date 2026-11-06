@@ -7,18 +7,6 @@
 
 namespace plume::parquet {
 
-void DynamicFilterColumn::Serialize(duckdb::Serializer &s) const {
-    s.WriteProperty(100, "filter_id", filter_id);
-    s.WriteProperty(101, "file_column", file_column);
-}
-
-DynamicFilterColumn DynamicFilterColumn::Deserialize(duckdb::Deserializer &d) {
-    DynamicFilterColumn c;
-    c.filter_id = d.ReadProperty<uint32_t>(100, "filter_id");
-    c.file_column = d.ReadProperty<uint32_t>(101, "file_column");
-    return c;
-}
-
 void ParquetConfig::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(100, "num_splits", num_splits);
     s.WriteProperty(101, "coalesce_distance", coalesce_distance);
@@ -34,7 +22,7 @@ void ParquetConfig::Serialize(duckdb::Serializer &s) const {
     s.WriteList(108, "page_index_sizes", page_index_sizes.size(),
                 [&](duckdb::Serializer::List &list, duckdb::idx_t i) { list.WriteElement(page_index_sizes[i]); });
     s.WritePropertyWithDefault(109, "dynamic_filters",
-        duckdb::vector<DynamicFilterColumn>(dynamic_filters.begin(), dynamic_filters.end()));
+        duckdb::vector<exec::DynamicFilterProbeSpec>(dynamic_filters.begin(), dynamic_filters.end()));
 }
 
 ParquetConfig ParquetConfig::Deserialize(duckdb::Deserializer &d) {
@@ -56,7 +44,7 @@ ParquetConfig ParquetConfig::Deserialize(duckdb::Deserializer &d) {
     d.ReadList(108, "page_index_sizes", [&](duckdb::Deserializer::List &list, duckdb::idx_t /*i*/) {
         c.page_index_sizes.push_back(list.ReadElement<uint64_t>());
     });
-    auto dyn_filters = d.ReadPropertyWithDefault<duckdb::vector<DynamicFilterColumn>>(109, "dynamic_filters");
+    auto dyn_filters = d.ReadPropertyWithDefault<duckdb::vector<exec::DynamicFilterProbeSpec>>(109, "dynamic_filters");
     c.dynamic_filters.assign(dyn_filters.begin(), dyn_filters.end());
     return c;
 }

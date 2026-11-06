@@ -1,6 +1,7 @@
 #pragma once
 
 #include "plume/common/buffer.hpp"
+#include "plume/execution/pipeline.hpp"
 #include "plume/expression/expression.hpp"
 
 #include <cstdint>
@@ -12,14 +13,6 @@ class Deserializer;
 } // namespace duckdb
 
 namespace plume::parquet {
-
-struct DynamicFilterColumn {
-    uint32_t filter_id = 0;
-    uint32_t file_column = 0;
-
-    void Serialize(duckdb::Serializer &s) const;
-    static DynamicFilterColumn Deserialize(duckdb::Deserializer &d);
-};
 
 // Parquet reading configuration. The information used by pq_prepare.
 struct ParquetConfig {
@@ -34,8 +27,8 @@ struct ParquetConfig {
     bool has_pushed_filter = false;
     expr::ExprNode pushed_filter;
 
-    // The prune-mode dynamic filters (input set 3), all ANDed. Empty -> none.
-    std::vector<DynamicFilterColumn> dynamic_filters;
+    // The prune-mode dynamic filters.
+    std::vector<exec::DynamicFilterProbeSpec> dynamic_filters;
 
     // Per-file prefix sums of the source's row group counts (one entry per file, indexed by the
     // footer item's key). Empty -> single-file source.

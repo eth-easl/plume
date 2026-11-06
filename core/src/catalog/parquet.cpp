@@ -314,7 +314,7 @@ std::shared_ptr<DataSource> CreateRemoteParquetSource(std::string name, std::vec
 
 ParquetPrepareInputs BuildParquetPrepareInputs(const RemoteParquetDataSource &src,
         std::vector<uint32_t> projection, const ExprNode *pushed_filter,
-        std::vector<parquet::DynamicFilterColumn> dyn_filters, uint32_t num_splits, uint64_t coalesce_distance, uint64_t max_region_bytes) {
+        std::vector<exec::DynamicFilterProbeSpec> dyn_filters, uint32_t num_splits, uint64_t coalesce_distance, uint64_t max_region_bytes) {
     const bool has_dyn_filters = !dyn_filters.empty();
     
     parquet::ParquetConfig cfg;

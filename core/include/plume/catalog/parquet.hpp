@@ -35,7 +35,7 @@ struct ParquetPrepareInputs {
 
 ParquetPrepareInputs BuildParquetPrepareInputs(const RemoteParquetDataSource &src,
     std::vector<uint32_t> projection, const ExprNode *pushed_filter,
-    std::vector<parquet::DynamicFilterColumn> dyn_filters = {}, uint32_t num_splits = 1, uint64_t coalesce_distance = 1 << 10, uint64_t max_region_bytes = 0);
+    std::vector<exec::DynamicFilterProbeSpec> dyn_filters = {}, uint32_t num_splits = 1, uint64_t coalesce_distance = 1 << 10, uint64_t max_region_bytes = 0);
 
 struct ParquetStageInputs {
     dandelion::DataItemVec region_info;

@@ -75,20 +75,116 @@ uint64_t StreamOffset(const RowRanges &covered, uint64_t row) {
     return offset;
 }
 
-std::vector<uint32_t> RemainingColumns(uint32_t num_cols, const std::vector<uint8_t> &col_is_filter) {
-    std::vector<uint32_t> rest;
-    for (uint32_t c = 0; c < num_cols; c++) {
-        if (col_is_filter[c] == 0) {
-            rest.push_back(c);
-        }
-    }
-    return rest;
-}
-
 // A dynamic filter evaluated on a scan column.
-struct ColumnProbe {
+struct DynamicFilterColProbe {
     uint32_t column;
     std::unique_ptr<exec::DynamicFilterProbe> probe;
+};
+
+// Tracks and applies a scan_filter and active dyanmic filters while decoding.
+// Columns are divided into those decoded before (early) and after (late) evaluating the active 
+// filters. Dynamic filters may disable themselves when they rarely reject anything.
+class LateMaterializer {
+public:
+    LateMaterializer(uint32_t num_cols, exec::FilterOperator *scan_filter, std::vector<DynamicFilterColProbe> df_probes)
+        : num_cols_(num_cols), scan_filter_(scan_filter), df_probes_(std::move(df_probes)) {
+        if (scan_filter_) {
+            const auto cols = scan_filter_->FilterColumns();
+            const bool in_bounds =
+                std::all_of(cols.begin(), cols.end(), [&](uint32_t c) { return c < num_cols_; });
+            if (!in_bounds || cols.empty()) {
+                // Predicate references something outside the scan schema -> decode fully.
+                scan_filter_ = nullptr;
+            }
+        }
+        Recompute();
+    }
+
+    // Recomputes the column split if a probe disabled itself since the last call.
+    void Refresh() {
+        for (size_t p = 0; p < df_probes_.size(); p++) {
+            if (active_probes_[p] && !df_probes_[p].probe->Active()) {
+                Recompute();
+                return;
+            }
+        }
+    }
+
+    bool Active() const { return scan_filter_ != nullptr || num_active_probes_ > 0; }
+
+    const std::vector<uint32_t> &EarlyColumns() const { return early_cols_; }
+    const std::vector<uint32_t> &LateColumns() const { return late_cols_; }
+
+    std::vector<DynamicFilterColProbe> &Probes() { return df_probes_; }
+
+    // Evaluates the scan filter and the active probes on the `n` rows of `chunk`, of which (only)
+    // the early columns must be decoded. Writes the surviving rows to `sel` and returns their count.
+    duckdb::idx_t Select(DataChunk &chunk, idx_t n, duckdb::SelectionVector &sel) {
+        idx_t count = n;
+        if (scan_filter_) {
+            count = scan_filter_->Select(chunk, sel);
+        } else {
+            for (idx_t j = 0; j < n; j++) {
+                sel.set_index(j, j);
+            }
+        }
+        for (size_t p = 0; p < df_probes_.size() && count > 0; p++) {
+            if (active_probes_[p]) {
+                count = df_probes_[p].probe->Select(chunk.data[df_probes_[p].column], n, sel, count);
+            }
+        }
+        return count;
+    }
+
+    // The mask over the `n` rows marking the `count` survivors in `sel`. Valid until the next call.
+    const uint8_t *SurvivorMask(const duckdb::SelectionVector &sel, idx_t count, idx_t n) {
+        keep_.assign(n, 0);
+        for (idx_t j = 0; j < count; j++) {
+            keep_[sel.get_index(j)] = 1;
+        }
+        return keep_.data();
+    }
+
+private:
+    void Recompute() {
+        std::vector<uint8_t> is_early(num_cols_, 0);
+        early_cols_.clear();
+        late_cols_.clear();
+        auto add_early = [&](uint32_t c) {
+            if (is_early[c] == 0) {
+                is_early[c] = 1;
+                early_cols_.push_back(c);
+            }
+        };
+        if (scan_filter_) {
+            for (auto c : scan_filter_->FilterColumns()) {
+                add_early(c);
+            }
+        }
+        active_probes_.assign(df_probes_.size(), 0);
+        num_active_probes_ = 0;
+        for (size_t p = 0; p < df_probes_.size(); p++) {
+            if (df_probes_[p].probe->Active()) {
+                active_probes_[p] = 1;
+                num_active_probes_++;
+                add_early(df_probes_[p].column);
+            }
+        }
+        for (uint32_t c = 0; c < num_cols_; c++) {
+            if (is_early[c] == 0) {
+                late_cols_.push_back(c);
+            }
+        }
+    }
+
+    uint32_t num_cols_;
+    exec::FilterOperator *scan_filter_;
+    std::vector<DynamicFilterColProbe> df_probes_;
+
+    std::vector<uint8_t> active_probes_; // the probes the column split was computed for
+    size_t num_active_probes_ = 0;
+    std::vector<uint32_t> early_cols_, late_cols_;
+    std::vector<uint8_t> keep_;
 };
 
 } // namespace
@@ -120,87 +216,33 @@ Result<void> RunParquetStage() {
     }
 
     const Schema &schema = desc.input_schema;
+    const auto schema_ncol = static_cast<uint32_t>(schema.size());
     duckdb::vector<LogicalType> types;
-    types.reserve(schema.size());
+    types.reserve(schema_ncol);
     for (auto &c : schema.columns) {
         types.push_back(ToLogicalType(c.type));
     }
 
-    const auto num_cols = static_cast<uint32_t>(schema.size());
+    for (const auto &spec : desc.dynamic_filter_probes) {
+        if (spec.column >= schema_ncol) {
+            return Error("Dynamic filter probe column exceeds the scan schema.", ErrorKind::OutOfRange);
+        }
+    }
+    TRY(auto dyn_filters, util::BindDynamicFilters(SET_IDX_IN_DYNAMIC_FILTER, desc.dynamic_filter_probes));
+    if (!dyn_filters) {
+        // An empty build side: nothing of the scan is needed.
+        util::EmitDynamicFilters(executor, SET_IDX_OUT_DYNAMIC_FILTER);
+        return Ok();
+    }
+    std::vector<DynamicFilterColProbe> probes;
+    for (auto &[column, filter] : *dyn_filters) {
+        TRY(auto probe, exec::DynamicFilterProbe::Create(std::move(filter), types[column]));
+        if (probe) {
+            probes.push_back({column, std::move(probe)});
+        }
+    }
     TRY(exec::FilterOperator *scan_filter, executor.TakeLeadingScanFilter());
-    std::vector<uint32_t> filter_cols;
-    std::vector<uint8_t> col_is_filter(schema.size(), 0);
-    if (scan_filter) {
-        filter_cols = scan_filter->FilterColumns();
-        bool in_bounds = true;
-        for (auto c : filter_cols) {
-            if (c < col_is_filter.size()) {
-                col_is_filter[c] = 1;
-            } else {
-                in_bounds = false;
-            }
-        }
-        if (!in_bounds || filter_cols.empty()) {
-            // Predicate references something outside the scan schema -> decode fully.
-            scan_filter = nullptr;
-            filter_cols.clear();
-            col_is_filter.assign(schema.size(), 0);
-        }
-    }
-    std::vector<uint32_t> rest_cols = RemainingColumns(num_cols, col_is_filter);
-
-    // One probe per dynamic filter (and column) the pipeline names. A filter that isn't bound has
-    // nothing to apply.
-    std::vector<ColumnProbe> probes;
-    {
-        TRY(auto dyn_filters, util::ReadDynamicFilters(SET_IDX_IN_DYNAMIC_FILTER));
-        for (const auto &spec : desc.dynamic_filter_probes) {
-            if (spec.column >= num_cols) {
-                return Error("Dynamic filter probe column exceeds the scan schema.", ErrorKind::OutOfRange);
-            }
-            auto it = dyn_filters.find(spec.filter_id);
-            if (it == dyn_filters.end()) {
-                continue;
-            }
-            if (!it->second.has_bounds) {
-                // The build side has no non-NULL key at all: the inner join can't produce any
-                // row, so nothing of the scan is needed.
-                util::EmitDynamicFilters(executor, SET_IDX_OUT_DYNAMIC_FILTER);
-                return Ok();
-            }
-            TRY(auto probe, exec::DynamicFilterProbe::Create(it->second, types[spec.column]));
-            if (probe) {
-                probes.push_back({spec.column, std::move(probe)});
-            }
-        }
-    }
-    // The columns decoded before (early) and after (late) evaluating the scan filter and the
-    // active probes, recomputed whenever a probe disables itself.
-    std::vector<uint32_t> probe_early_cols, probe_rest_cols;
-    std::vector<uint8_t> active_probes; // the probes the columns were computed for
-    bool probe_cols_computed = false;
-    auto update_probe_cols = [&]() {
-        std::vector<uint8_t> active(probes.size());
-        for (size_t p = 0; p < probes.size(); p++) {
-            active[p] = probes[p].probe->Active() ? 1 : 0;
-        }
-        if (probe_cols_computed && active == active_probes) {
-            return;
-        }
-        probe_cols_computed = true;
-        active_probes = std::move(active);
-        std::vector<uint8_t> is_early = col_is_filter;
-        probe_early_cols = filter_cols;
-        for (size_t p = 0; p < probes.size(); p++) {
-            const uint32_t c = probes[p].column;
-            if (active_probes[p] && is_early[c] == 0) {
-                is_early[c] = 1;
-                probe_early_cols.push_back(c);
-            }
-        }
-        probe_rest_cols = RemainingColumns(num_cols, is_early);
-    };
-    std::vector<uint8_t> keep; // reused per window (survivor mask for late materialization)
+    LateMaterializer late_mat(schema_ncol, scan_filter, std::move(probes));
 
     for (auto &region_itm : region_itms) {
         const size_t region_key = region_itm.key;
@@ -208,13 +250,12 @@ Result<void> RunParquetStage() {
 
         for (auto &rg : region.row_groups) {
             const size_t ncol = rg.size();
-            if (ncol != schema.size()) {
+            if (ncol != schema_ncol) {
                 return Error("Region row group's column count does not match the scan schema.",
                              ErrorKind::InvalidInput);
             }
 
-            // A column chunk read only in part (DataChunk::pages) is assembled from its dictionary
-            // page and page runs; it holds just the rows of its runs.
+            // collect base pointers and sizes
             std::vector<const uint8_t *> bases(ncol);
             std::vector<size_t> sizes(ncol);
             std::vector<std::vector<uint8_t>> assembled(ncol);
@@ -249,6 +290,7 @@ Result<void> RunParquetStage() {
                 sizes[c] = buf.size();
             }
 
+            // column readers
             std::vector<parquet::ColumnChunkReader> readers;
             size_t num_rows = 0;
             TRYV(TryCatch([&] {
@@ -260,7 +302,7 @@ Result<void> RunParquetStage() {
                 }
             }));
 
-            // The rows to read: those every column holds.
+            // row ranges to read
             RowRanges target = {{0, num_rows}};
             if (partial) {
                 std::optional<RowRanges> common;
@@ -280,10 +322,9 @@ Result<void> RunParquetStage() {
                 }
             }
 
-            // A fully dictionary-encoded key column chunk holds no other values than its
-            // dictionary: check the dictionary once instead of every row.
+            // apply pushed filter probes
             bool rg_rejected = false;
-            for (auto &[probe_col, probe] : probes) {
+            for (auto &[probe_col, probe] : late_mat.Probes()) {
                 const duckdb::Vector *dict = nullptr;
                 if (probe->Active() && !rg_rejected) {
                     TRYV(TryCatch([&, col = probe_col] { dict = readers[col].Dictionary(types[col]); }));
@@ -297,6 +338,7 @@ Result<void> RunParquetStage() {
                 continue;
             }
 
+            // decode remaining data
             std::vector<uint64_t> stream_pos(ncol, 0); // rows of each column chunk consumed
             for (auto [range_begin, range_end] : target) {
                 if (partial) {
@@ -317,18 +359,10 @@ Result<void> RunParquetStage() {
                     auto chunk = std::make_unique<DataChunk>();
                     chunk->Initialize(alloc.Get(), types);
 
-                    const bool use_filter = scan_filter != nullptr;
-                    const bool use_probe = std::any_of(probes.begin(), probes.end(),
-                                                       [](const ColumnProbe &p) { return p.probe->Active(); });
-                    if (use_probe) {
-                        update_probe_cols();
-                    }
-                    const auto &early_cols = use_probe ? probe_early_cols : filter_cols;
-                    const auto &late_cols = use_probe ? probe_rest_cols : rest_cols;
-
+                    late_mat.Refresh();
                     bool emit = true;
                     TRYV(TryCatch([&] {
-                        if (!use_filter && !use_probe) {
+                        if (!late_mat.Active()) {
                             for (size_t c = 0; c < ncol; c++) {
                                 readers[c].ReadInto(chunk->data[c], n);
                             }
@@ -337,30 +371,15 @@ Result<void> RunParquetStage() {
                         }
 
                         // 1. Decode the early columns and evaluate the scan and the dynamic filters.
-                        for (auto c : early_cols) {
+                        for (auto c : late_mat.EarlyColumns()) {
                             readers[c].ReadInto(chunk->data[c], n);
                         }
                         chunk->SetCardinality(n);
                         duckdb::SelectionVector sel(n);
-                        duckdb::idx_t sc = n;
-                        if (use_filter) {
-                            sc = scan_filter->Select(*chunk, sel);
-                        } else {
-                            for (duckdb::idx_t j = 0; j < n; j++) {
-                                sel.set_index(j, j);
-                            }
-                        }
-                        if (use_probe) {
-                            for (size_t p = 0; p < probes.size() && sc > 0; p++) {
-                                // Only the probes the early columns were decoded for.
-                                if (active_probes[p]) {
-                                    sc = probes[p].probe->Select(chunk->data[probes[p].column], n, sel, sc);
-                                }
-                            }
-                        }
+                        const idx_t sc = late_mat.Select(*chunk, n, sel);
                         if (sc == 0) {
                             // Whole window rejected: advance the other readers, emit nothing.
-                            for (auto c : late_cols) {
+                            for (auto c : late_mat.LateColumns()) {
                                 readers[c].Skip(n);
                             }
                             emit = false;
@@ -368,12 +387,9 @@ Result<void> RunParquetStage() {
                         }
 
                         // 2. Late-materialize the remaining columns for survivors only.
-                        keep.assign(n, 0);
-                        for (duckdb::idx_t j = 0; j < sc; j++) {
-                            keep[sel.get_index(j)] = 1;
-                        }
-                        for (auto c : late_cols) {
-                            readers[c].ReadInto(chunk->data[c], n, keep.data());
+                        const uint8_t *keep = late_mat.SurvivorMask(sel, sc, n);
+                        for (auto c : late_mat.LateColumns()) {
+                            readers[c].ReadInto(chunk->data[c], n, keep);
                         }
 
                         // 3. Compact every column to the surviving rows.

@@ -694,9 +694,9 @@ TEST_CASE("ParquetConfig: dynamic_filters round-trip") {
     auto back = DeserializeFromBytes<parquet::ParquetConfig>(buf.data(), buf.size());
     CHECK(back.dynamic_filters.size() == 2);
     CHECK(back.dynamic_filters[0].filter_id == 3);
-    CHECK(back.dynamic_filters[0].file_column == 1);
+    CHECK(back.dynamic_filters[0].column == 1);
     CHECK(back.dynamic_filters[1].filter_id == 9);
-    CHECK(back.dynamic_filters[1].file_column == 0);
+    CHECK(back.dynamic_filters[1].column == 0);
     parquet::ParquetConfig empty_cfg;
     auto plain = SerializeToBuffer(empty_cfg);
     CHECK(DeserializeFromBytes<parquet::ParquetConfig>(plain.data(), plain.size()).dynamic_filters.empty());

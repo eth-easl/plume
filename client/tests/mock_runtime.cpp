@@ -360,7 +360,7 @@ PartitionedBlocks MockRuntime::RunParquetStage(const LeafStage &stage) {
     dandelion::DataItemVec region_info;
     dandelion::DataItemVec chunk_reqs;
     if (stage.PrunesByDynFilter()) {
-        std::vector<parquet::DynamicFilterColumn> prune_filters;
+        std::vector<exec::DynamicFilterProbeSpec> prune_filters;
         for (const auto &in : stage.dynamic_filter_inputs) {
             if (in.prune) {
                 prune_filters.push_back({in.filter_id, in.file_column});

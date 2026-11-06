@@ -196,23 +196,6 @@ Result<void> RunParquetPrepare() {
     auto config = DeserializeFromBytes<parquet::ParquetConfig>(config_itm.buffer.data(), config_itm.buffer.size());
     const uint32_t num_splits = config.num_splits == 0 ? 1 : config.num_splits;
 
-    // The prune-mode dynamic filters (all ANDed) and their file key columns. A filter that isn't
-    // bound has nothing to prune by.
-    TRY(auto all_dyn_filters, util::ReadDynamicFilters(SET_IDX_IN_DYNAMIC_FILTER));
-    std::vector<std::pair<uint32_t, const exec::DynamicFilter *>> dyn_filters;
-    for (const auto &df : config.dynamic_filters) {
-        auto it = all_dyn_filters.find(df.filter_id);
-        if (it == all_dyn_filters.end()) {
-            continue;
-        }
-        if (!it->second.has_bounds) {
-            // The build side has no non-NULL key at all: the inner join can't produce any row,
-            // so the entire probe scan is pruned.
-            return Ok();
-        }
-        dyn_filters.emplace_back(df.file_column, &it->second);
-    }
-
     TRY(auto footer_itms, abi::GetInputSet(SET_IDX_IN_FOOTER));
     TRY(auto url_itms, abi::GetInputSet(SET_IDX_IN_URL));
     if (footer_itms.size() != url_itms.size()) {
@@ -226,6 +209,13 @@ Result<void> RunParquetPrepare() {
         url_buf_index[url_buf.key] = &url_buf.buffer;
     }
 
+    TRY(auto bound_dyn_filters, util::BindDynamicFilters(SET_IDX_IN_DYNAMIC_FILTER, config.dynamic_filters));
+    if (!bound_dyn_filters) {
+        // An empty build side: the entire probe scan is pruned.
+        return Ok();
+    }
+    
+    const auto &dyn_filters = *bound_dyn_filters;
     const auto &rg_offsets = config.file_row_group_offsets;
     const uint32_t num_files = rg_offsets.empty() ? 1 : static_cast<uint32_t>(rg_offsets.size());
 
@@ -253,7 +243,7 @@ Result<void> RunParquetPrepare() {
                              ErrorKind::OutOfRange);
             }
             const auto &col_type = meta.schema.columns[key_col].type;
-            auto range = exec::BuildRangeFilter(key_col, col_type, *dyn_filter);
+            auto range = exec::BuildRangeFilter(key_col, col_type, dyn_filter);
             if (range) {
                 filter = has_filter ? expr::ExprNode::Conjunction(
                              duckdb::ExpressionType::CONJUNCTION_AND, {std::move(filter), std::move(*range)}
@@ -262,8 +252,8 @@ Result<void> RunParquetPrepare() {
             }
             // An exact key set additionally prunes the row groups none of its keys falls into.
             KeyFilter kf{key_col, std::nullopt};
-            if (dyn_filter->has_values) {
-                kf.values = parquet::SortStatValues(dyn_filter->values, col_type);
+            if (dyn_filter.has_values) {
+                kf.values = parquet::SortStatValues(dyn_filter.values, col_type);
                 has_values = has_values || kf.values.has_value();
             }
             key_filters.push_back(std::move(kf));
@@ -289,7 +279,6 @@ Result<void> RunParquetPrepare() {
             }
         }
 
-        // page index: only the pages of the row groups whose key may match
         std::map<uint32_t, parquet::RowGroupPages> page_selection;
         PageIndexBytes page_index;
         if (file_idx < config.page_index_sizes.size() && file_idx < config.page_index_offsets.size() &&

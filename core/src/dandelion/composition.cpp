@@ -147,7 +147,7 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
                         stage_dyn_filter = ", dynFilter = " + DynFilterBinding(leaf_stage->DynFilterSourceStages());
                     }
                     if (leaf_stage->PrunesByDynFilter()) {
-                        std::vector<parquet::DynamicFilterColumn> prune_filters;
+                        std::vector<exec::DynamicFilterProbeSpec> prune_filters;
                         for (const auto &in : leaf_stage->dynamic_filter_inputs) {
                             if (in.prune) {
                                 prune_filters.push_back({in.filter_id, in.file_column});
