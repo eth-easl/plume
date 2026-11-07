@@ -147,7 +147,7 @@ int main() {
     return plume_test::RunAll();
 }
 
-// --- dynamic filters (AddDynamicFilter / ApplyDynamicFilters / Export) -----------------------
+// --- dynamic filters (AddDynamicFilter / AttachDynamicFilters / Export) -----------------------
 
 namespace {
 
@@ -173,10 +173,8 @@ PlanBuilder::SharedOpNode JoinOf(PlanBuilder &builder, PlanBuilder::SharedOpNode
     return builder.Join(std::move(probe), std::move(build), std::move(t), std::move(out), {0}, {0}, 1, 1);
 }
 
-// The keys of `build`'s column 0 filter `target`'s column 0, which `probe_input` (the join's probe
-// input) traces back to through its column 0.
+// The keys of `build`'s column 0 filter `target`'s column 0.
 PlanBuilder::DynamicFilterEdge EdgeOf(PlanBuilder::SharedOpNode build, PlanBuilder::SharedOpNode target,
-                                      PlanBuilder::SharedOpNode probe_input, double benefit,
                                       uint32_t max_values = 16) {
     PlanBuilder::DynamicFilterEdge e;
     e.build = std::move(build);
@@ -187,10 +185,7 @@ PlanBuilder::DynamicFilterEdge EdgeOf(PlanBuilder::SharedOpNode build, PlanBuild
     e.key_type = I32();
     e.max_values = max_values;
     e.bloom_bits = 0;
-    e.probe_input = std::move(probe_input);
-    e.probe_key = 0;
     e.prune = false;
-    e.benefit = benefit;
     return e;
 }
 
@@ -206,13 +201,29 @@ std::vector<const DynamicFilterBuildTemplate *> Taps(const Stage &stage) {
 
 } // namespace
 
-TEST_CASE("plan_builder: an accepted dynamic filter links the build stage to the target leaf") {
+TEST_CASE("plan_builder: a splitter inserted before a shared node's consumers records them") {
+    PlanBuilder builder(/*optimize_remote_fetching=*/false);
+    auto t = ScanOf(builder, "t");
+    auto b = ScanOf(builder, "b");
+    auto j = JoinOf(builder, t, b); // t itself carries the join's split
+    // A second consumer: the join's split moves to a splitter in front of the join.
+    auto other = builder.After(t, EqFilter(1), TestSchema());
+    const auto &splitter = j->sources[0];
+    CHECK(splitter != t);
+    CHECK(splitter->sources[0] == t);
+    CHECK(splitter->consumers.size() == 1);
+    CHECK(splitter->consumers[0] == j);
+    CHECK(t->consumers.size() == 2);
+    CHECK(other->sources[0]->sources[0] == t);
+}
+
+TEST_CASE("plan_builder: an attached dynamic filter links the build stage to the target leaf") {
     PlanBuilder builder(/*optimize_remote_fetching=*/false);
     auto t = ScanOf(builder, "t");
     auto b = ScanOf(builder, "b");
     auto j = JoinOf(builder, t, b);
-    builder.AddDynamicFilter(EdgeOf(b, t, t, 0.9));
-    builder.ApplyDynamicFilters(j, 2);
+    builder.AddDynamicFilter(EdgeOf(b, t));
+    builder.AttachDynamicFilters();
     CHECK(builder.DynamicFilters().size() == 1);
     auto plan = builder.Export(j);
 
@@ -239,11 +250,11 @@ TEST_CASE("plan_builder: edges with the same build node and parameters share one
     auto j1 = JoinOf(builder, t1, b);
     auto j2 = JoinOf(builder, t2, b);
     auto root = JoinOf(builder, j1, j2);
-    builder.AddDynamicFilter(EdgeOf(b, t1, t1, 0.9));
-    builder.AddDynamicFilter(EdgeOf(b, t2, t2, 0.8));
+    builder.AddDynamicFilter(EdgeOf(b, t1));
+    builder.AddDynamicFilter(EdgeOf(b, t2));
     // Different parameters: a tap of its own.
-    builder.AddDynamicFilter(EdgeOf(b, t2, t2, 0.7, /*max_values=*/0));
-    builder.ApplyDynamicFilters(root, 2);
+    builder.AddDynamicFilter(EdgeOf(b, t2, /*max_values=*/0));
+    builder.AttachDynamicFilters();
     CHECK(builder.DynamicFilters().size() == 3);
     auto plan = builder.Export(root);
 
@@ -255,86 +266,4 @@ TEST_CASE("plan_builder: edges with the same build node and parameters share one
     CHECK(in2.size() == 2);
     CHECK(in1[0].filter_id == in2[0].filter_id); // the shared tap
     CHECK(in2[1].filter_id != in2[0].filter_id);
-}
-
-TEST_CASE("plan_builder: a dynamic filter on a shared scan is dropped") {
-    PlanBuilder builder(/*optimize_remote_fetching=*/false);
-    auto t = ScanOf(builder, "t");
-    auto b = ScanOf(builder, "b");
-    auto j = JoinOf(builder, t, b);
-    // The scan also feeds a filter (e.g. a CTE's other reference).
-    auto other = builder.After(t, EqFilter(1), TestSchema());
-    auto root = JoinOf(builder, j, other);
-    builder.AddDynamicFilter(EdgeOf(b, t, t, 0.9));
-    builder.ApplyDynamicFilters(root, 2);
-    CHECK(builder.DynamicFilters().empty());
-    auto plan = builder.Export(root);
-    for (auto &s : plan->stages) {
-        CHECK(Taps(*s).empty());
-        CHECK(!s->ConsumesDynFilter());
-        CHECK(!s->ProducesDynFilter());
-    }
-}
-
-TEST_CASE("plan_builder: a dynamic filter whose build waits for its target is dropped") {
-    PlanBuilder builder(/*optimize_remote_fetching=*/false);
-    auto t = ScanOf(builder, "t");
-    auto b = ScanOf(builder, "b");
-    auto j = JoinOf(builder, t, b);
-    // The join's output reads the target itself: the filtered scan would wait on itself.
-    builder.AddDynamicFilter(EdgeOf(j, t, t, 0.9));
-    builder.ApplyDynamicFilters(j, 2);
-    CHECK(builder.DynamicFilters().empty());
-}
-
-TEST_CASE("plan_builder: chained dynamic filters are capped by the chain depth, weakest dropped") {
-    auto build_chain = [](PlanBuilder &builder, std::vector<PlanBuilder::SharedOpNode> &targets) {
-        // t1 JOIN (t2 JOIN (t3 JOIN b3)): each level's build side is the next level's join.
-        auto t1 = ScanOf(builder, "t1");
-        auto t2 = ScanOf(builder, "t2");
-        auto t3 = ScanOf(builder, "t3");
-        auto b3 = ScanOf(builder, "b3");
-        auto j3 = JoinOf(builder, t3, b3);
-        auto j2 = JoinOf(builder, t2, j3);
-        auto j1 = JoinOf(builder, t1, j2);
-        builder.AddDynamicFilter(EdgeOf(j2, t1, t1, 0.9));
-        builder.AddDynamicFilter(EdgeOf(j3, t2, t2, 0.5));
-        builder.AddDynamicFilter(EdgeOf(b3, t3, t3, 0.7));
-        targets = {t1, t2, t3};
-        return j1;
-    };
-
-    {
-        PlanBuilder builder(false);
-        std::vector<PlanBuilder::SharedOpNode> targets;
-        auto root = build_chain(builder, targets);
-        builder.ApplyDynamicFilters(root, 3);
-        CHECK(builder.DynamicFilters().size() == 3);
-    }
-    {
-        // Depth 2: t1 <- j2 <- t2 <- j3 <- t3 is 3 long; the weakest edge (into t2) goes, which
-        // breaks the chain in the middle and keeps both others.
-        PlanBuilder builder(false);
-        std::vector<PlanBuilder::SharedOpNode> targets;
-        auto root = build_chain(builder, targets);
-        builder.ApplyDynamicFilters(root, 2);
-        const auto &kept = builder.DynamicFilters();
-        CHECK(kept.size() == 2);
-        CHECK(kept[0].target == targets[0]);
-        CHECK(kept[1].target == targets[2]);
-        auto plan = builder.Export(root);
-        CHECK(plan->stages[targets[0]->stage_idx]->ConsumesDynFilter());
-        CHECK(!plan->stages[targets[1]->stage_idx]->ConsumesDynFilter());
-        CHECK(plan->stages[targets[2]->stage_idx]->ConsumesDynFilter());
-    }
-    {
-        PlanBuilder builder(false);
-        std::vector<PlanBuilder::SharedOpNode> targets;
-        auto root = build_chain(builder, targets);
-        builder.ApplyDynamicFilters(root, 1);
-        // Benefit order: t1 (0.9) accepted. t3 (0.7) chains with it too: t1's build j2 reads the
-        // scan t3, which would wait for b3. t2 (0.5) chains directly.
-        CHECK(builder.DynamicFilters().size() == 1);
-        CHECK(builder.DynamicFilters()[0].target == targets[0]);
-    }
 }

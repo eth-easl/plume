@@ -52,9 +52,16 @@ set(PLUME_CORE_COMPILE_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dandelion/composition.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/compile.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/converter.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/dynamic_filter_planning.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/expression_translator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/physical_plan.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/plan_builder.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/transfer/estimates.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/transfer/join_graph.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/transfer/key_classes.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/transfer/planner.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/transfer/relation.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/transfer/schedule.cpp
 )
 
 set(PLUME_CORE_SOURCES ${PLUME_CORE_ENGINE_SOURCES})

@@ -49,6 +49,7 @@ PlanBuilder::SharedOpNode AddShuffle(PlanBuilder::SharedOpNode n, std::vector<ui
                 c->sources[1] = prev_splitter;
             }
         }
+        prev_splitter->consumers = std::move(n->consumers);
         n->consumers = { prev_splitter };
     }
 
@@ -74,35 +75,6 @@ PlanBuilder::SharedOpNode FindEquivalentConsumer(const PlanBuilder::SharedOpNode
     }
     return nullptr;
 }
-
-// A fixed-size bitset over leaf ids.
-class LeafSet {
-public:
-    explicit LeafSet(size_t n = 0) : words_((n + 63) / 64, 0) {}
-    
-    void Set(size_t i) { words_[i >> 6] |= uint64_t{1} << (i & 63); }
-    bool Test(size_t i) const { return i < words_.size() * 64 && ((words_[i >> 6] >> (i & 63)) & 1); }
-    void Clear() { std::fill(words_.begin(), words_.end(), 0); }
-    
-    LeafSet &operator|=(const LeafSet &o) {
-        for (size_t k = 0; k < words_.size(); k++) {
-            words_[k] |= o.words_[k];
-        }
-        return *this;
-    }
-
-    template <class F>
-    void ForEach(F &&f) const {
-        for (size_t k = 0; k < words_.size(); k++) {
-            for (uint64_t w = words_[k]; w; w &= w - 1) {
-                f(k * 64 + static_cast<size_t>(__builtin_ctzll(w)));
-            }
-        }
-    }
-
-private:
-    std::vector<uint64_t> words_;
-};
 
 } // namespace
 
@@ -211,40 +183,20 @@ std::pair<PlanBuilder::SharedOpNode, uint32_t> PlanBuilder::AppendColumn(PlanBui
     return std::make_pair(After(std::move(node), std::move(t), std::move(out)), new_idx);
 }
 
-std::optional<PlanBuilder::LeafColumn> PlanBuilder::TraceLeafColumn(const SharedOpNode &node, uint32_t col_idx,
-        std::vector<OperatorNode *> *path) {
-    if (path) {
-        path->push_back(node.get());
-    }
-    auto trace = [&](uint32_t source, uint32_t idx) {
-        return TraceLeafColumn(node->sources[source], idx, path);
-    };
-
-    // A node without a template is either a source or a splitter node.
-    if (!node->templ) {
-        if (node->sources[0]) {
-            return trace(0, col_idx); // a splitter: passthrough, same columns
+std::optional<PlanBuilder::ColumnSource> PlanBuilder::TraceColumnStep(const OperatorNode &node, uint32_t col_idx) {
+    // A node without a template is either a source (nothing to step to) or a splitter node.
+    if (!node.templ) {
+        if (node.sources[0]) {
+            return ColumnSource{0, col_idx}; // a splitter: passthrough, same columns
         }
-        
-        LeafStage *leaf = LeafStageAt(node->stage_idx);
-        if (!leaf) {
-            return std::nullopt;
-        }
-        uint32_t file_idx = col_idx;
-        if (leaf->projection && !leaf->projection->empty()) {
-            if (col_idx >= leaf->projection->size()) {
-                return std::nullopt;
-            }
-            file_idx = (*leaf->projection)[col_idx];
-        }
-        return LeafColumn{node, leaf, col_idx, file_idx};
+        return std::nullopt;
     }
 
     // passthrough operators (filters, sort)
-    const auto *templ = node->templ.get();
+    const auto *templ = node.templ.get();
     if (dynamic_cast<const exec::FilterTemplate *>(templ) || dynamic_cast<const exec::SortTemplate *>(templ) ||
         dynamic_cast<const exec::DynamicFilterBuildTemplate *>(templ)) {
-        return trace(0, col_idx); // passthrough, same columns
+        return ColumnSource{0, col_idx}; // passthrough, same columns
     }
 
     // projection
@@ -256,7 +208,7 @@ std::optional<PlanBuilder::LeafColumn> PlanBuilder::TraceLeafColumn(const Shared
         if (e.kind != expr::ExprKind::REFERENCE) {
             return std::nullopt; // a computed column -- can't trace a value back through it
         }
-        return trace(0, e.ref_index);
+        return ColumnSource{0, static_cast<uint32_t>(e.ref_index)};
     }
 
     // aggregate
@@ -265,7 +217,7 @@ std::optional<PlanBuilder::LeafColumn> PlanBuilder::TraceLeafColumn(const Shared
         if (col_idx >= agg->group_keys.size() || agg->group_keys[col_idx].kind != expr::ExprKind::REFERENCE) {
             return std::nullopt;
         }
-        return trace(0, agg->group_keys[col_idx].ref_index);
+        return ColumnSource{0, static_cast<uint32_t>(agg->group_keys[col_idx].ref_index)};
     }
 
     // join
@@ -274,165 +226,53 @@ std::optional<PlanBuilder::LeafColumn> PlanBuilder::TraceLeafColumn(const Shared
         using K = exec::JoinKind;
         const bool has_left = join->kind != K::RIGHT_SEMI && join->kind != K::RIGHT_ANTI;
         const bool has_right = join->kind != K::SEMI && join->kind != K::ANTI && join->kind != K::MARK;
-        const auto left_size = static_cast<uint32_t>(node->sources[0]->output_schema.columns.size());
+        const auto left_size = static_cast<uint32_t>(node.sources[0]->output_schema.columns.size());
         if (has_left && col_idx < left_size) {
-            return trace(0, col_idx);
+            return ColumnSource{0, col_idx};
         }
         const uint32_t right_idx = has_left ? col_idx - left_size : col_idx;
         if (has_right && join->kind != K::SINGLE && right_idx < join->right_schema.columns.size()) {
-            return trace(1, right_idx);
+            return ColumnSource{1, right_idx};
         }
         return std::nullopt; // the marker, or a SINGLE join's build side
     }
     return std::nullopt; // anything else (limit, top-n, ...) -- filtering its input changes its output
 }
 
+std::optional<PlanBuilder::LeafColumn> PlanBuilder::TraceLeafColumn(const SharedOpNode &node, uint32_t col_idx) {
+    SharedOpNode cur = node;
+    uint32_t col = col_idx;
+    while (true) {
+        if (!cur->templ && !cur->sources[0]) {
+            break; // a source
+        }
+        auto step = TraceColumnStep(*cur, col);
+        if (!step) {
+            return std::nullopt;
+        }
+        col = step->column;
+        cur = cur->sources[step->src_idx];
+    }
+
+    LeafStage *leaf = LeafStageAt(cur->stage_idx);
+    if (!leaf) {
+        return std::nullopt;
+    }
+    uint32_t file_idx = col;
+    if (leaf->projection && !leaf->projection->empty()) {
+        if (col >= leaf->projection->size()) {
+            return std::nullopt;
+        }
+        file_idx = (*leaf->projection)[col];
+    }
+    return LeafColumn{cur, leaf, col, file_idx};
+}
+
 void PlanBuilder::AddDynamicFilter(DynamicFilterEdge edge) {
     dynamic_filters_.push_back(std::move(edge));
 }
 
-void PlanBuilder::ApplyDynamicFilters(const SharedOpNode &root, uint32_t max_chain_depth) {
-    const size_t n = dynamic_filters_.size();
-    if (n == 0) {
-        return;
-    }
-
-    // process order
-    std::vector<uint32_t> order;
-    order.reserve(n);
-    for (uint32_t i = 0; i < n; i++) {
-        const auto &e = dynamic_filters_[i];
-        std::vector<OperatorNode *> path;
-        auto traced = TraceLeafColumn(e.probe_input, e.probe_key, &path);
-        const bool exclusive = traced && traced->node == e.target && traced->scan_column == e.target_column &&
-            std::all_of(path.begin(), path.end(),
-                        [&](const OperatorNode *p) { return p->consumers.size() == 1 && p != root.get(); });
-        if (exclusive) {
-            order.push_back(i);
-        }
-    }
-    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-        return dynamic_filters_[a].benefit > dynamic_filters_[b].benefit;
-    });
-
-    // Before Export() only Scan() has created stages, so every node with a stage is a leaf and
-    // its stage index is a dense leaf id. Targets are leaves (TraceLeafColumn returned them).
-    const size_t num_leaves = plan_->stages.size();
-
-    std::unordered_map<const OperatorNode *, LeafSet> upstream;
-    auto upstream_of = [&](auto &self, const OperatorNode *node) -> const LeafSet & {
-        if (auto it = upstream.find(node); it != upstream.end()) {
-            return it->second;
-        }
-
-        LeafSet set(num_leaves);
-        if (node->stage_idx < num_leaves) {
-            set.Set(node->stage_idx);
-        }
-        for (const auto &src : node->sources) {
-            if (src) {
-                set |= self(self, src.get());
-            }
-        }
-        return upstream.emplace(node, std::move(set)).first->second;
-    };
-
-    // awaits[l] is the leaves leaf l transitively waits for.
-    std::vector<LeafSet> awaits(num_leaves, LeafSet(num_leaves));
-    for (size_t l = 0; l < num_leaves; l++) {
-        awaits[l].Set(l);
-    }
-
-    // chain relation among edges
-    auto precedes = [&](uint32_t e, uint32_t o) {
-        return upstream_of(upstream_of, dynamic_filters_[e].build.get())
-            .Test(dynamic_filters_[o].target->stage_idx);
-    };
-
-    // For the accepted edges (parallel to `accepted`): the longest chain ending / starting at it.
-    // The cycle check keeps the chain relation acyclic.
-    std::vector<uint32_t> accepted;
-    std::vector<uint32_t> up_depth;
-    std::vector<uint32_t> down_depth;
-    auto recompute_depths = [&]() {
-        const size_t a = accepted.size();
-        up_depth.assign(a, 0);
-        down_depth.assign(a, 0);
-        auto up = [&](auto &self, size_t k) -> uint32_t {
-            if (up_depth[k] == 0) {
-                uint32_t d = 1;
-                for (size_t j = 0; j < a; j++) {
-                    if (j != k && precedes(accepted[j], accepted[k])) {
-                        d = std::max(d, self(self, j) + 1);
-                    }
-                }
-                up_depth[k] = d;
-            }
-            return up_depth[k];
-        };
-        auto down = [&](auto &self, size_t k) -> uint32_t {
-            if (down_depth[k] == 0) {
-                uint32_t d = 1;
-                for (size_t j = 0; j < a; j++) {
-                    if (j != k && precedes(accepted[k], accepted[j])) {
-                        d = std::max(d, self(self, j) + 1);
-                    }
-                }
-                down_depth[k] = d;
-            }
-            return down_depth[k];
-        };
-        for (size_t k = 0; k < a; k++) {
-            up(up, k);
-            down(down, k);
-        }
-    };
-
-    LeafSet reach(num_leaves);
-    for (uint32_t i : order) {
-        const auto &filter = dynamic_filters_[i];
-        const size_t target_idx = filter.target->stage_idx;
-
-        // Check if build waits for scan which would lead to cycle.
-        reach.Clear();
-        upstream_of(upstream_of, filter.build.get()).ForEach([&](size_t l) { reach |= awaits[l]; });
-        if (reach.Test(target_idx)) {
-            continue;
-        }
-
-        // Every chain avoiding i is within the limit already, so only check the longest through i.
-        uint32_t up_i = 1;
-        uint32_t down_i = 1;
-        for (size_t k = 0; k < accepted.size(); k++) {
-            if (precedes(accepted[k], i)) {
-                up_i = std::max(up_i, up_depth[k] + 1);
-            }
-            if (precedes(i, accepted[k])) {
-                down_i = std::max(down_i, down_depth[k] + 1);
-            }
-        }
-        if (up_i + down_i - 1 > max_chain_depth) {
-            continue;
-        }
-
-        accepted.push_back(i);
-        for (size_t l = 0; l < num_leaves; l++) {
-            if (awaits[l].Test(target_idx)) {
-                awaits[l] |= reach;
-            }
-        }
-        recompute_depths();
-    }
-
-    // Keep the accepted edges in their original order.
-    std::sort(accepted.begin(), accepted.end());
-    std::vector<DynamicFilterEdge> kept;
-    kept.reserve(accepted.size());
-    for (uint32_t i : accepted) {
-        kept.push_back(std::move(dynamic_filters_[i]));
-    }
-    dynamic_filters_ = std::move(kept);
-
+void PlanBuilder::AttachDynamicFilters() {
     // Edges with the same build node, column and parameters share one tap.
     dynamic_filter_taps_.clear();
     for (uint32_t i = 0; i < dynamic_filters_.size(); i++) {

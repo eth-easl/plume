@@ -2,6 +2,7 @@
 
 #include "plume/common/result.hpp"
 #include "plume/execution/operators/join.hpp"
+#include "plume/parser/dynamic_filter_planning.hpp"
 #include "plume/parser/physical_plan.hpp"
 #include "plume/parser/plan_builder.hpp"
 
@@ -59,7 +60,7 @@ struct ConverterConfig {
     // average. Otherwise the fetch starts right away and only pq_stage applies the filter.
     double dynamic_filter_max_rowgroup_coverage = 0.5;
     // Upper limit on the exact distinct build keys a dynamic filter carries (0 => no exact set).
-    uint32_t dynamic_filter_max_values = 1024;
+    uint32_t dynamic_filter_max_values = 256;
     // Bloom filter bits per estimated build-side row (0 => no Bloom filter, 10 bits => ~1% false positives).
     uint32_t dynamic_filter_bloom_bits_per_key = 10;
     // Upper limit on a dynamic filter's Bloom filter size.
@@ -79,10 +80,6 @@ public:
 
 private:
     uint32_t SplitCount(uint64_t estimated_rows) const;
-
-    void ProposeDynamicFilters(const PlanBuilder::SharedOpNode &left, const PlanBuilder::SharedOpNode &right,
-        exec::JoinKind kind, const std::vector<uint32_t> &left_keys, const std::vector<uint32_t> &right_keys,
-        const std::vector<bool> &keys_match_null, uint64_t left_card, uint64_t right_card);
 
     Result<PlanBuilder::SharedOpNode> BuildProjection(duckdb::LogicalOperator &op);
     Result<PlanBuilder::SharedOpNode> BuildFilter(duckdb::LogicalFilter &filter);
@@ -109,6 +106,8 @@ private:
     catalog::SourceCatalog catalog_;
     ConverterConfig cfg_;
     PlanBuilder builder_;
+
+    DynamicFilterContext dyn_filter_ctx_;
 
     std::map<uint64_t, PlanBuilder::SharedOpNode> cte_subs_;
     std::vector<PlanBuilder::SharedOpNode> delim_stack_;

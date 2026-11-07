@@ -128,8 +128,9 @@ RemoteColumnStats AggregateColumnStats(const ColumnType &type,
 } // namespace
 
 Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
-    // schema acts to check if this data source has already been resolved.
-    if (schema.has_value()) return Ok();
+    if (schema.has_value() || !BeginResolve()) {
+        return Ok();
+    }
 
     metadata.assign(paths.size(), parquet::FileMeta());
     footer_bytes.assign(paths.size(), {});
@@ -179,8 +180,7 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
 
             const uint64_t rows = static_cast<uint64_t>(std::max<int64_t>(meta.num_rows, 0));
             {
-                static std::mutex mu; // guards the fields shared across this source's path jobs
-                std::lock_guard<std::mutex> lock(mu);
+                std::lock_guard<std::mutex> lock(resolve_mu_);
                 
                 if (!schema) {
                     schema = meta.schema;

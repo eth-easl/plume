@@ -77,14 +77,10 @@ public:
         ColumnType key_type;  // type keys are cast to before collecting/hashing
         uint32_t max_values;  // exact key set limit (0 -> none)
         uint64_t bloom_bits;  // Bloom filter size (0 -> none)
-
-        SharedOpNode probe_input; // the join's probe-side input (for the exclusivity recheck)
-        uint32_t probe_key;       // key column in probe_input's output
-        bool prune;               // remote parquet leaf: also prune in pq_prepare
-        double benefit;           // estimated fraction of probe rows removed (ranking)
+        bool prune;           // remote parquet leaf: also prune in pq_prepare
     };
 
-    // The accepted edges sharing build node, column and parameters (becomes a DynamicFilterBuildTemplate).
+    // The edges sharing build node, column and parameters (becomes a DynamicFilterBuildTemplate).
     struct DynamicFilterTap {
         uint32_t build_column;
         ColumnType key_type;
@@ -110,6 +106,13 @@ public:
 
     std::pair<SharedOpNode, uint32_t> AppendColumn(SharedOpNode node, expr::ExprNode value, ColumnType type);
 
+    struct ColumnSource {
+        size_t src_idx;
+        uint32_t column;
+    };
+    
+    static std::optional<ColumnSource> TraceColumnStep(const OperatorNode &node, uint32_t col_idx);
+
     struct LeafColumn {
         SharedOpNode node; // the leaf node
         LeafStage *leaf;   // its stage
@@ -117,11 +120,13 @@ public:
         uint32_t file_column;
     };
 
-    std::optional<LeafColumn> TraceLeafColumn(const SharedOpNode &node, uint32_t col_idx,
-                                              std::vector<OperatorNode *> *path = nullptr);
+    // Traces a column back to the leaf it is read from (TraceColumnStep until a leaf).
+    std::optional<LeafColumn> TraceLeafColumn(const SharedOpNode &node, uint32_t col_idx);
 
     void AddDynamicFilter(DynamicFilterEdge edge);
-    void ApplyDynamicFilters(const SharedOpNode &root, uint32_t max_chain_depth);
+    // Attaches every added edge: edges with the same build node, column and parameters share
+    // one tap. Export() then emits the taps and links the stages.
+    void AttachDynamicFilters();
     
     const std::vector<DynamicFilterEdge> &DynamicFilters() const { return dynamic_filters_; }
 

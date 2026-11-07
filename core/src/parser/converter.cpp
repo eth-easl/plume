@@ -2,7 +2,6 @@
 
 #include "plume/catalog/catalog.hpp"
 #include "plume/catalog/local.hpp"
-#include "plume/catalog/parquet.hpp"
 #include "plume/catalog/plume_remote.hpp"
 #include "plume/common/result.hpp"
 #include "plume/execution/operators/aggregate.hpp"
@@ -13,7 +12,6 @@
 #include "plume/execution/operators/sort.hpp"
 #include "plume/execution/operators/top_n.hpp"
 #include "plume/expression/expression.hpp"
-#include "plume/parquet/prune.hpp"
 #include "plume/parser/expression_translator.hpp"
 #include "plume/parser/physical_plan.hpp"
 #include "plume/parser/plan_builder.hpp"
@@ -47,6 +45,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <utility>
 
 namespace plume::parser {
 
@@ -60,7 +59,9 @@ using catalog::SourceCatalog;
 
 Result<std::unique_ptr<PhysicalPlan>> Converter::Convert(duckdb::LogicalOperator &root) {
     TRY(auto root_node, Build(root));
-    builder_.ApplyDynamicFilters(root_node, cfg_.dynamic_filter_max_chain_depth);
+    if (cfg_.dynamic_filter) {
+        PlanDynamicFilters(builder_, root_node, dyn_filter_ctx_, cfg_);
+    }
     return builder_.Export(root_node);
 }
 
@@ -76,86 +77,6 @@ uint32_t Converter::SplitCount(uint64_t estimated_rows) const {
         n = cfg_.max_splits;
     }
     return static_cast<uint32_t>(n);
-}
-
-void Converter::ProposeDynamicFilters(const PlanBuilder::SharedOpNode &left, const PlanBuilder::SharedOpNode &right,
-        exec::JoinKind kind, const std::vector<uint32_t> &left_keys, const std::vector<uint32_t> &right_keys,
-        const std::vector<bool> &keys_match_null, uint64_t left_card, uint64_t right_card) {
-    // Only for joins that drop every probe row without a build match.
-    using K = exec::JoinKind;
-    if (kind != K::INNER && kind != K::SEMI && kind != K::RIGHT && kind != K::RIGHT_SEMI) {
-        return;
-    }
-
-    for (size_t i = 0; i < left_keys.size(); i++) {
-        if (keys_match_null[i]) {
-            continue; // the filter rejects NULL probe keys
-        }
-
-        // TODO: We currently only support dynamic filters on remote parquet leaves.
-        auto probe_leaf = builder_.TraceLeafColumn(left, left_keys[i]);
-        if (!probe_leaf || probe_leaf->leaf->data_source->type != catalog::DataSourceType::REMOTE_PARQUET) {
-            continue;
-        }
-
-        auto build_leaf = builder_.TraceLeafColumn(right, right_keys[i]);
-        double match_fraction = std::numeric_limits<double>::quiet_NaN();
-        if (build_leaf) {
-            const auto &src = *build_leaf->leaf->data_source;
-            const uint32_t file_col = build_leaf->file_column;
-            uint64_t distinct = src.cardinality_total; // no distinct count -> assume a unique key
-            // Only remote parquet sources carry column statistics.
-            if (file_col < src.col_stats.size() && src.col_stats[file_col].has_distinct) {
-                distinct = src.col_stats[file_col].distinct_count;
-            }
-            if (distinct > 0) {
-                match_fraction = std::min(1.0, static_cast<double>(right_card) / static_cast<double>(distinct));
-            }
-        }
-
-        // estimate selectivity
-        const double size_ratio = left_card == 0 
-            ? 1.0
-            : static_cast<double>(right_card) / static_cast<double>(left_card);
-        const bool selective = !std::isnan(match_fraction)
-            ? match_fraction <= cfg_.dynamic_filter_max_match_fraction
-            : size_ratio <= cfg_.dynamic_filter_selectivity_threshold;
-        if (!selective) {
-            continue;
-        }
-
-        const uint32_t lk = left_keys[i];
-        const uint32_t rk = right_keys[i];
-        // Exact keys and hashes are only comparable to the probe side if both key columns share
-        // a type; otherwise fall back to the min/max range alone.
-        const ColumnType key_type = right->output_schema.columns[rk].type;
-        const bool same_type = key_type == left->output_schema.columns[lk].type;
-        uint64_t bloom_bits = 0;
-        if (same_type && cfg_.dynamic_filter_bloom_bits_per_key > 0) {
-            bloom_bits = std::min<uint64_t>(std::max<uint64_t>(right_card, 1) * cfg_.dynamic_filter_bloom_bits_per_key,
-                                            cfg_.dynamic_filter_max_bloom_bytes * 8);
-        }
-
-        // Waiting for the filter before fetching only pays off if it can prune row groups.
-        const auto &probe_src = static_cast<const catalog::RemoteParquetDataSource &>(*probe_leaf->leaf->data_source);
-        const auto coverage = parquet::MeanRowGroupCoverage(probe_src.metadata, probe_leaf->file_column);
-        const bool prune = coverage && *coverage <= cfg_.dynamic_filter_max_rowgroup_coverage;
-
-        PlanBuilder::DynamicFilterEdge edge;
-        edge.build = right;
-        edge.build_column = rk;
-        edge.target = probe_leaf->node;
-        edge.target_column = probe_leaf->scan_column;
-        edge.target_file_column = probe_leaf->file_column;
-        edge.key_type = key_type;
-        edge.max_values = same_type ? cfg_.dynamic_filter_max_values : 0;
-        edge.bloom_bits = bloom_bits;
-        edge.probe_input = left;
-        edge.probe_key = lk;
-        edge.prune = prune;
-        edge.benefit = 1.0 - (!std::isnan(match_fraction) ? match_fraction : std::min(1.0, size_ratio));
-        builder_.AddDynamicFilter(std::move(edge));
-    }
 }
 
 Result<PlanBuilder::SharedOpNode> Converter::BuildProjection(duckdb::LogicalOperator &op) {
@@ -790,9 +711,10 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
     PlanBuilder::SharedOpNode cur = builder_.Join(left, right, std::move(t), natural,
         std::move(probe_split_columns), std::move(build_split_columns), probe_partitions, build_partitions);
     
-    // add tentative dynamic filters if we estimate them to be selective enough
+    // record the join for dynamic filter planning once the graph is built
     if (cfg_.dynamic_filter && has_equi_keys) {
-        ProposeDynamicFilters(left, right, kind, left_keys, right_keys, keys_match_null, left_card, right_card);
+        dyn_filter_ctx_.join_index[cur.get()] = dyn_filter_ctx_.joins.size();
+        dyn_filter_ctx_.joins.push_back(EquiJoin{left, right, kind, left_keys, right_keys, keys_match_null});
     }
 
     const bool has_left = kind != exec::JoinKind::RIGHT_SEMI && kind != exec::JoinKind::RIGHT_ANTI;
@@ -951,40 +873,50 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildMaterializedCTE(duckdb::Logica
 }
 
 Result<PlanBuilder::SharedOpNode> Converter::Build(duckdb::LogicalOperator &op) {
+    Result<PlanBuilder::SharedOpNode> built = PlanBuilder::SharedOpNode{};
     switch (op.type) {
     case LogicalOperatorType::LOGICAL_PROJECTION:
-        return BuildProjection(op);
+        built = BuildProjection(op);
+        break;
 
     case LogicalOperatorType::LOGICAL_FILTER:
-        return BuildFilter(op.Cast<duckdb::LogicalFilter>());
+        built = BuildFilter(op.Cast<duckdb::LogicalFilter>());
+        break;
 
     case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-        return BuildAggregate(op.Cast<duckdb::LogicalAggregate>());
+        built = BuildAggregate(op.Cast<duckdb::LogicalAggregate>());
+        break;
 
     case LogicalOperatorType::LOGICAL_LIMIT:
-        return BuildLimit(op.Cast<duckdb::LogicalLimit>());
+        built = BuildLimit(op.Cast<duckdb::LogicalLimit>());
+        break;
 
     case LogicalOperatorType::LOGICAL_ORDER_BY:
-        return BuildOrder(op.Cast<duckdb::LogicalOrder>());
+        built = BuildOrder(op.Cast<duckdb::LogicalOrder>());
+        break;
 
     case LogicalOperatorType::LOGICAL_TOP_N:
-        return BuildTopN(op.Cast<duckdb::LogicalTopN>());
+        built = BuildTopN(op.Cast<duckdb::LogicalTopN>());
+        break;
 
     case LogicalOperatorType::LOGICAL_GET:
-        return BuildGet(op.Cast<duckdb::LogicalGet>());
+        built = BuildGet(op.Cast<duckdb::LogicalGet>());
+        break;
 
     case LogicalOperatorType::LOGICAL_CHUNK_GET:
-        return BuildChunkGet(op.Cast<duckdb::LogicalColumnDataGet>());
+        built = BuildChunkGet(op.Cast<duckdb::LogicalColumnDataGet>());
+        break;
 
-    case LogicalOperatorType::LOGICAL_DELIM_GET: {
+    case LogicalOperatorType::LOGICAL_DELIM_GET:
         if (delim_stack_.empty()) {
             return Error("DELIM_GET outside of a DELIM join.", ErrorKind::NotImplemented);
         }
-        return delim_stack_.back();
-    }
+        built = delim_stack_.back();
+        break;
 
     case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
-        return BuildEmptyResult(op.Cast<duckdb::LogicalEmptyResult>());
+        built = BuildEmptyResult(op.Cast<duckdb::LogicalEmptyResult>());
+        break;
 
     case LogicalOperatorType::LOGICAL_CTE_REF: {
         auto &ref = op.Cast<duckdb::LogicalCTERef>();
@@ -993,25 +925,36 @@ Result<PlanBuilder::SharedOpNode> Converter::Build(duckdb::LogicalOperator &op) 
             return Error("Reference to a non-materialized CTE is not supported.",
                          ErrorKind::NotImplemented);
         }
-        return it->second;
+        built = it->second;
+        break;
     }
 
     case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-        return BuildDelimJoin(op.Cast<duckdb::LogicalComparisonJoin>());
+        built = BuildDelimJoin(op.Cast<duckdb::LogicalComparisonJoin>());
+        break;
 
     case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-        return BuildComparisonJoin(op.Cast<duckdb::LogicalComparisonJoin>());
+        built = BuildComparisonJoin(op.Cast<duckdb::LogicalComparisonJoin>());
+        break;
 
     case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-        return BuildCrossProduct(op.Cast<duckdb::LogicalCrossProduct>());
+        built = BuildCrossProduct(op.Cast<duckdb::LogicalCrossProduct>());
+        break;
 
     case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-        return BuildMaterializedCTE(op.Cast<duckdb::LogicalMaterializedCTE>());
+        built = BuildMaterializedCTE(op.Cast<duckdb::LogicalMaterializedCTE>());
+        break;
 
     default:
         return Error("Unsupported logical operator '" + op.GetName() + "'.",
                      ErrorKind::NotImplemented);
     }
+
+    TRY(auto node, std::move(built));
+    if (cfg_.dynamic_filter && op.has_estimated_cardinality) {
+        dyn_filter_ctx_.node_card.try_emplace(node.get(), op.estimated_cardinality);
+    }
+    return node;
 }
 
 namespace {

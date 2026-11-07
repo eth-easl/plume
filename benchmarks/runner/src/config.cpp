@@ -101,6 +101,39 @@ Result<BenchmarkConfig> BenchmarkConfig::FromJsonFile(const std::string &path) {
         if (data.contains("maxRegionSize")) {
             cfg.converter_config.max_region_bytes = data.at("maxRegionSize").get<uint64_t>();
         }
+        if (data.contains("coalesceDistance")) {
+            cfg.converter_config.coalesce_distance = data.at("coalesceDistance").get<uint64_t>();
+        }
+        if (data.contains("dynamicFilter")) {
+            cfg.converter_config.dynamic_filter = data.at("dynamicFilter").get<bool>();
+        }
+        if (data.contains("dynamicFilterMaxMatchFraction")) {
+            cfg.converter_config.dynamic_filter_max_match_fraction =
+                data.at("dynamicFilterMaxMatchFraction").get<double>();
+        }
+        if (data.contains("dynamicFilterSelectivityThreshold")) {
+            cfg.converter_config.dynamic_filter_selectivity_threshold =
+                data.at("dynamicFilterSelectivityThreshold").get<double>();
+        }
+        if (data.contains("dynamicFilterMaxRowgroupCoverage")) {
+            cfg.converter_config.dynamic_filter_max_rowgroup_coverage =
+                data.at("dynamicFilterMaxRowgroupCoverage").get<double>();
+        }
+        if (data.contains("dynamicFilterMaxValues")) {
+            cfg.converter_config.dynamic_filter_max_values = data.at("dynamicFilterMaxValues").get<uint32_t>();
+        }
+        if (data.contains("dynamicFilterBloomBitsPerKey")) {
+            cfg.converter_config.dynamic_filter_bloom_bits_per_key =
+                data.at("dynamicFilterBloomBitsPerKey").get<uint32_t>();
+        }
+        if (data.contains("dynamicFilterMaxBloomBytes")) {
+            cfg.converter_config.dynamic_filter_max_bloom_bytes =
+                data.at("dynamicFilterMaxBloomBytes").get<uint64_t>();
+        }
+        if (data.contains("dynamicFilterMaxChainDepth")) {
+            cfg.converter_config.dynamic_filter_max_chain_depth =
+                data.at("dynamicFilterMaxChainDepth").get<uint32_t>();
+        }
         if (data.contains("fetcherThreads")) {
             cfg.fetcher_threads = data.at("fetcherThreads").get<size_t>();
         }

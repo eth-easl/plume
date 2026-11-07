@@ -32,8 +32,9 @@ Schema ProjectSchema(const Schema &full, const std::vector<uint32_t> &projection
 } // namespace
 
 Result<void> RemoteCSVDataSource::Resolve(const RemoteResolver &resolver) {
-    // schema acts to check if this data source has already been resolved.
-    if (schema.has_value()) return Ok();
+    if (schema.has_value() || !BeginResolve()) {
+        return Ok();
+    }
 
     file_sizes.assign(paths.size(), 0);
     cardinalities.assign(paths.size(), 0);
@@ -78,8 +79,7 @@ Result<void> RemoteCSVDataSource::Resolve(const RemoteResolver &resolver) {
             }
 
             {
-                static std::mutex mu; // guards the fields shared across this source's path jobs
-                std::lock_guard<std::mutex> lock(mu);
+                std::lock_guard<std::mutex> lock(resolve_mu_);
                 if (!schema) {
                     schema = std::move(file_schema);
                 }

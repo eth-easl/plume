@@ -23,8 +23,8 @@
         "ctxSize": 1073741824,
         "binaryPath": "~/plume_functions/plume_pq_stage",
         "metadata": {
-            "inputSets": ["template", "regionInfo", "inBuffers"],
-            "outputSets": ["outData", "stdio"]
+            "inputSets": ["template", "regionInfo", "inBuffers", "dynFilter"],
+            "outputSets": ["outData", "dynFilter", "stdio"]
         }
     },{
         "name": "plume_stage",

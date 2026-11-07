@@ -145,10 +145,10 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
     auto now = std::chrono::steady_clock::now();
     int64_t planning_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
 
-    if (config_.debug_prints) {
-        LogDebug("   compiled physical plan:\n===== PHYSICAL PLAN =====\n", 
-                 compiled.plan->ToString(), "===== PHYSICAL PLAN =====");
-    }
+    LogDebug("   compiled physical plan:\n===== PHYSICAL PLAN =====\n", 
+             compiled.plan->ToString(), "===== PHYSICAL PLAN =====");
+    LogDebug("   dandelion composition:\n===== DANDELION COMPOSITION =====\n", 
+             compiled.composition.dsl, "===== DANDELION COMPOSITION =====");
 
     Invocation inv;
     inv.name = key;

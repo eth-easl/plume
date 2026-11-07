@@ -1040,7 +1040,7 @@ TEST_CASE("dynamic filter: attaches to an INNER join's build side, marks the rem
     duckdb::DuckDB db(nullptr);
     auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
     auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
-                                       "JOIN customers c ON o.cust = c.cust")
+                                       "JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
                     .unwrap();
 
     const LeafStage *orders = FindLeaf(*plan, "remote_orders");
@@ -1075,7 +1075,7 @@ TEST_CASE("dynamic filter: producing leaf stage's dynFilter output is actually b
     duckdb::DuckDB db(nullptr);
     auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
     auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
-                                       "JOIN customers c ON o.cust = c.cust")
+                                       "JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
                     .unwrap();
 
     const LeafStage *orders = FindLeaf(*plan, "remote_orders");
@@ -1083,7 +1083,7 @@ TEST_CASE("dynamic filter: producing leaf stage's dynFilter output is actually b
     CHECK(build_stage.ProducesDynFilter());
     CHECK(build_stage.IsLeaf()); // the case this regression test targets
 
-    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", ConverterConfig{}).unwrap();
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", Cfg(true)).unwrap();
 
     const std::string dyn_var = "dfltr_" + std::to_string(build_stage.idx);
     // pq_stage consumes it by name (no row-group statistics -> no pq_prepare)...
@@ -1101,12 +1101,12 @@ TEST_CASE("dynamic filter: probe column sorted in the files -> pq_prepare prunes
     // "cust" row groups [0,99], [100,199], ... -> each spans 1/4 of the range.
     auto con = MakeRemoteJoinDb(db, 1'000'000, {{0, 99}, {100, 199}, {200, 299}, {300, 399}});
     auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
-                                       "JOIN customers c ON o.cust = c.cust")
+                                       "JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
                     .unwrap();
     const LeafStage *orders = FindLeaf(*plan, "remote_orders");
     CHECK(OnlyDynFilter(orders).prune);
 
-    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", ConverterConfig{}).unwrap();
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", Cfg(true)).unwrap();
     const std::string dyn_var = "dfltr_" + std::to_string(OnlyDynFilter(orders).source_stage);
     CHECK(Contains(comp.dsl, "url = anyKeyed url_" + std::to_string(orders->idx) + ", dynFilter = all " + dyn_var));
     // pq_stage evaluates the pruning filter on the rows too (regions no longer carry it).
@@ -1116,7 +1116,7 @@ TEST_CASE("dynamic filter: probe column sorted in the files -> pq_prepare prunes
     duckdb::DuckDB db2(nullptr);
     auto con2 = MakeRemoteJoinDb(db2, 1'000'000, {{0, 399}, {1, 398}, {0, 397}, {2, 399}});
     auto plan2 = BuildPhysicalPlan(con2, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
-                                         "JOIN customers c ON o.cust = c.cust")
+                                         "JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
                      .unwrap();
     const LeafStage *orders2 = FindLeaf(*plan2, "remote_orders");
     CHECK(!OnlyDynFilter(orders2).prune);
@@ -1145,7 +1145,7 @@ TEST_CASE("dynamic filter: attached by the share of build keys the build side ke
         duckdb::DuckDB db(nullptr);
         auto con = MakeRemoteJoinDb(db, 1'000'000, {}, std::make_shared<FakeRemoteCustomers>(10'000));
         auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
-                                           "JOIN plume_remote('remote_customers') c ON o.cust = c.cust")
+                                           "JOIN plume_remote('remote_customers') c ON o.cust = c.cust", {}, Cfg(true))
                         .unwrap();
         CHECK(!HasDynFilter(FindLeaf(*plan, "remote_orders")));
     }
@@ -1155,7 +1155,7 @@ TEST_CASE("dynamic filter: attached by the share of build keys the build side ke
         auto con = MakeRemoteJoinDb(db, 1'000'000, {}, std::make_shared<FakeRemoteCustomers>(10'000));
         auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
                                            "JOIN plume_remote('remote_customers') c ON o.cust = c.cust "
-                                           "WHERE c.name = 'alice'")
+                                           "WHERE c.name = 'alice'", {}, Cfg(true))
                         .unwrap();
         CHECK(HasDynFilter(FindLeaf(*plan, "remote_orders")));
     }
@@ -1166,7 +1166,7 @@ namespace {
 std::unique_ptr<PhysicalPlan> RemoteJoinPlan(const std::string &sql) {
     duckdb::DuckDB db(nullptr);
     auto con = MakeRemoteJoinDb(db, 1'000'000);
-    return BuildPhysicalPlan(con, sql).unwrap();
+    return BuildPhysicalPlan(con, sql, {}, Cfg(true)).unwrap();
 }
 
 size_t CountDynamicFilterBuilds(const PhysicalPlan &plan) {
@@ -1250,7 +1250,7 @@ TEST_CASE("dynamic filter: star schema -> several builds filter one scan, bound 
     con.Query("INSERT INTO items VALUES (1, 'x'), (3, 'y')");
     auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name, i.label FROM plume_remote('remote_orders') o "
                                        "JOIN customers c ON o.cust = c.cust "
-                                       "JOIN items i ON o.o_id = i.item")
+                                       "JOIN items i ON o.o_id = i.item", {}, Cfg(true))
                     .unwrap();
 
     const LeafStage *orders = FindLeaf(*plan, "remote_orders");
@@ -1264,7 +1264,7 @@ TEST_CASE("dynamic filter: star schema -> several builds filter one scan, bound 
     }
     CHECK((file_cols == std::set<uint32_t>{0, 1}));
 
-    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", ConverterConfig{}).unwrap();
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", Cfg(true)).unwrap();
     const std::string binding = "dynFilter = all {dfltr_" + std::to_string(sources[0]) + ", dfltr_" +
                                 std::to_string(sources[1]) + "}";
     CHECK(Contains(comp.dsl, "inBuffers = keyed data_" + std::to_string(orders->idx) + ", " + binding));
@@ -1292,7 +1292,7 @@ TEST_CASE("dynamic filter: prune mode is decided per filter") {
     con.Query("INSERT INTO items VALUES (1, 'x'), (3, 'y')");
     auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name, i.label FROM plume_remote('remote_orders') o "
                                        "JOIN customers c ON o.cust = c.cust "
-                                       "JOIN items i ON o.o_id = i.item")
+                                       "JOIN items i ON o.o_id = i.item", {}, Cfg(true))
                     .unwrap();
     const LeafStage *orders = FindLeaf(*plan, "remote_orders");
     CHECK(orders->dynamic_filter_inputs.size() == 2);
@@ -1305,7 +1305,7 @@ TEST_CASE("dynamic filter: prune mode is decided per filter") {
     CHECK(!o_id->prune);
     CHECK(orders->PrunesByDynFilter());
 
-    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", ConverterConfig{}).unwrap();
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", Cfg(true)).unwrap();
     // pq_prepare waits only for the pruning filter's producer, pq_stage for both.
     CHECK(Contains(comp.dsl, "url = anyKeyed url_" + std::to_string(orders->idx) + ", dynFilter = all dfltr_" +
                                  std::to_string(cust->source_stage) + ")"));
@@ -1356,7 +1356,10 @@ struct DynFilterParquetDb {
         auto plume_rows = PlumeRows(runtime->Run(*plan));
         std::string duck_sql = sql;
         const std::string from = "plume_remote('pq_orders')";
-        duck_sql.replace(duck_sql.find(from), from.size(), "read_parquet('" + path + "')");
+        const std::string to = "read_parquet('" + path + "')";
+        for (size_t pos = duck_sql.find(from); pos != std::string::npos; pos = duck_sql.find(from, pos + to.size())) {
+            duck_sql.replace(pos, from.size(), to);
+        }
         auto duck_rows = DuckRows(con, duck_sql);
         std::sort(plume_rows.begin(), plume_rows.end());
         std::sort(duck_rows.begin(), duck_rows.end());
@@ -1431,6 +1434,64 @@ TEST_CASE("dynamic filter e2e: pruning and probe-only filters of two builds on o
     CHECK(RowCount(runtime3->StageOutput(orders3->idx)) == 0);
 }
 
+TEST_CASE("dynamic filter e2e: transitive keys filter a scan that never meets the build directly") {
+    DynFilterParquetDb t;
+    // a.cust = c.cust and b.cust = a.cust: customers' keys bound b.cust too, so its scan is filtered
+    // by the same tap although b only ever joins (a JOIN customers). With a RIGHT join b's
+    // unmatched rows are dropped as well; a SEMI join drops a's unmatched rows like an INNER one.
+    const std::string b = "(SELECT cust, k FROM plume_remote('pq_orders')) b ON b.cust = a.cust";
+    for (const std::string &sql : {
+             "SELECT a.o_id, b.k, c.name FROM plume_remote('pq_orders') a JOIN customers c ON a.cust = c.cust JOIN " + b,
+             "SELECT a.o_id, b.k, c.name FROM plume_remote('pq_orders') a JOIN customers c ON a.cust = c.cust "
+             "LEFT JOIN " + b,
+             "SELECT a.o_id, b.k FROM plume_remote('pq_orders') a JOIN " + b +
+                 " WHERE a.cust IN (SELECT cust FROM customers)"}) {
+        auto [plan, runtime] = t.ExpectMatch(sql);
+        std::vector<const LeafStage *> scans;
+        for (auto &s : plan->stages) {
+            if (s->IsLeaf() && static_cast<const LeafStage &>(*s).data_source->name == "pq_orders") {
+                scans.push_back(static_cast<const LeafStage *>(s.get()));
+            }
+        }
+        CHECK_MSG(scans.size() == 2, sql);
+        std::set<uint32_t> sources;
+        for (const LeafStage *scan : scans) {
+            const auto &in = OnlyDynFilter(scan);
+            CHECK(in.file_column == 1);
+            sources.insert(in.source_stage);
+            // cust 5, 100, 199 -> 300 rows of 20480 per scan.
+            CHECK_MSG(RowCount(runtime->StageOutput(scan->idx)) == 300, sql);
+        }
+        // Both from the one tap on customers.
+        CHECK(sources.size() == 1);
+        CHECK(DynamicFilterBuilds(*plan->stages[*sources.begin()]).size() == 1);
+    }
+}
+
+TEST_CASE("dynamic filter e2e: a filtered scan passes the filter on through another key") {
+    DynFilterParquetDb t;
+    // customers filters a (on cust); a's surviving rows then filter b on a different key (a.k =
+    // b.o_id): the predicate on customers reaches b, which shares no key with it.
+    const std::string sql = "SELECT a.o_id, b.cust, c.name FROM plume_remote('pq_orders') a "
+                            "JOIN customers c ON a.cust = c.cust "
+                            "JOIN (SELECT o_id, cust FROM plume_remote('pq_orders')) b ON b.o_id = a.k";
+    auto [plan, runtime] = t.ExpectMatch(sql);
+    const LeafStage *a = nullptr, *b = nullptr;
+    for (auto &s : plan->stages) {
+        if (s->IsLeaf() && static_cast<const LeafStage &>(*s).data_source->name == "pq_orders") {
+            auto *leaf = static_cast<const LeafStage *>(s.get());
+            (OnlyDynFilter(leaf).file_column == 1 ? a : b) = leaf;
+        }
+    }
+    CHECK(a && b);
+    CHECK(OnlyDynFilter(b).file_column == 0); // o_id
+    // cust 5, 100, 199 -> 300 rows of a, whose 300 distinct k values select 300 rows of b.
+    CHECK(RowCount(runtime->StageOutput(a->idx)) == 300);
+    CHECK(RowCount(runtime->StageOutput(b->idx)) == 300);
+    // a's own scan builds b's filter from the rows its probe keeps.
+    CHECK(OnlyDynFilter(b).source_stage == a->idx);
+}
+
 TEST_CASE("dynamic filter: dropped when the probe scan is shared with another consumer") {
     // The materialized CTE's scan also feeds the count, which needs the rows the filter would drop.
     auto plan = RemoteJoinPlan("WITH o AS MATERIALIZED (SELECT * FROM plume_remote('remote_orders')) "
@@ -1479,7 +1540,7 @@ TEST_CASE("dynamic filter: not attached for a join that keeps unmatched probe ro
     duckdb::DuckDB db(nullptr);
     auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
     auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
-                                       "LEFT JOIN customers c ON o.cust = c.cust")
+                                       "LEFT JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
                     .unwrap();
 
     const LeafStage *orders = FindLeaf(*plan, "remote_orders");
@@ -1491,7 +1552,7 @@ TEST_CASE("dynamic filter: not attached when the probe side isn't a remote parqu
     duckdb::DuckDB db(nullptr);
     auto con = MakeDb(db);
     auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM orders o JOIN customers c "
-                                       "ON o.cust = c.c_id")
+                                       "ON o.cust = c.c_id", {}, Cfg(true))
                     .unwrap();
     CHECK(CountDynamicFilterBuilds(*plan) == 0);
 }
@@ -1550,6 +1611,32 @@ TEST_CASE("RemoteParquetDataSource: column min/max bound every file") {
     CHECK(k.has_min && k.min_value == duckdb::Value::BIGINT(0));
     CHECK(k.has_max && k.max_value == duckdb::Value::BIGINT(299));
     CHECK(k.not_null);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("ResolveAndRewriteSources: a source referenced twice is resolved once") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "plume_test_resolve_twice";
+    fs::create_directories(dir);
+    const std::string a = (dir / "a.parquet").string();
+    {
+        duckdb::DuckDB db(nullptr);
+        duckdb::Connection con(db);
+        CHECK(!con.Query("COPY (SELECT range AS k FROM range(0, 300)) TO '" + a + "' (FORMAT PARQUET)")->HasError());
+    }
+
+    // A self join: both references share one catalog entry, whose files must be queued once.
+    SourceCatalog catalog;
+    RemoteResolver resolver(AutoFetcher(), 4);
+    const std::string url = "file://" + a;
+    auto sql = ResolveAndRewriteSources("SELECT * FROM plume_remote(" + url + ") x JOIN plume_remote(" + url +
+                                            ") y ON x.k = y.k",
+                                        catalog, resolver);
+    CHECK(sql.is_ok());
+    CHECK(catalog.size() == 1);
+    auto src = catalog.Get(0).unwrap();
+    CHECK(src->cardinality_total == 300);
+    CHECK(src->cardinalities == std::vector<uint64_t>{300});
     fs::remove_all(dir);
 }
 
