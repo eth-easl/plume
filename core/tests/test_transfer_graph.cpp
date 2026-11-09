@@ -1,6 +1,6 @@
 // Unit tests for the predicate transfer dynamic filter planner (parser/transfer/, see
 // predicate-transfer.md): relation discovery, join graph edges and their closure, key class
-// domains, the forward-pass schedule, and the planner's emitted dynamic filters. The node graphs
+// domains, the forward pass, and the planner's emitted dynamic filters. The node graphs
 // are built by hand through PlanBuilder, as the converter would.
 
 #include "test_util.hpp"
@@ -17,9 +17,7 @@
 #include "plume/parser/dynamic_filter_planning.hpp"
 #include "plume/parser/plan_builder.hpp"
 #include "plume/parser/transfer/join_graph.hpp"
-#include "plume/parser/transfer/key_classes.hpp"
 #include "plume/parser/transfer/relation.hpp"
-#include "plume/parser/transfer/schedule.hpp"
 
 #include "duckdb/common/types/value.hpp"
 
@@ -123,10 +121,10 @@ bool HasClosedEdge(const JoinGraph &graph, RelationColumn source, RelationColumn
     return HasEdge(graph.EdgesFrom(source.relation), source, target);
 }
 
-TransferSchedule::Options Opts(uint32_t max_depth = 2) {
-    TransferSchedule::Options o;
-    o.thresholds.max_match_fraction = 0.5;
-    o.thresholds.max_card_fraction = 0.2;
+ForwardPassOptions Opts(uint32_t max_depth = 2) {
+    ForwardPassOptions o;
+    o.max_match_fraction = 0.5;
+    o.max_card_fraction = 0.2;
     o.max_depth = max_depth;
     return o;
 }
@@ -175,9 +173,9 @@ TEST_CASE("transfer: a shared scan forks into relations that send but never rece
 
     // The forked branch's filter still reaches the other scan.
     auto graph = JoinGraph::Build(rels, g.ctx.joins, root);
-    auto schedule = TransferSchedule::ForwardPass(rels, graph, Opts());
+    auto transfers = graph.ForwardPass(rels, Opts());
     bool found = false;
-    for (const auto &x : schedule.Transfers()) {
+    for (const auto &x : transfers) {
         found |= x.edge.source.relation == r1.id && x.edge.target.relation == RelOf(rels, t);
         CHECK(x.edge.target.relation != r1.id && x.edge.target.relation != r2.id);
     }
@@ -269,15 +267,13 @@ TEST_CASE("transfer: a key domain is the smallest known domain of its class") {
     auto rels = RelationSet::Discover(g.builder, root, g.ctx.node_card);
     auto graph = JoinGraph::Build(rels, g.ctx.joins, root);
     const RelationColumn fc{RelOf(rels, fact), 0}, dc{RelOf(rels, dim), 0}, lc{RelOf(rels, loc), 0};
-    CHECK(graph.Classes().Find(fc) == graph.Classes().Find(dc));
-    CHECK(graph.Classes().Find(fc) == graph.Classes().Find(lc));
-    CHECK(graph.Classes().Domain(rels, fc) == 10'000);
-    CHECK(graph.Classes().Domain(rels, lc) == 10'000);
-    CHECK(graph.Classes().Domain(rels, lc, /*exclude=*/dc) == 6'000'000);
-    CHECK(graph.Classes().Domain(rels, {RelOf(rels, fact), 1}) == 6'000'000); // in no class
+    CHECK(graph.KeyDomain(fc) == 10'000);
+    CHECK(graph.KeyDomain(lc) == 10'000); // loc's own is unknown: it takes the class's
+    CHECK(graph.KeyDomain(lc, /*exclude=*/dc) == 6'000'000);
+    CHECK(graph.KeyDomain({RelOf(rels, fact), 1}) == 0); // not a join key
 }
 
-// --- schedule -----------------------------------------------------------------------------
+// --- forward pass -----------------------------------------------------------------------------
 
 TEST_CASE("transfer: a filtered relation filters a larger one, each target column keeps its best") {
     Graph g;
@@ -288,11 +284,11 @@ TEST_CASE("transfer: a filtered relation filters a larger one, each target colum
     auto root = g.Join(g.Join(fact, d1), d2, 0, 0);
     auto rels = RelationSet::Discover(g.builder, root, g.ctx.node_card);
     auto graph = JoinGraph::Build(rels, g.ctx.joins, root);
-    auto schedule = TransferSchedule::ForwardPass(rels, graph, Opts());
+    auto transfers = graph.ForwardPass(rels, Opts());
 
     const uint32_t rf = RelOf(rels, fact), r1 = RelOf(rels, d1);
     std::vector<Transfer> into_fact;
-    for (const auto &x : schedule.Transfers()) {
+    for (const auto &x : transfers) {
         if (x.edge.target.relation == rf) {
             into_fact.push_back(x);
         }
@@ -301,9 +297,10 @@ TEST_CASE("transfer: a filtered relation filters a larger one, each target colum
     CHECK(into_fact[0].edge.source.relation == r1);
     CHECK(into_fact[0].fraction == 0.1);
     CHECK(into_fact[0].depth == 1);
-    CHECK(schedule.FilteredCard(rf) == 10'000);
-    // Smaller first: the dimension tables precede the fact table.
-    CHECK(schedule.Order().back() == rf);
+    // Smaller first: the fact table is scheduled after d1, so it never filters d1.
+    for (const auto &x : transfers) {
+        CHECK(x.edge.target.relation != r1);
+    }
 }
 
 TEST_CASE("transfer: an unselective relation sends nothing") {
@@ -313,7 +310,7 @@ TEST_CASE("transfer: an unselective relation sends nothing") {
     auto root = g.Join(fact, dim);
     auto rels = RelationSet::Discover(g.builder, root, g.ctx.node_card);
     auto graph = JoinGraph::Build(rels, g.ctx.joins, root);
-    CHECK(TransferSchedule::ForwardPass(rels, graph, Opts()).Transfers().empty());
+    CHECK(graph.ForwardPass(rels, Opts()).empty());
 }
 
 TEST_CASE("transfer: chains of transfers carry filters through relations, capped by depth") {
@@ -327,9 +324,9 @@ TEST_CASE("transfer: chains of transfers carry filters through relations, capped
         auto root = g.Join(big, sm, 1, /*mid.1*/ 1);
         auto rels = RelationSet::Discover(g.builder, root, g.ctx.node_card);
         auto graph = JoinGraph::Build(rels, g.ctx.joins, root);
-        auto schedule = TransferSchedule::ForwardPass(rels, graph, Opts(max_depth));
+        auto transfers = graph.ForwardPass(rels, Opts(max_depth));
         std::vector<std::pair<uint32_t, uint32_t>> pairs;
-        for (const auto &x : schedule.Transfers()) {
+        for (const auto &x : transfers) {
             pairs.push_back({x.edge.source.relation, x.edge.target.relation});
         }
         return std::make_tuple(pairs, RelOf(rels, small), RelOf(rels, mid), RelOf(rels, big));

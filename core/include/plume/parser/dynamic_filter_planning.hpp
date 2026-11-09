@@ -37,17 +37,7 @@ bool DropsUnmatched(exec::JoinKind kind, size_t side);
 // The distinct values of a leaf column (if unknown its source's row count or 0 if neither is known).
 uint64_t LeafColumnDomain(const PlanBuilder::LeafColumn &leaf);
 
-// Whether the target column's row groups are clustered enough for a filter to prune them before
-// the fetch (pq_prepare).
-bool RowGroupsPrunable(const PlanBuilder::LeafColumn &target, const ConverterConfig &cfg);
-
-// A dynamic filter edge from `build`'s column into the leaf column `target`, sized for an
-// estimated `build_distinct` keys.
-PlanBuilder::DynamicFilterEdge MakeDynamicFilterEdge(const ConverterConfig &cfg, 
-    PlanBuilder::SharedOpNode build, uint32_t build_column, const PlanBuilder::LeafColumn &target,
-    double build_distinct, bool prune);
-
-// Determines the plan's dynamic filters and attaches them to `builder`.
+// Determines the plan's dynamic filters with predicate transfer and attaches them to `builder`.
 void PlanDynamicFilters(PlanBuilder &builder, const PlanBuilder::SharedOpNode &root, 
     const DynamicFilterContext &ctx, const ConverterConfig &cfg);
 
