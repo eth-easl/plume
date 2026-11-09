@@ -1,10 +1,14 @@
 #include "plume/dandelion/composition.hpp"
 
 #include "plume/catalog/catalog.hpp"
+#include "plume/catalog/csv.hpp"
+#include "plume/catalog/local.hpp"
+#include "plume/catalog/parquet.hpp"
 #include "plume/common/result.hpp"
 #include "plume/dandelion/api.hpp"
 #include "plume/execution/operators/join.hpp"
 #include "plume/memory/adapter.hpp"
+#include "plume/parser/converter.hpp"
 #include "plume/parser/physical_plan.hpp"
 
 #include <nlohmann/json.hpp>
@@ -12,9 +16,7 @@
 #include <memory>
 #include <sstream>
 
-// TODO: move to cmake config
-#define ENABLE_STDIO // uncomment to use function with stdio set registered (debugging)
-#ifdef ENABLE_STDIO
+#ifdef PLUME_DSL_STDIO
 # define EXTRA_OUT_SET ", stdio"
 #else
 # define EXTRA_OUT_SET
@@ -22,7 +24,15 @@
 
 namespace plume::dandelion {
 
+using catalog::BuildCSVStageInputs;
+using catalog::BuildParquetStageInputs;
+using catalog::BuildParquetPrepareInputs;
 using catalog::DataSourceType;
+using catalog::LocalTableDataSource;
+using catalog::MaterializeTable;
+using catalog::RemoteCSVDataSource;
+using catalog::RemoteParquetDataSource;
+using parser::ConverterConfig;
 using parser::LeafStage;
 using parser::PhysicalPlan;
 
@@ -37,59 +47,85 @@ std::string TableInVar(int stage) { return "tin_" + std::to_string(stage); }
 std::string RemoteInfoVar(int stage) { return "info_" + std::to_string(stage); }
 std::string RemoteReqVar(int stage) { return "req_" + std::to_string(stage); }
 std::string OutVar(int stage) { return "out_" + std::to_string(stage); }
+std::string DynFilterVar(int stage) { return "dfltr_" + std::to_string(stage); }
+
+std::string DynFilterBinding(const std::vector<uint32_t> &stages) {
+    if (stages.size() == 1) {
+        return "all " + DynFilterVar(static_cast<int>(stages[0]));
+    }
+    std::string out = "all {";
+    for (size_t i = 0; i < stages.size(); i++) {
+        out += (i ? ", " : "") + DynFilterVar(static_cast<int>(stages[i]));
+    }
+    return out + "}";
+}
 
 struct DeclarationTracker {
-    bool using_http = false;  // -> the runtime-provided HTTP function (file fetches)
-    bool using_stage = false; // -> plume_stage (BLOCKS / join / compute stages)
-    bool using_csv = false;   // -> plume_csv_stage
-    bool using_pq = false;    // -> plume_pq_stage
+    bool using_http = false;    // -> the runtime-provided HTTP function (file fetches)
+    bool using_stage = false;   // -> plume_stage (BLOCKS / join / compute stages)
+    bool using_csv = false;     // -> plume_csv_stage
+    bool using_pq_prep = false; // -> plume_pq_prepare
+    bool using_pq = false;      // -> plume_pq_stage
 
     void AppendDeclarations(std::ostringstream &out) const {
         if (using_http) {
             out << "function HTTP (requests) => (headers, bodies);\n";
         }
         if (using_stage) {
-            out << "function plume_stage (template, inData, inData2) => (outData" EXTRA_OUT_SET ");\n";
+            out << "function plume_stage (template, inData, inData2) => (outData, dynFilter" EXTRA_OUT_SET ");\n";
         }
         if (using_csv) {
-            out << "function plume_csv_stage (template, chunkInfo, inBuffers) => (outData" EXTRA_OUT_SET ");\n";
+            out << "function plume_csv_stage (template, chunkInfo, inBuffers) => (outData, dynFilter" EXTRA_OUT_SET ");\n";
+        }
+        if (using_pq_prep) {
+            out << "function plume_pq_prepare (config, footer, url, dynFilter) => (region, chunkReq" EXTRA_OUT_SET ");\n";
         }
         if (using_pq) {
-            out << "function plume_pq_stage (template, regionInfo, inBuffers) => (outData" EXTRA_OUT_SET ");\n";
+            out << "function plume_pq_stage (template, regionInfo, inBuffers, dynFilter) => (outData, dynFilter" EXTRA_OUT_SET ");\n";
         }
     }
 };
 
 } // namespace
 
-Result<DandelionComposition> BuildDandelionComposition(const PhysicalPlan &plan, const std::string &name) {
+Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con, 
+        const PhysicalPlan &plan, const std::string &name, const ConverterConfig &config) {
     DandelionComposition comp;
     comp.name = name;
 
-    // Iterate over stages adding the function application(s) and inputs of each.
     DeclarationTracker dt;
     std::ostringstream fappls;
+    std::ostringstream comp_input;
+    auto add_input = [&comp, &comp_input](DataItemVec &&set, const std::string &in_name) {
+        comp.in_sets.push_back(set);
+        comp_input << in_name << ", ";
+    };
+    auto dyn_filter_output = [](const parser::Stage &s) -> std::string {
+        return s.ProducesDynFilter() ? ", " + DynFilterVar(static_cast<int>(s.idx)) + " = dynFilter" : "";
+    };
     for (const auto &stage : plan.stages) {
         std::string st_var = StageTemplVar(stage->idx);
+        comp_input << st_var << ", ";
+        comp.in_sets.push_back({DataItem{0, "", plume::SerializePipeline(stage->pipeline)}});
 
-        StageTemplate templ;
-        templ.var = st_var;
-        templ.buf = plume::SerializePipeline(stage->pipeline);
-        comp.stage_templates.push_back(std::move(templ));
-
-        if (stage->is_leaf()) {
+        if (stage->IsLeaf()) {
             LeafStage *leaf_stage = static_cast<LeafStage*>(stage.get());
             const auto &data_source = leaf_stage->data_source;
+            const auto &projection = leaf_stage->projection ? *leaf_stage->projection : std::vector<uint32_t>{};
+            const expr::ExprNode *filter = leaf_stage->pushed_filter.get();
+
             switch (data_source->type) {
             case DataSourceType::LOCAL_TABLE: {
                 dt.using_stage = true;
                 std::string data_var = TableInVar(stage->idx);
-                comp.table_inputs.push_back({
-                    data_var, data_source, 
-                    leaf_stage->projection, leaf_stage->pushed_filter
-                });
+
+                auto table_source = std::static_pointer_cast<LocalTableDataSource>(data_source);
+                TRY(auto materialized, MaterializeTable(con, *table_source, projection, filter));
+                add_input(std::move(materialized), data_var);
+
                 fappls << "  plume_stage (template = all " << st_var << ", inData = keyed "
-                       << data_var << ") => (" << OutVar(stage->idx) << " = outData);\n";
+                       << data_var << ") => (" << OutVar(stage->idx) << " = outData"
+                       << dyn_filter_output(*stage) << ");\n";
                 break;
             }
             case DataSourceType::REMOTE_PARQUET:
@@ -102,22 +138,63 @@ Result<DandelionComposition> BuildDandelionComposition(const PhysicalPlan &plan,
 
                 if (data_source->type == DataSourceType::REMOTE_PARQUET) {
                     dt.using_pq = true;
+
+                    auto pq_src = std::static_pointer_cast<RemoteParquetDataSource>(leaf_stage->data_source);
+                    // Pruning dynamic filters go through pq_prepare before the fetch. pq_stage
+                    // evaluates every filter (pruning or probe-only) on the rows.
+                    std::string stage_dyn_filter;
+                    if (leaf_stage->ConsumesDynFilter()) {
+                        stage_dyn_filter = ", dynFilter = " + DynFilterBinding(leaf_stage->DynFilterSourceStages());
+                    }
+                    if (leaf_stage->PrunesByDynFilter()) {
+                        std::vector<exec::DynamicFilterProbeSpec> prune_filters;
+                        for (const auto &in : leaf_stage->dynamic_filter_inputs) {
+                            if (in.prune) {
+                                prune_filters.push_back({in.filter_id, in.file_column});
+                            }
+                        }
+                        dt.using_pq_prep = true;
+                        std::string cfg_var = "cfg_" + std::to_string(stage->idx);
+                        std::string footer_var = "ftr_" + std::to_string(stage->idx);
+                        std::string url_var = "url_" + std::to_string(stage->idx);
+                        auto pq_prepare_inputs = BuildParquetPrepareInputs(*pq_src, projection, filter,
+                            std::move(prune_filters), leaf_stage->source_splits,
+                            config.coalesce_distance, config.max_region_bytes);
+                        add_input(std::move(pq_prepare_inputs.cfg), cfg_var);
+                        add_input(std::move(pq_prepare_inputs.footers), footer_var);
+                        add_input(std::move(pq_prepare_inputs.urls), url_var);
+
+                        fappls << "  plume_pq_prepare (config = all " << cfg_var
+                              << ", footer = anyKeyed " << footer_var
+                              << ", url = anyKeyed " << url_var << ", dynFilter = "
+                              << DynFilterBinding(leaf_stage->DynFilterSourceStages(/*prune_only=*/true))
+                              << ") => (" << info_var << " = region, " 
+                              << req_var << " = chunkReq) by footer inner url;\n";
+                    } else {
+                        TRY(auto pq_stage_inputs, BuildParquetStageInputs(*pq_src, projection, filter,
+                            leaf_stage->source_splits, config.coalesce_distance, config.max_region_bytes));
+                        add_input(std::move(pq_stage_inputs.region_info), info_var);
+                        add_input(std::move(pq_stage_inputs.chunk_reqs), req_var);
+                    }
+
                     fappls << "  HTTP (requests = each " << req_var << ") => (" << data << " = bodies);\n";
                     fappls << "  plume_pq_stage (template = all " << st_var << ", regionInfo = keyed " << info_var
-                           << ", inBuffers = keyed " << data << ") => (" << OutVar(stage->idx) 
-                           << " = outData) by regionInfo inner inBuffers;\n";
+                           << ", inBuffers = keyed " << data << stage_dyn_filter << ") => (" << OutVar(stage->idx)
+                           << " = outData" << dyn_filter_output(*stage) << ") by regionInfo inner inBuffers;\n";
                 } else {
                     dt.using_csv = true;
+
+                    auto csv_src = std::static_pointer_cast<RemoteCSVDataSource>(leaf_stage->data_source);
+                    TRY(auto csv_stage_inputs,
+                        BuildCSVStageInputs(*csv_src, projection, leaf_stage->source_splits, config.max_region_bytes));
+                    add_input(std::move(csv_stage_inputs.chunk_info), info_var);
+                    add_input(std::move(csv_stage_inputs.chunk_reqs), req_var);
+
                     fappls << "  HTTP (requests = each " << req_var << ") => (" << data << " = bodies);\n";
                     fappls << "  plume_csv_stage (template = all " << st_var << ", chunkInfo = keyed " << info_var
-                           << ", inBuffers = keyed " << data << ") => (" << OutVar(stage->idx) 
-                           << " = outData) by chunkInfo inner inBuffers;\n";
+                           << ", inBuffers = keyed " << data << ") => (" << OutVar(stage->idx)
+                           << " = outData" << dyn_filter_output(*stage) << ") by chunkInfo inner inBuffers;\n";
                 }
-
-                comp.remote_inputs.push_back({
-                    std::move(info_var), std::move(req_var), data_source,
-                    leaf_stage->projection, leaf_stage->pushed_filter, leaf_stage->source_splits
-                });
                 break;
             }
             }
@@ -132,14 +209,14 @@ Result<DandelionComposition> BuildDandelionComposition(const PhysicalPlan &plan,
                    << (in_parallel ? "keyed" : "all") << " " << OutVar(stage->input_stages[0]);
             
             bool in2_parallel = false;
-            if (stage->leads_with_join()) {
+            if (stage->LeadsWithJoin()) {
                 in2_parallel = plan.stages[stage->input_stages[1]]->pipeline.output_split.partitions > 1;
                 fappls << ", inData2 = " << (in2_parallel ? "keyed" : "all") << " "
                        << OutVar(stage->input_stages[1]);
             }
     
-            fappls << ") => (" << OutVar(stage->idx) << " = outData)";
-            if (stage->leads_with_join() && in_parallel && in2_parallel) {
+            fappls << ") => (" << OutVar(stage->idx) << " = outData" << dyn_filter_output(*stage) << ")";
+            if (stage->LeadsWithJoin() && in_parallel && in2_parallel) {
                 auto join_template = std::static_pointer_cast<exec::JoinTemplate>(stage->pipeline.operators[0]);
                 const char *join_strategy;
                 switch (join_template->kind) {
@@ -167,32 +244,51 @@ Result<DandelionComposition> BuildDandelionComposition(const PhysicalPlan &plan,
             fappls << ";\n";
         }
     }
+    std::string comp_input_str = comp_input.str();
+    if (comp_input_str.size() >= 2) {
+        comp_input_str.resize(comp_input_str.size() - 2); // remove trailing ", "
+    }
 
     // Write final composition dsl.
     std::ostringstream out;
     dt.AppendDeclarations(out);
-    out << "\ncomposition " << name << " (";
-    bool first = true;
-    auto param = [&](const std::string &p) {
-        out << (first ? "" : ", ") << p;
-        first = false;
-    };
-    for (const auto &ti : comp.table_inputs) {
-        param(ti.var);
-    }
-    for (const auto &ri : comp.remote_inputs) {
-        param(ri.var_info);
-        param(ri.var_req);
-    }
-    for (const auto &st : comp.stage_templates) {
-        param(st.var);
-    }
-    out << ") => (" << OutVar(plan.root_idx) << ") {\n";
+    out << "\ncomposition " << name << " (" << comp_input_str << ") => (" << OutVar(plan.root_idx) << ") {\n";
     out << fappls.str();
     out << "}\n";
+    
     comp.dsl = out.str();
-
     return comp;
+}
+
+Result<std::vector<std::string>> ParseCompositionInputNames(const DandelionComposition &comp) {
+    const std::string marker = "composition " + comp.name + " (";
+    size_t start = comp.dsl.find(marker);
+    if (start == std::string::npos) {
+        return Error("dsl does not contain a 'composition " + comp.name + " (' header", ErrorKind::InvalidInput);
+    }
+    start += marker.size();
+    size_t end = comp.dsl.find(')', start);
+    if (end == std::string::npos) {
+        return Error("dsl composition header is missing its closing ')'", ErrorKind::InvalidInput);
+    }
+
+    std::vector<std::string> names;
+    const std::string params = comp.dsl.substr(start, end - start);
+    size_t pos = 0;
+    while (pos < params.size()) {
+        size_t comma = params.find(',', pos);
+        std::string tok = params.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        size_t a = tok.find_first_not_of(" \t");
+        if (a != std::string::npos) {
+            size_t b = tok.find_last_not_of(" \t");
+            names.push_back(tok.substr(a, b - a + 1));
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return names;
 }
 
 //===----------------------------------------------------------------------===//
@@ -224,44 +320,10 @@ BinaryData RegistrationBody(const DandelionComposition& comp) {
     return json::to_bson(body);
 }
 
-Result<BinaryData> InvocationBody(const DandelionComposition& comp,
-        const DataSetVec &table_blocks, const DataSetVec &remote_infos, 
-        const DataSetVec &remote_reqs, bool is_registered) {
-    if (table_blocks.size() != comp.table_inputs.size()) {
-        return Error("table_blocks size does not match composition table inputs size.");
-    }
-    if (remote_infos.size() != comp.remote_inputs.size()) {
-        return Error("remote_infos size does not match composition remote inputs size.");
-    }
-    if (remote_reqs.size() != comp.remote_inputs.size()) {
-        return Error("remote_infos size does not match composition remote inputs size.");
-    }
-
+Result<BinaryData> InvocationBody(const DandelionComposition& comp, bool is_registered) {
     json sets;
-
-    // First sets correspond to table input data.
-    for (size_t i = 0; i < comp.table_inputs.size(); i++) {
-        sets.push_back(SourceItemSet(comp.table_inputs[i].var, table_blocks[i]));
-    }
-
-    // Next sets correspond to remote input data.
-    for (size_t i = 0; i < comp.remote_inputs.size(); i++) {
-        sets.push_back(SourceItemSet(comp.remote_inputs[i].var_info, remote_infos[i]));
-        sets.push_back(SourceItemSet(comp.remote_inputs[i].var_req, remote_reqs[i]));
-    }
-
-    // Remaining sets are stage pipeline templates.
-    for (const auto& st : comp.stage_templates) {
-        json items;
-        items.push_back(json{
-            {"identifier", ""},
-            {"key", 0},
-            {"data", json::binary(st.buf)}
-        });
-        sets.push_back(json{
-            {"identifier", ""},
-            {"items", items}
-        });
+    for (const auto &set : comp.in_sets) {
+        sets.push_back(SourceItemSet("", set));
     }
 
     json body;

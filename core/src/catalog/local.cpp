@@ -34,7 +34,7 @@ std::shared_ptr<DataSource> CreateTableSource(std::string name, Schema schema) {
 }
 
 Result<dandelion::DataItemVec> MaterializeTable(duckdb::Connection &con, const LocalTableDataSource &src, 
-        const std::vector<uint32_t> *projection, const ExprNode *pushed_filter) {
+        const std::vector<uint32_t> &projection, const ExprNode *pushed_filter) {
     if (!src.schema) {
         return Error("Table has no schema defined.", ErrorKind::RuntimeError);
     }

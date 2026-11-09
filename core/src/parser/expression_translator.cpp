@@ -2,6 +2,7 @@
 
 #include "plume/common/result.hpp"
 
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -103,6 +104,80 @@ Result<expr::ExprNode> TranslateExpression(const Expression &expr) {
                 std::string(duckdb::ExpressionTypeToString(expr.GetExpressionType())),
             ErrorKind::NotImplemented);
     }
+}
+
+Result<expr::ExprNode> CombinePredicates(const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &predicates) {
+    if (predicates.size() == 1) {
+        return TranslateExpression(*predicates[0]);
+    }
+    std::vector<expr::ExprNode> children;
+    children.reserve(predicates.size());
+    for (auto &p : predicates) {
+        TRY(auto child, TranslateExpression(*p));
+        children.push_back(std::move(child));
+    }
+    return expr::ExprNode::Conjunction(duckdb::ExpressionType::CONJUNCTION_AND, std::move(children));
+}
+
+Result<exec::AggregateSpec> TranslateAggregate(const duckdb::BoundAggregateExpression &agg) {
+    if (agg.filter) {
+        return Error("Aggregate FILTER clause is not supported.", ErrorKind::NotImplemented);
+    }
+    if (agg.order_bys) {
+        return Error("Ordered aggregates are not supported.", ErrorKind::NotImplemented);
+    }
+    exec::AggregateSpec spec;
+    // statistics_propagation can swap sum -> sum_no_overflow when it proves no
+    // overflow; Plume only registers plain sum (same result), so normalize back.
+    spec.func_name = (agg.function.name == "sum_no_overflow") ? "sum" : agg.function.name;
+    spec.return_type = FromLogicalType(agg.return_type);
+    spec.distinct = agg.IsDistinct();
+    spec.arguments.reserve(agg.children.size());
+    for (auto &child : agg.children) {
+        TRY(auto arg, TranslateExpression(*child));
+        spec.arguments.push_back(std::move(arg));
+    }
+    return spec;
+}
+
+Result<exec::JoinKind> JoinKindFromType(duckdb::JoinType type) {
+    switch (type) {
+    case duckdb::JoinType::INNER:
+        return exec::JoinKind::INNER;
+    case duckdb::JoinType::LEFT:
+        return exec::JoinKind::LEFT;
+    case duckdb::JoinType::RIGHT:
+        return exec::JoinKind::RIGHT;
+    case duckdb::JoinType::OUTER:
+        return exec::JoinKind::OUTER;
+    case duckdb::JoinType::SEMI:
+        return exec::JoinKind::SEMI;
+    case duckdb::JoinType::ANTI:
+        return exec::JoinKind::ANTI;
+    case duckdb::JoinType::SINGLE:
+        return exec::JoinKind::SINGLE;
+    case duckdb::JoinType::MARK:
+        return exec::JoinKind::MARK;
+    case duckdb::JoinType::RIGHT_SEMI:
+        return exec::JoinKind::RIGHT_SEMI;
+    case duckdb::JoinType::RIGHT_ANTI:
+        return exec::JoinKind::RIGHT_ANTI;
+    default:
+        return Error("Unsupported join type.", ErrorKind::NotImplemented);
+    }
+}
+
+Result<uint32_t> JoinKeyIndex(const duckdb::Expression &side) {
+    if (side.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+        return Error("Join keys must be plain columns (expression join keys not supported).",
+                     ErrorKind::NotImplemented);
+    }
+    return static_cast<uint32_t>(side.Cast<duckdb::BoundReferenceExpression>().index);
+}
+
+bool IsEquiCondition(const duckdb::JoinCondition &cond) {
+    return cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
+           cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 }
 
 } // namespace plume::parser

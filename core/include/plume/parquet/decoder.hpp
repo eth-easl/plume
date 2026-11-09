@@ -15,6 +15,7 @@
 
 namespace duckdb {
 class Vector;
+struct LogicalType;
 } // namespace duckdb
 
 namespace plume::parquet {
@@ -153,6 +154,13 @@ public:
     // PLAIN VARCHAR) length prefixes.
     void Skip(size_t n);
 
+    // The chunk's dictionary vector, if every data page is dictionary-encoded (so it holds
+    // every value of the chunk); nullptr otherwise or once a data page was read. It holds
+    // DictionaryVectorSize() entries, the last one a NULL. ReadInto's DICTIONARY_VECTORs
+    // reference it.
+    const duckdb::Vector *Dictionary(const duckdb::LogicalType &type);
+    size_t DictionaryVectorSize() const { return dict_size_ + 1; }
+
 private:
     bool EnterNextDataPage();
     void SkipInPage(size_t m); // advance value cursors over m rows, no materialization
@@ -160,7 +168,7 @@ private:
     // then emit a whole window as a DICTIONARY_VECTOR referencing it — no per-row
     // gather / string copy. Falls through to EmitFromPage when a window straddles
     // pages. See the DuckDB DictionaryDecoder::Read model.
-    void EnsureDictVector(const duckdb::Vector &like);
+    void EnsureDictVector(const duckdb::LogicalType &type);
     void EmitDictVector(duckdb::Vector &vec, size_t m);
     void SetupDictionaryPage(const uint8_t *page, size_t comp_size, size_t uncomp_size, size_t num_values);
     void SetupDataPage(const uint8_t *page, size_t comp_size, size_t uncomp_size, size_t num_values, bool is_v2,
@@ -181,6 +189,7 @@ private:
     size_t pos_ = 0;        // byte cursor: start of the next page header in `data_`
     size_t total_rows_ = 0; // from the header prescan
     size_t emitted_ = 0;    // rows emitted so far
+    bool all_dict_ = false; // a leading dictionary page, then only dictionary-encoded data pages
 
     // Dictionary — persists across the column chunk's data pages.
     ByteVec dict_raw_;

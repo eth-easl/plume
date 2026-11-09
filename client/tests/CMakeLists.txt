@@ -15,7 +15,8 @@ set(MOCK_RUNTIME_FN_SRC
   mock_runtime.cpp
   # plume_stage (BLOCKS / join stages)
   ${FN_SRC}/functions/stage.cpp
-  ${FN_SRC}/functions/output_split.cpp
+  ${FN_SRC}/util/dynamic_filter.cpp
+  ${FN_SRC}/util/output_split.cpp
   # csv source stages
   ${FN_SRC}/functions/csv_prepare.cpp
   ${FN_SRC}/functions/csv_stage.cpp

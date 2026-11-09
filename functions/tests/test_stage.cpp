@@ -4,10 +4,12 @@
 #include "abi_mock.hpp"
 #include "test_util.hpp"
 
+#include "plume/common/serial.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/expression/expression.hpp"
-#include "plume/functions/output_split.hpp"
+#include "split_output.hpp"
 #include "plume/functions/stage.hpp"
 #include "plume/memory/adapter.hpp"
 #include "plume/memory/allocator.hpp"
@@ -136,7 +138,7 @@ struct SplitStats {
     std::map<uint32_t, uint32_t> blocks_per_key;
 };
 
-SplitStats Inspect(const std::vector<fn::SplitBlock> &parts) {
+SplitStats Inspect(const std::vector<plume_test::SplitBlock> &parts) {
     SplitStats s;
     for (auto &sb : parts) {
         s.blocks_per_key[sb.key]++;
@@ -162,14 +164,14 @@ TEST_CASE("SplitOutput: coalesces a partition into one ~target block") {
     ChunkList chunks = MakeChunks(alloc, kRows, 7);
 
     // Large cap: the whole partition coalesces into ONE multi-chunk block.
-    auto big = fn::SplitOutput(split, RegionAmount(), chunks, 1u << 20).unwrap();
+    auto big = plume_test::SplitOutput(split, RegionAmount(), chunks, 1u << 20).unwrap();
     auto bs = Inspect(big);
     CHECK(bs.total_rows == kRows);
     CHECK(bs.blocks_per_key.size() == 1);            // a single partition received rows
     CHECK(bs.blocks_per_key.begin()->second == 1);   // coalesced into one block
 
     // Tiny cap: the same rows spill across several blocks (still all data).
-    auto small = fn::SplitOutput(split, RegionAmount(), chunks, 4096).unwrap();
+    auto small = plume_test::SplitOutput(split, RegionAmount(), chunks, 4096).unwrap();
     auto ss = Inspect(small);
     CHECK(ss.total_rows == kRows);
     CHECK(ss.blocks_per_key.begin()->second > 1);    // flushed at the byte cap
@@ -212,7 +214,7 @@ TEST_CASE("SplitOutput: hash round-trip preserves rows and routes by key") {
         chunks.push_back(std::move(c));
     }
 
-    auto parts = fn::SplitOutput(split, RegionAmount(), chunks, 1u << 20).unwrap();
+    auto parts = plume_test::SplitOutput(split, RegionAmount(), chunks, 1u << 20).unwrap();
     std::multiset<std::pair<int32_t, int32_t>> got;
     for (auto &sb : parts) {
         Schema schema;
@@ -239,7 +241,7 @@ TEST_CASE("SplitOutput: coalesced blocks respect the byte cap") {
     ChunkList chunks = MakeChunks(alloc, kRows, 7);
 
     const size_t cap = 8192;
-    auto parts = fn::SplitOutput(split, RegionAmount(), chunks, cap).unwrap();
+    auto parts = plume_test::SplitOutput(split, RegionAmount(), chunks, cap).unwrap();
     CHECK(parts.size() > 1); // spilled across many blocks, not one giant block
 
     // Flushing is chunk-granular (a whole input chunk is the smallest unit that gets
@@ -290,7 +292,7 @@ TEST_CASE("SplitOutput: varchar heap gather round-trips") {
         chunks.push_back(std::move(c));
     }
 
-    auto parts = fn::SplitOutput(split, schema, chunks, 1u << 20).unwrap();
+    auto parts = plume_test::SplitOutput(split, schema, chunks, 1u << 20).unwrap();
     std::multiset<std::pair<int32_t, std::string>> got;
     for (auto &sb : parts) {
         Schema out_schema;
@@ -305,6 +307,76 @@ TEST_CASE("SplitOutput: varchar heap gather round-trips") {
         }
     }
     CHECK(got == expected); // strings survive the heap gather intact
+}
+
+// --- dynamic filter build output --------------------------------------------
+
+TEST_CASE("plume_stage: emits dynamic filter bounds when the pipeline builds one") {
+    mock::Reset();
+    Allocator alloc;
+
+    // Pipeline: no row-shaping operators, just a DynamicFilterBuildTemplate over "amount"
+    // (column 1) -- a pure passthrough with the min/max side effect.
+    PipelineTemplate desc;
+    desc.input_schema = RegionAmount();
+    auto dyn_build = std::make_shared<DynamicFilterBuildTemplate>(/*column=*/1, I32());
+    desc.operators = {dyn_build};
+    auto blob = plume::SerializePipeline(desc);
+
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(mock::MakeBuffer(blob.data(), blob.size()));
+        return v;
+    }());
+    mock::SetInput(1, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(MakeBlock(alloc, {1, 2, 1}, {100, 50, -5}));
+        return v;
+    }());
+
+    CHECK(fn::RunStage().is_ok());
+
+    auto dyn_outs = mock::OutputsForSet(1);
+    CHECK(dyn_outs.size() == 1);
+    auto bounds =
+        DeserializeFromBytes<DynamicFilter>(dyn_outs[0]->buffer.data(), dyn_outs[0]->buffer.size());
+    CHECK(bounds.has_bounds);
+    CHECK(bounds.min == Value::INTEGER(-5));
+    CHECK(bounds.max == Value::INTEGER(100));
+
+    // The normal row output (set 0) is unaffected -- all 3 rows pass through unchanged.
+    int total = 0;
+    for (auto *out : mock::OutputsForSet(0)) {
+        Schema schema;
+        auto chunks = ImportBlockChunks(const_cast<uint8_t *>(out->buffer.data()), out->buffer.size(), schema).unwrap();
+        for (auto &c : chunks) {
+            total += c->size();
+        }
+    }
+    CHECK(total == 3);
+}
+
+TEST_CASE("plume_stage: no dynamic filter output when the pipeline builds none") {
+    mock::Reset();
+    Allocator alloc;
+
+    PipelineTemplate desc; // no operators at all
+    desc.input_schema = RegionAmount();
+    auto blob = plume::SerializePipeline(desc);
+
+    mock::SetInput(0, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(mock::MakeBuffer(blob.data(), blob.size()));
+        return v;
+    }());
+    mock::SetInput(1, [&] {
+        std::vector<DataBuffer> v;
+        v.push_back(MakeBlock(alloc, {1}, {10}));
+        return v;
+    }());
+
+    CHECK(fn::RunStage().is_ok());
+    CHECK(mock::OutputsForSet(1).empty());
 }
 
 int main() { return plume_test::RunAll(); }

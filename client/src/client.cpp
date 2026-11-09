@@ -19,9 +19,6 @@ namespace {
 CompiledQuery ToCompiledQuery(parser::CompiledComposition &&cc) {
     CompiledQuery out;
     out.composition = std::move(cc.composition);
-    out.table_blocks = std::move(cc.table_blocks);
-    out.remote_info = std::move(cc.remote_info);
-    out.remote_requests = std::move(cc.remote_requests);
     out.output_schema = std::move(cc.plan->output_schema);
     return out;
 }
@@ -45,7 +42,7 @@ std::string QueryResponse::ToString() {
 //===----------------------------------------------------------------------===//
 
 Result<dandelion::BinaryData> CompiledQuery::Request() {
-    return dandelion::InvocationBody(composition, table_blocks, remote_info, remote_requests);
+    return dandelion::InvocationBody(composition);
 }
 
 std::string CompiledQuery::ResultToString(const dandelion::BinaryData& data) {
@@ -76,8 +73,7 @@ Result<CompiledQuery> Client::Resolve(const std::string &sql, const std::string 
 Result<QueryResponse> Client::Execute(const std::string &sql, const ExecutionConfig &exec_cfg,
         const std::string &query_name) {
     TRY(auto cc, parser::CompileQuery(con_, *catalog_, sql, query_name, converter_cfg_, fetcher_threads_));
-    TRY(auto body, dandelion::InvocationBody(cc.composition, cc.table_blocks, cc.remote_info, cc.remote_requests,
-                                             /*is_registered=*/false));
+    TRY(auto body, dandelion::InvocationBody(cc.composition, /*is_registered=*/false));
 
     cpr::Response resp =
         cpr::Post(cpr::Url{exec_cfg.dandelion_url}, cpr::Body{reinterpret_cast<const char *>(body.data()), body.size()},

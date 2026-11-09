@@ -35,6 +35,12 @@ Plain `.sql` files under `tpch/queries/`, referencing tables as `[table]` placeh
 | `resultsPrefix` | Output directory for result files (empty => console only). |
 | `preAggregate`, `projectionPushdown`, `filterPushdown` | `CompileQuery` converter toggles (default on). |
 | `maxSplits`, `targetRowsPerSplit`, `maxRegionSize` | `CompileQuery` converter split tuning. |
+| `coalesceDistance` | Maximum byte gap between parquet range requests that are merged into one. |
+| `dynamicFilter` | Enables dynamic filters (default on). |
+| `dynamicFilterMaxMatchFraction`, `dynamicFilterSelectivityThreshold` | Estimated selectivity a transfer must reach (share of the key's distinct values / of the target's rows). |
+| `dynamicFilterMaxRowgroupCoverage` | Mean row-group key-range coverage up to which a filter prunes in `pq_prepare` (prune mode). |
+| `dynamicFilterMaxValues`, `dynamicFilterBloomBitsPerKey`, `dynamicFilterMaxBloomBytes` | Filter sizing: exact key set limit, Bloom bits per key, Bloom size cap. |
+| `dynamicFilterMaxChainDepth` | Maximum length of a chain of dynamic filters. |
 | `scaleFactor` | Scale-factor label used to look up expected checksums (trace mode uses its own column). |
 | `checksumFile` | Path to checksum file for correctness checking (empty => no checks, see Correctness Checking below). |
 | `benchmarkConfig` | Type-specific settings (see Benchmark types). |

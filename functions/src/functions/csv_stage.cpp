@@ -4,18 +4,23 @@
 #include "plume/execution/executor.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/functions/csv.hpp"
-#include "plume/functions/output_split.hpp"
+#include "plume/util/dynamic_filter.hpp"
+#include "plume/util/output_split.hpp"
 #include "plume/memory/allocator.hpp"
 
 #include <map>
 #include <vector>
 
-/// The first input set (index 0) should have one item containing the pipeline template.
+// The first input set (index 0) should have one item containing the pipeline template.
 #define SET_IDX_IN_PIPELINE_TEMPL 0
-/// The second input set (index 1) should have the items containing the csv chunk infos.
+// The second input set (index 1) should have the items containing the csv chunk infos.
 #define SET_IDX_IN_CHUNK_INFO 1
-/// The third input set (index 2) should have the items containing the resolved data buffers.
+// The third input set (index 2) should have the items containing the resolved data buffers.
 #define SET_IDX_IN_DATA_BUFFERS 2
+
+// The first output set (index 0) contains the normal row output.
+// The second output set (index 1) contains the dynamic filters each as a single item.
+#define SET_IDX_OUT_DYNAMIC_FILTER 1
 
 namespace plume::fn {
 
@@ -30,7 +35,7 @@ Result<void> RunCSVStage() {
     exec::Executor executor(alloc);
     {
         PLUME_TRACE_STAGE(trace::Phase::SETUP);
-        TRYV(executor.Build(desc, MakeSink(desc.output_sink, abi::AddOutput)));
+        TRYV(executor.Build(desc, util::MakeSink(desc.output_sink, abi::AddOutput)));
     }
 
     TRY(auto chunk_info_itms, abi::GetInputSet(SET_IDX_IN_CHUNK_INFO));
@@ -39,6 +44,7 @@ Result<void> RunCSVStage() {
         return Error("Number of chunk info items does not match number of raw data buffer items.", ErrorKind::InvalidInput);
     }
     if (chunk_info_itms.empty()) {
+        util::EmitDynamicFilters(executor, SET_IDX_OUT_DYNAMIC_FILTER);
         return Ok();
     }
 
@@ -64,6 +70,7 @@ Result<void> RunCSVStage() {
     }
 
     TRYV(executor.Finish());
+    util::EmitDynamicFilters(executor, SET_IDX_OUT_DYNAMIC_FILTER);
 
 #if defined(PLUME_VERBOSE) && PLUME_VERBOSE >= 1
     alloc.PrintStats();

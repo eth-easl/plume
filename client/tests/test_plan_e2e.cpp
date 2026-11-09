@@ -3,7 +3,11 @@
 #include "test_util.hpp"
 
 #include "plume/catalog/catalog.hpp"
+#include "plume/catalog/parquet.hpp"
+#include "plume/catalog/plume_remote.hpp"
+#include "plume/catalog/remote_resolver.hpp"
 #include "plume/dandelion/composition.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/join.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/memory/adapter.hpp"
@@ -13,7 +17,10 @@
 #include "duckdb/common/types/data_chunk.hpp"
 
 #include <algorithm>
+#include <cstring>
+#include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -120,6 +127,130 @@ duckdb::Connection MakeDb(duckdb::DuckDB &db) {
     con.Query("CREATE TABLE tiers(t_id INTEGER, label VARCHAR)");
     con.Query("INSERT INTO tiers VALUES (1, 'gold'), (2, 'silver'), (3, 'bronze')");
     return con;
+}
+
+// --- dynamic filter (join build -> remote parquet probe scan pruning) helpers ----------
+
+// A resolved (schema + cardinality already set) fake REMOTE_PARQUET source, so tests can
+// exercise Converter's dynamic-filter attachment without a real remote fetch/resolve.
+struct FakeRemoteOrders : RemoteParquetDataSource {
+    // `cust_ranges`: per row group [min, max] footer statistics of "cust" (none if empty).
+    explicit FakeRemoteOrders(uint64_t card, const std::vector<std::pair<int32_t, int32_t>> &cust_ranges = {}) {
+        name = "remote_orders";
+        schema = Schema{{{"o_id", {TypeId::INT32}, false}, {"cust", {TypeId::INT32}, false}}};
+        cardinality_total = card;
+        // Never actually parsed by these tests (Resolve() is stubbed out below), but
+        // BuildParquetPrepareInputs/BuildParquetStageInputs index into paths/footer_bytes
+        // 1:1, so they need to be present and the same size.
+        paths = {"fake://remote_orders.parquet"};
+        footer_bytes = {{0}};
+        parquet::FileMeta meta;
+        meta.schema = *schema;
+        for (auto [lo, hi] : cust_ranges) {
+            auto stat = [](int32_t v) {
+                std::vector<uint8_t> b(4);
+                std::memcpy(b.data(), &v, 4);
+                return b;
+            };
+            parquet::RowGroupMeta rg;
+            rg.columns.resize(2);
+            rg.columns[1].stats.has_min = rg.columns[1].stats.has_max = true;
+            rg.columns[1].stats.min_value = stat(lo);
+            rg.columns[1].stats.max_value = stat(hi);
+            meta.row_groups.push_back(rg);
+        }
+        metadata.push_back(std::move(meta));
+    }
+    Result<void> Resolve(const RemoteResolver &) override { return Ok(); }
+};
+
+// A fresh in-memory DB with a small local `customers` table and `remote_orders` registered
+// as a plume_remote(...) source of `orders_cardinality` estimated rows.
+duckdb::Connection MakeRemoteJoinDb(duckdb::DuckDB &db, uint64_t orders_cardinality,
+                                    const std::vector<std::pair<int32_t, int32_t>> &cust_ranges = {},
+                                    std::shared_ptr<DataSource> extra_source = nullptr) {
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE customers(cust INTEGER, name VARCHAR)");
+    con.Query("INSERT INTO customers VALUES (1, 'alice'), (2, 'bob')");
+
+    auto catalog_ptr = std::make_shared<SourceCatalog>();
+    CHECK(catalog_ptr->Add(std::make_shared<FakeRemoteOrders>(orders_cardinality, cust_ranges)).is_ok());
+    if (extra_source) {
+        CHECK(catalog_ptr->Add(std::move(extra_source)).is_ok());
+    }
+    auto registry = duckdb::make_shared_ptr<PlumeRemoteInfo>();
+    registry->catalog = catalog_ptr;
+    RegisterPlumeRemote(con, std::move(registry));
+    return con;
+}
+
+const LeafStage *FindLeaf(const PhysicalPlan &plan, const std::string &source_name) {
+    for (auto &s : plan.stages) {
+        if (!s->IsLeaf()) continue;
+        auto *leaf = static_cast<const LeafStage *>(s.get());
+        if (leaf->data_source->name == source_name) {
+            return leaf;
+        }
+    }
+    return nullptr;
+}
+
+size_t CountLeaves(const PhysicalPlan &plan, DataSourceType type) {
+    size_t n = 0;
+    for (auto &s : plan.stages) {
+        if (s->IsLeaf() && static_cast<const LeafStage &>(*s).data_source->type == type) {
+            n++;
+        }
+    }
+    return n;
+}
+
+// Every stage's serialized pipeline template: BuildDandelionComposition names each
+// one `st_<idx>` in the DSL, so pull those names back out via
+// ParseCompositionInputNames and match them 1:1 against comp.in_sets.
+std::vector<const dandelion::BinaryData *> StageTemplates(const dandelion::DandelionComposition &comp) {
+    auto names = dandelion::ParseCompositionInputNames(comp).unwrap();
+    CHECK(names.size() == comp.in_sets.size());
+    std::vector<const dandelion::BinaryData *> out;
+    for (size_t i = 0; i < names.size() && i < comp.in_sets.size(); i++) {
+        if (names[i].rfind("st_", 0) == 0 && !comp.in_sets[i].empty()) {
+            out.push_back(&comp.in_sets[i][0].data);
+        }
+    }
+    return out;
+}
+
+// The pipeline's DynamicFilterBuildTemplates.
+std::vector<const exec::DynamicFilterBuildTemplate *> DynamicFilterBuilds(const Stage &stage) {
+    std::vector<const exec::DynamicFilterBuildTemplate *> out;
+    for (auto &op : stage.pipeline.operators) {
+        if (auto *d = dynamic_cast<exec::DynamicFilterBuildTemplate *>(op.get())) {
+            out.push_back(d);
+        }
+    }
+    return out;
+}
+
+// The pipeline's DynamicFilterBuildTemplate of filter `filter_id`, or nullptr.
+const exec::DynamicFilterBuildTemplate *FindDynamicFilterBuild(const Stage &stage, uint32_t filter_id) {
+    for (auto *d : DynamicFilterBuilds(stage)) {
+        if (d->filter_id == filter_id) {
+            return d;
+        }
+    }
+    return nullptr;
+}
+
+// The leaf's only dynamic filter input.
+const DynamicFilterInput &OnlyDynFilter(const LeafStage *leaf) {
+    CHECK(leaf != nullptr);
+    CHECK(leaf->dynamic_filter_inputs.size() == 1);
+    return leaf->dynamic_filter_inputs[0];
+}
+
+bool HasDynFilter(const LeafStage *leaf) {
+    CHECK(leaf != nullptr);
+    return leaf->ConsumesDynFilter();
 }
 
 } // namespace
@@ -349,18 +480,19 @@ TEST_CASE("composition: structure for a single source stage") {
     duckdb::DuckDB db(nullptr);
     auto con = MakeDb(db);
     auto plan = BuildPhysicalPlan(con, "SELECT o_id, amount FROM orders WHERE amount > 20").unwrap();
-    auto comp = dandelion::BuildDandelionComposition(*plan, "Q").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "Q", ConverterConfig{}).unwrap();
 
-    CHECK(comp.table_inputs.size() == 1);             // one base table (orders)
-    CHECK(comp.stage_templates.size() == plan->stages.size());
-    CHECK(comp.table_inputs[0].source->name == "orders");
+    CHECK(CountLeaves(*plan, DataSourceType::LOCAL_TABLE) == 1); // one base table (orders)
+    CHECK(FindLeaf(*plan, "orders") != nullptr);
     CHECK(Contains(comp.dsl, "composition Q ("));
     // The template is broadcast to every invocation (`all`); a LOCAL_TABLE source
     // reads its host-provided blocks keyed by block index (`keyed`/`anyKeyed`).
     CHECK(ContainsKeyed(comp.dsl, "plume_stage (template = all st_0, inData = ", " tin_0)"));
-    // Every option set is a valid serialized pipeline template.
-    for (auto &st : comp.stage_templates) {
-        CHECK(plume::DeserializePipeline(st.buf).is_ok());
+    // Every stage's template set is a valid serialized pipeline template.
+    auto templates = StageTemplates(comp);
+    CHECK(templates.size() == plan->stages.size());
+    for (auto &st : templates) {
+        CHECK(plume::DeserializePipeline(*st).is_ok());
     }
 }
 
@@ -372,10 +504,10 @@ TEST_CASE("composition: three-table join wiring") {
                                   "JOIN customers c ON o.cust = c.c_id "
                                   "JOIN tiers t ON c.tier = t.t_id")
                     .unwrap();
-    auto comp = dandelion::BuildDandelionComposition(*plan, "J3").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "J3", ConverterConfig{}).unwrap();
 
-    CHECK(comp.table_inputs.size() == 3);            // orders, customers, tiers
-    CHECK(comp.stage_templates.size() == plan->stages.size());
+    CHECK(CountLeaves(*plan, DataSourceType::LOCAL_TABLE) == 3); // orders, customers, tiers
+    CHECK(StageTemplates(comp).size() == plan->stages.size());
     CHECK(Contains(comp.dsl, "inData2 = all"));     // joins wired with a build side
     // Two join stages -> two `inData2` references.
     size_t joins = 0, pos = 0;
@@ -396,7 +528,9 @@ TEST_CASE("composition: data parallelism emits keyed shardings") {
                                   "ON o.cust = c.c_id GROUP BY c.name",
                                   {}, Cfg(true, /*max_splits=*/4, /*target_rows_per_split=*/1))
                     .unwrap();
-    auto comp = dandelion::BuildDandelionComposition(*plan, "P").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "P", Cfg(true, /*max_splits=*/4,
+                                                                          /*target_rows_per_split=*/1))
+                    .unwrap();
 
     // The join's two inputs are both consumed keyed (co-partitioned on the join key).
     CHECK(ContainsKeyed(comp.dsl, "inData = ", ""));
@@ -407,13 +541,11 @@ TEST_CASE("composition: data parallelism emits keyed shardings") {
     CHECK(!Contains(comp.dsl, ");\n by inData"));
 
     // At a single split every edge is a plain gather (`all`), no keyed sharding.
-    auto serial = dandelion::BuildDandelionComposition(
-                      *BuildPhysicalPlan(con,
+    auto serial_plan = BuildPhysicalPlan(con,
                                         "SELECT c.name, sum(o.amount) FROM orders o JOIN customers c "
                                         "ON o.cust = c.c_id GROUP BY c.name")
-                          .unwrap(),
-                      "S")
-                      .unwrap();
+                          .unwrap();
+    auto serial = dandelion::BuildDandelionComposition(con, *serial_plan, "S", ConverterConfig{}).unwrap();
     CHECK(!ContainsKeyed(serial.dsl, "", " out_"));
 }
 
@@ -431,7 +563,7 @@ TEST_CASE("composition: cross join gives the probe side keyed sharding, "
 
     const Stage *join = nullptr;
     for (const auto &s : plan->stages) {
-        if (s->leads_with_join()) {
+        if (s->LeadsWithJoin()) {
             join = s.get();
         }
     }
@@ -444,7 +576,9 @@ TEST_CASE("composition: cross join gives the probe side keyed sharding, "
         CHECK(build_split.partitions <= 1);       // the smaller side stays single-partition
     }
 
-    auto comp = dandelion::BuildDandelionComposition(*plan, "X").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "X",
+                                                     Cfg(true, /*max_splits=*/4, /*target_rows_per_split=*/1))
+                    .unwrap();
     CHECK(ContainsKeyed(comp.dsl, "inData = ", ""));  // probe: keyed
     CHECK(Contains(comp.dsl, "inData2 = all "));      // build: broadcast to every invocation
     // No pairing clause: a broadcast edge already reaches every invocation, there's
@@ -472,7 +606,7 @@ size_t CountOps(const PhysicalPlan &plan, exec::OpType type) {
 // join stages' outputs, not source stages.)
 bool AnyJoinOutputCarries(const PhysicalPlan &plan, const std::string &col_name) {
     for (const auto &stage : plan.stages) {
-        if (!stage->leads_with_join()) {
+        if (!stage->LeadsWithJoin()) {
             continue;
         }
         for (const auto &col : stage->output_schema.columns) {
@@ -601,7 +735,7 @@ TEST_CASE("split: join inputs co-partition by their join keys") {
 
     const Stage *join = nullptr;
     for (const auto &s : plan->stages) {
-        if (s->leads_with_join()) {
+        if (s->LeadsWithJoin()) {
             join = s.get();
         }
     }
@@ -714,7 +848,7 @@ TEST_CASE("composition: uncorrelated scalar subquery comparison gives the "
 
     const Stage *join = nullptr;
     for (const auto &s : plan->stages) {
-        if (s->leads_with_join()) {
+        if (s->LeadsWithJoin()) {
             join = s.get();
         }
     }
@@ -730,7 +864,9 @@ TEST_CASE("composition: uncorrelated scalar subquery comparison gives the "
         CHECK(build_split.partitions <= 1);       // the one-row avg subquery stays single-partition
     }
 
-    auto comp = dandelion::BuildDandelionComposition(*plan, "Y").unwrap();
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "Y",
+                                                     Cfg(true, /*max_splits=*/8, /*target_rows_per_split=*/1))
+                    .unwrap();
     CHECK(ContainsKeyed(comp.dsl, "inData = ", ""));
     CHECK(Contains(comp.dsl, "inData2 = all "));
     CHECK(!Contains(comp.dsl, "by inData"));
@@ -865,10 +1001,11 @@ TEST_CASE("composition: CTE/DELIM plan wires stage-output fan-out") {
     }
     CHECK(fan_out);
 
-    auto comp = dandelion::BuildDandelionComposition(*plan, "Q2").unwrap();
-    CHECK(comp.stage_templates.size() == plan->stages.size());
-    for (auto &st : comp.stage_templates) {
-        CHECK(plume::DeserializePipeline(st.buf).is_ok());
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "Q2", ConverterConfig{}).unwrap();
+    auto templates = StageTemplates(comp);
+    CHECK(templates.size() == plan->stages.size());
+    for (auto &st : templates) {
+        CHECK(plume::DeserializePipeline(*st).is_ok());
     }
 }
 
@@ -895,6 +1032,612 @@ TEST_CASE("e2e: Q15-shaped shared aggregate (CTE feeds join + scalar subquery)")
         "ORDER BY s.supp";
     ExpectMatch(con, sql, /*ordered=*/true, {}, /*pre_aggregate=*/true, /*max_splits=*/4);
     ExpectMatch(con, sql, /*ordered=*/true, {}, /*pre_aggregate=*/false, /*max_splits=*/4);
+}
+
+// --- dynamic filter (join build -> remote parquet probe scan pruning) ------------------
+
+TEST_CASE("dynamic filter: attaches to an INNER join's build side, marks the remote probe leaf") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
+    auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                       "JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
+                    .unwrap();
+
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    const auto &in = OnlyDynFilter(orders);
+    CHECK(in.file_column == 1); // "cust" is file column 1 of (o_id, cust)
+    CHECK(orders->projection);
+    CHECK(int32_t(in.scan_column) == parquet::ScanColumnIndex(*orders->projection, int32_t(in.file_column)));
+    CHECK(in.source_stage < plan->stages.size());
+    CHECK_MSG(!in.prune, "no footer statistics -> nothing to prune, probe only");
+    // pq_stage learns the probe column from the scan's pipeline.
+    CHECK(orders->pipeline.dynamic_filter_probes.size() == 1);
+    CHECK(orders->pipeline.dynamic_filter_probes[0] == (exec::DynamicFilterProbeSpec{in.filter_id, in.scan_column}));
+
+    const Stage &build_stage = *plan->stages[in.source_stage];
+    const auto *dyn = FindDynamicFilterBuild(build_stage, in.filter_id);
+    CHECK(dyn != nullptr);
+    CHECK(dyn->column == 0); // "cust" is column 0 of customers(cust, name)
+
+    // The producer -> consumer link is the reverse of the consumer -> producer one.
+    CHECK(build_stage.ProducesDynFilter());
+    CHECK(build_stage.dynamic_filter_outputs == std::vector<uint32_t>{in.filter_id});
+}
+
+// Regression test: the dynamic filter's build side above is a plain local table, so the
+// producing stage is a LOCAL_TABLE *leaf* stage, not a COMMON/JOIN one -- the common
+// case, not an edge case (a join's build side isn't restricted to any particular
+// stage type). BuildDandelionComposition must still bind that stage's dynFilter
+// output: every leaf-stage branch used to skip the ProducesDynFilter() check (only the
+// non-leaf branch did it), so plume_pq_prepare's `dynFilter = all dfltr_N` referenced a
+// variable nothing in the composition body ever produced.
+TEST_CASE("dynamic filter: producing leaf stage's dynFilter output is actually bound in the dsl") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
+    auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                       "JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
+                    .unwrap();
+
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    const Stage &build_stage = *plan->stages[OnlyDynFilter(orders).source_stage];
+    CHECK(build_stage.ProducesDynFilter());
+    CHECK(build_stage.IsLeaf()); // the case this regression test targets
+
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", Cfg(true)).unwrap();
+
+    const std::string dyn_var = "dfltr_" + std::to_string(build_stage.idx);
+    // pq_stage consumes it by name (no row-group statistics -> no pq_prepare)...
+    CHECK(Contains(comp.dsl, "inBuffers = keyed data_" + std::to_string(orders->idx) + ", dynFilter = all " + dyn_var));
+    CHECK(!Contains(comp.dsl, "plume_pq_prepare ("));
+    // ...and the producing stage's own function application must actually bind it as an
+    // output, or the reference above is dangling.
+    CHECK(Contains(comp.dsl, dyn_var + " = dynFilter"));
+    // The function it's declared on must expose the output at all.
+    CHECK(Contains(comp.dsl, "=> (outData, dynFilter"));
+}
+
+TEST_CASE("dynamic filter: probe column sorted in the files -> pq_prepare prunes before the fetch") {
+    duckdb::DuckDB db(nullptr);
+    // "cust" row groups [0,99], [100,199], ... -> each spans 1/4 of the range.
+    auto con = MakeRemoteJoinDb(db, 1'000'000, {{0, 99}, {100, 199}, {200, 299}, {300, 399}});
+    auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                       "JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
+                    .unwrap();
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    CHECK(OnlyDynFilter(orders).prune);
+
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", Cfg(true)).unwrap();
+    const std::string dyn_var = "dfltr_" + std::to_string(OnlyDynFilter(orders).source_stage);
+    CHECK(Contains(comp.dsl, "url = anyKeyed url_" + std::to_string(orders->idx) + ", dynFilter = all " + dyn_var));
+    // pq_stage evaluates the pruning filter on the rows too (regions no longer carry it).
+    CHECK(Contains(comp.dsl, "inBuffers = keyed data_" + std::to_string(orders->idx) + ", dynFilter = all " + dyn_var));
+
+    // Unclustered: every row group spans the whole range -> probe only.
+    duckdb::DuckDB db2(nullptr);
+    auto con2 = MakeRemoteJoinDb(db2, 1'000'000, {{0, 399}, {1, 398}, {0, 397}, {2, 399}});
+    auto plan2 = BuildPhysicalPlan(con2, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                         "JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
+                     .unwrap();
+    const LeafStage *orders2 = FindLeaf(*plan2, "remote_orders");
+    CHECK(!OnlyDynFilter(orders2).prune);
+}
+
+namespace {
+
+// A remote build side whose key "cust" is unique over `card` rows.
+struct FakeRemoteCustomers : RemoteParquetDataSource {
+    explicit FakeRemoteCustomers(uint64_t card) {
+        name = "remote_customers";
+        schema = Schema{{{"cust", {TypeId::INT32}, false}, {"name", {TypeId::VARCHAR}, false}}};
+        cardinality_total = card;
+        paths = {"fake://remote_customers.parquet"};
+        footer_bytes = {{0}};
+        metadata.push_back({});
+    }
+    Result<void> Resolve(const RemoteResolver &) override { return Ok(); }
+};
+
+} // namespace
+
+TEST_CASE("dynamic filter: attached by the share of build keys the build side keeps") {
+    // Unfiltered build side: it keeps every key -> every probe row has a partner, no filter.
+    {
+        duckdb::DuckDB db(nullptr);
+        auto con = MakeRemoteJoinDb(db, 1'000'000, {}, std::make_shared<FakeRemoteCustomers>(10'000));
+        auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                           "JOIN plume_remote('remote_customers') c ON o.cust = c.cust", {}, Cfg(true))
+                        .unwrap();
+        CHECK(!HasDynFilter(FindLeaf(*plan, "remote_orders")));
+    }
+    // A filter on a non-key build column keeps only part of the keys -> filter.
+    {
+        duckdb::DuckDB db(nullptr);
+        auto con = MakeRemoteJoinDb(db, 1'000'000, {}, std::make_shared<FakeRemoteCustomers>(10'000));
+        auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                           "JOIN plume_remote('remote_customers') c ON o.cust = c.cust "
+                                           "WHERE c.name = 'alice'", {}, Cfg(true))
+                        .unwrap();
+        CHECK(HasDynFilter(FindLeaf(*plan, "remote_orders")));
+    }
+}
+
+namespace {
+
+std::unique_ptr<PhysicalPlan> RemoteJoinPlan(const std::string &sql) {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeRemoteJoinDb(db, 1'000'000);
+    return BuildPhysicalPlan(con, sql, {}, Cfg(true)).unwrap();
+}
+
+size_t CountDynamicFilterBuilds(const PhysicalPlan &plan) {
+    size_t n = 0;
+    for (auto &s : plan.stages) {
+        n += DynamicFilterBuilds(*s).size();
+    }
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("dynamic filter: SEMI and RIGHT_SEMI joins filter their probe side") {
+    // orders IN (customers): customers is the build side of a SEMI join.
+    auto semi = RemoteJoinPlan("SELECT o.o_id FROM plume_remote('remote_orders') o "
+                               "WHERE o.cust IN (SELECT cust FROM customers)");
+    CHECK(semi->ToString().find("SEMI") != std::string::npos);
+    CHECK(OnlyDynFilter(FindLeaf(*semi, "remote_orders")).file_column == 1);
+
+    // customers IN (orders): DuckDB builds on the small side, i.e. a RIGHT_SEMI probing orders.
+    auto right_semi = RemoteJoinPlan("SELECT c.name FROM customers c "
+                                     "WHERE c.cust IN (SELECT cust FROM plume_remote('remote_orders'))");
+    CHECK(right_semi->ToString().find("RIGHT_SEMI") != std::string::npos);
+    CHECK(HasDynFilter(FindLeaf(*right_semi, "remote_orders")));
+}
+
+TEST_CASE("dynamic filter: multi-key joins and residuals filter on every equality key") {
+    auto plan = RemoteJoinPlan("SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                               "JOIN customers c ON o.cust = c.cust AND o.o_id = c.cust + 1 AND o.o_id > c.cust");
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    // One filter per key: cust = c.cust and o_id = c.cust + 1 (a computed build key column).
+    CHECK(orders->dynamic_filter_inputs.size() == 2);
+    std::set<uint32_t> file_cols, filters, sources;
+    for (const auto &in : orders->dynamic_filter_inputs) {
+        file_cols.insert(in.file_column);
+        filters.insert(in.filter_id);
+        sources.insert(in.source_stage);
+    }
+    CHECK((file_cols == std::set<uint32_t>{0, 1}));
+    CHECK(filters.size() == 2);     // different build columns: separate taps...
+    CHECK(sources.size() == 1);     // ...of the same build stage
+    CHECK(CountDynamicFilterBuilds(*plan) == 2);
+    CHECK(orders->pipeline.dynamic_filter_probes.size() == 2);
+
+    // IS NOT DISTINCT FROM matches NULL keys, which the filter rejects.
+    auto null_eq = RemoteJoinPlan("SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                  "JOIN customers c ON o.cust IS NOT DISTINCT FROM c.cust");
+    CHECK(!HasDynFilter(FindLeaf(*null_eq, "remote_orders")));
+    CHECK(CountDynamicFilterBuilds(*null_eq) == 0);
+}
+
+TEST_CASE("dynamic filter: traced through group keys and other joins") {
+    auto agg = RemoteJoinPlan("SELECT o.cust, o.n, c.name FROM "
+                              "(SELECT cust, count(*) AS n FROM plume_remote('remote_orders') GROUP BY cust) o "
+                              "JOIN customers c ON o.cust = c.cust");
+    CHECK(OnlyDynFilter(FindLeaf(*agg, "remote_orders")).file_column == 1);
+
+    // An aggregate's result can't be traced.
+    auto agg_value = RemoteJoinPlan("SELECT o.cust, c.name FROM "
+                                    "(SELECT cust, max(o_id) AS m FROM plume_remote('remote_orders') GROUP BY cust) o "
+                                    "JOIN customers c ON o.m = c.cust");
+    CHECK(!HasDynFilter(FindLeaf(*agg_value, "remote_orders")));
+
+    // o_id passes through the LEFT join with tiers to the INNER join with customers.
+    auto joined = RemoteJoinPlan("SELECT o.o_id, t.name, c.name FROM plume_remote('remote_orders') o "
+                                 "LEFT JOIN (SELECT cust AS tier, name FROM customers) t ON o.cust = t.tier "
+                                 "JOIN customers c ON o.o_id = c.cust");
+    CHECK(OnlyDynFilter(FindLeaf(*joined, "remote_orders")).file_column == 0);
+
+    // LIMIT keeps the first rows of its input, so filtering that input isn't equivalent.
+    auto limited = RemoteJoinPlan("SELECT o.o_id, c.name FROM "
+                                  "(SELECT * FROM plume_remote('remote_orders') LIMIT 100) o "
+                                  "JOIN customers c ON o.cust = c.cust");
+    CHECK(!HasDynFilter(FindLeaf(*limited, "remote_orders")));
+}
+
+TEST_CASE("dynamic filter: star schema -> several builds filter one scan, bound into one dynFilter input") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeRemoteJoinDb(db, 1'000'000);
+    con.Query("CREATE TABLE items(item INTEGER, label VARCHAR)");
+    con.Query("INSERT INTO items VALUES (1, 'x'), (3, 'y')");
+    auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name, i.label FROM plume_remote('remote_orders') o "
+                                       "JOIN customers c ON o.cust = c.cust "
+                                       "JOIN items i ON o.o_id = i.item", {}, Cfg(true))
+                    .unwrap();
+
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    CHECK(orders->dynamic_filter_inputs.size() == 2);
+    const auto sources = orders->DynFilterSourceStages();
+    CHECK(sources.size() == 2);
+    std::set<uint32_t> file_cols;
+    for (const auto &in : orders->dynamic_filter_inputs) {
+        file_cols.insert(in.file_column);
+        CHECK(FindDynamicFilterBuild(*plan->stages[in.source_stage], in.filter_id) != nullptr);
+    }
+    CHECK((file_cols == std::set<uint32_t>{0, 1}));
+
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", Cfg(true)).unwrap();
+    const std::string binding = "dynFilter = all {dfltr_" + std::to_string(sources[0]) + ", dfltr_" +
+                                std::to_string(sources[1]) + "}";
+    CHECK(Contains(comp.dsl, "inBuffers = keyed data_" + std::to_string(orders->idx) + ", " + binding));
+    for (uint32_t src : sources) {
+        CHECK(Contains(comp.dsl, "dfltr_" + std::to_string(src) + " = dynFilter"));
+    }
+
+    // The plan printer shows the taps and both ends of every filter edge.
+    const std::string text = plan->ToString();
+    CHECK(Contains(text, "DYNAMIC_FILTER_BUILD"));
+    for (const auto &in : orders->dynamic_filter_inputs) {
+        const std::string f = "dynfilter #" + std::to_string(in.filter_id);
+        CHECK(Contains(text, f + ": " + orders->pipeline.input_schema.columns[in.scan_column].name +
+                                 " (file column " + std::to_string(in.file_column) + ") <- Stage #" +
+                                 std::to_string(in.source_stage) + "  (probe)"));
+        CHECK(Contains(text, f + " -> Stage #" + std::to_string(orders->idx)));
+    }
+}
+
+TEST_CASE("dynamic filter: prune mode is decided per filter") {
+    duckdb::DuckDB db(nullptr);
+    // "cust" sorted in the files (prunes), "o_id" without statistics (probe only).
+    auto con = MakeRemoteJoinDb(db, 1'000'000, {{0, 99}, {100, 199}, {200, 299}, {300, 399}});
+    con.Query("CREATE TABLE items(item INTEGER, label VARCHAR)");
+    con.Query("INSERT INTO items VALUES (1, 'x'), (3, 'y')");
+    auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name, i.label FROM plume_remote('remote_orders') o "
+                                       "JOIN customers c ON o.cust = c.cust "
+                                       "JOIN items i ON o.o_id = i.item", {}, Cfg(true))
+                    .unwrap();
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    CHECK(orders->dynamic_filter_inputs.size() == 2);
+    const DynamicFilterInput *cust = nullptr, *o_id = nullptr;
+    for (const auto &in : orders->dynamic_filter_inputs) {
+        (in.file_column == 1 ? cust : o_id) = &in;
+    }
+    CHECK(cust && o_id);
+    CHECK(cust->prune);
+    CHECK(!o_id->prune);
+    CHECK(orders->PrunesByDynFilter());
+
+    auto comp = dandelion::BuildDandelionComposition(con, *plan, "DF", Cfg(true)).unwrap();
+    // pq_prepare waits only for the pruning filter's producer, pq_stage for both.
+    CHECK(Contains(comp.dsl, "url = anyKeyed url_" + std::to_string(orders->idx) + ", dynFilter = all dfltr_" +
+                                 std::to_string(cust->source_stage) + ")"));
+    CHECK(Contains(comp.dsl, "inBuffers = keyed data_" + std::to_string(orders->idx) + ", dynFilter = all {"));
+}
+
+namespace {
+
+// A real parquet source of 10 row groups x 2048 rows: o_id 0..20479, "cust" = o_id / 100 (sorted ->
+// each row group spans 1/10 of its range, prune mode), "k" = o_id * 7919 mod 20480 (scattered ->
+// every row group spans the whole range, probe mode). Registered as plume_remote('pq_orders') next
+// to the local tables customers(cust, name) and items(item, label).
+struct DynFilterParquetDb {
+    std::string path;
+    duckdb::DuckDB db{nullptr};
+    duckdb::Connection con{db};
+    std::shared_ptr<SourceCatalog> catalog = std::make_shared<SourceCatalog>();
+
+    DynFilterParquetDb() {
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::temp_directory_path() / "plume_test_dyn_filter";
+        fs::create_directories(dir);
+        path = (dir / "orders.parquet").string();
+        CHECK(!con.Query("COPY (SELECT range::INTEGER AS o_id, (range // 100)::INTEGER AS cust, "
+                         "((range * 7919) % 20480)::INTEGER AS k FROM range(20480)) TO '" + path +
+                         "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)")->HasError());
+        con.Query("CREATE TABLE customers(cust INTEGER, name VARCHAR)");
+        con.Query("INSERT INTO customers VALUES (5, 'alice'), (100, 'bob'), (199, 'carol'), (100000, 'nobody')");
+        con.Query("CREATE TABLE items(item INTEGER, label VARCHAR)");
+        con.Query("INSERT INTO items VALUES (511, 'x'), (11000, 'y'), (12345, 'z'), (20000, 'w'), (7, 'v')");
+
+        auto src = CreateRemoteParquetSource("pq_orders", {"file://" + path});
+        RemoteResolver resolver(AutoFetcher(), 2);
+        CHECK(src->Resolve(resolver).is_ok());
+        CHECK(resolver.Execute().is_ok());
+        CHECK(static_cast<RemoteParquetDataSource &>(*src).metadata.at(0).row_groups.size() == 10);
+        CHECK(catalog->Add(src).is_ok());
+        auto registry = duckdb::make_shared_ptr<PlumeRemoteInfo>();
+        registry->catalog = catalog;
+        RegisterPlumeRemote(con, std::move(registry));
+    }
+
+    // Runs `sql` (over plume_remote('pq_orders')) through the mock runtime and checks the result
+    // against DuckDB running it over read_parquet. Returns the plan and the runtime for inspection.
+    std::pair<std::unique_ptr<PhysicalPlan>, std::unique_ptr<MockRuntime>> ExpectMatch(const std::string &sql) {
+        auto plan = BuildPhysicalPlan(con, sql, *catalog, Cfg(true)).unwrap();
+        auto runtime = std::make_unique<MockRuntime>(con);
+        auto plume_rows = PlumeRows(runtime->Run(*plan));
+        std::string duck_sql = sql;
+        const std::string from = "plume_remote('pq_orders')";
+        const std::string to = "read_parquet('" + path + "')";
+        for (size_t pos = duck_sql.find(from); pos != std::string::npos; pos = duck_sql.find(from, pos + to.size())) {
+            duck_sql.replace(pos, from.size(), to);
+        }
+        auto duck_rows = DuckRows(con, duck_sql);
+        std::sort(plume_rows.begin(), plume_rows.end());
+        std::sort(duck_rows.begin(), duck_rows.end());
+        CHECK_MSG(plume_rows == duck_rows, "result mismatch for: " + sql + " (plume " +
+                                               std::to_string(plume_rows.size()) + " rows, duckdb " +
+                                               std::to_string(duck_rows.size()) + " rows)");
+        return {std::move(plan), std::move(runtime)};
+    }
+};
+
+uint64_t RowCount(const PartitionedBlocks &parts) {
+    uint64_t n = 0;
+    for (auto &[p, blocks] : parts) {
+        for (auto &b : blocks) {
+            Schema schema;
+            auto chunks = memory::ImportBlockChunks(const_cast<uint8_t *>(b.data()), b.size(), schema).unwrap();
+            for (auto &c : chunks) {
+                n += c->size();
+            }
+        }
+    }
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("dynamic filter e2e: a pruning filter is forwarded through pq_prepare and pq_stage") {
+    DynFilterParquetDb t;
+    auto [plan, runtime] = t.ExpectMatch("SELECT o.o_id, o.cust, c.name FROM plume_remote('pq_orders') o "
+                                         "JOIN customers c ON o.cust = c.cust");
+    const LeafStage *orders = FindLeaf(*plan, "pq_orders");
+    const auto &in = OnlyDynFilter(orders);
+    CHECK(in.prune);
+    // The producer emitted its filter, and the scan only produced the rows of matching keys:
+    // cust 5, 100, 199 -> 300 rows of 20480.
+    CHECK(runtime->DynamicFilterOutputs(in.source_stage).size() == 1);
+    CHECK(runtime->DynamicFilterOutputs(in.source_stage)[0].identifier == exec::DynamicFilterIdent(in.filter_id));
+    CHECK(RowCount(runtime->StageOutput(orders->idx)) == 300);
+}
+
+TEST_CASE("dynamic filter e2e: pruning and probe-only filters of two builds on one scan") {
+    DynFilterParquetDb t;
+    auto [plan, runtime] = t.ExpectMatch("SELECT o.o_id, c.name, i.label FROM plume_remote('pq_orders') o "
+                                         "JOIN customers c ON o.cust = c.cust "
+                                         "JOIN items i ON o.k = i.item");
+    const LeafStage *orders = FindLeaf(*plan, "pq_orders");
+    CHECK(orders->dynamic_filter_inputs.size() == 2);
+    CHECK(orders->DynFilterSourceStages().size() == 2);
+    bool has_prune = false, has_probe = false;
+    for (const auto &in : orders->dynamic_filter_inputs) {
+        (in.prune ? has_prune : has_probe) = true;
+    }
+    CHECK(has_prune && has_probe);
+    // Both filters applied: at most the rows whose cust and k both match (the exact sets have no
+    // false positives).
+    auto expected = DuckRows(t.con, "SELECT count(*) FROM read_parquet('" + t.path + "') "
+                                    "WHERE cust IN (5, 100, 199) AND k IN (511, 11000, 12345, 20000, 7)");
+    CHECK(std::to_string(RowCount(runtime->StageOutput(orders->idx))) == expected.at(0));
+
+    // Probe-only filter alone.
+    auto [plan2, runtime2] = t.ExpectMatch("SELECT o.o_id, i.label FROM plume_remote('pq_orders') o "
+                                           "JOIN items i ON o.k = i.item");
+    const LeafStage *orders2 = FindLeaf(*plan2, "pq_orders");
+    CHECK(!OnlyDynFilter(orders2).prune);
+    CHECK(RowCount(runtime2->StageOutput(orders2->idx)) == 5);
+
+    // An empty build side: the scan produces nothing at all.
+    auto [plan3, runtime3] = t.ExpectMatch("SELECT o.o_id, c.name FROM plume_remote('pq_orders') o "
+                                           "JOIN customers c ON o.cust = c.cust WHERE c.name = 'nobody'");
+    const LeafStage *orders3 = FindLeaf(*plan3, "pq_orders");
+    CHECK(orders3 && orders3->ConsumesDynFilter());
+    CHECK(RowCount(runtime3->StageOutput(orders3->idx)) == 0);
+}
+
+TEST_CASE("dynamic filter e2e: transitive keys filter a scan that never meets the build directly") {
+    DynFilterParquetDb t;
+    // a.cust = c.cust and b.cust = a.cust: customers' keys bound b.cust too, so its scan is filtered
+    // by the same tap although b only ever joins (a JOIN customers). With a RIGHT join b's
+    // unmatched rows are dropped as well; a SEMI join drops a's unmatched rows like an INNER one.
+    const std::string b = "(SELECT cust, k FROM plume_remote('pq_orders')) b ON b.cust = a.cust";
+    for (const std::string &sql : {
+             "SELECT a.o_id, b.k, c.name FROM plume_remote('pq_orders') a JOIN customers c ON a.cust = c.cust JOIN " + b,
+             "SELECT a.o_id, b.k, c.name FROM plume_remote('pq_orders') a JOIN customers c ON a.cust = c.cust "
+             "LEFT JOIN " + b,
+             "SELECT a.o_id, b.k FROM plume_remote('pq_orders') a JOIN " + b +
+                 " WHERE a.cust IN (SELECT cust FROM customers)"}) {
+        auto [plan, runtime] = t.ExpectMatch(sql);
+        std::vector<const LeafStage *> scans;
+        for (auto &s : plan->stages) {
+            if (s->IsLeaf() && static_cast<const LeafStage &>(*s).data_source->name == "pq_orders") {
+                scans.push_back(static_cast<const LeafStage *>(s.get()));
+            }
+        }
+        CHECK_MSG(scans.size() == 2, sql);
+        std::set<uint32_t> sources;
+        for (const LeafStage *scan : scans) {
+            const auto &in = OnlyDynFilter(scan);
+            CHECK(in.file_column == 1);
+            sources.insert(in.source_stage);
+            // cust 5, 100, 199 -> 300 rows of 20480 per scan.
+            CHECK_MSG(RowCount(runtime->StageOutput(scan->idx)) == 300, sql);
+        }
+        // Both from the one tap on customers.
+        CHECK(sources.size() == 1);
+        CHECK(DynamicFilterBuilds(*plan->stages[*sources.begin()]).size() == 1);
+    }
+}
+
+TEST_CASE("dynamic filter e2e: a filtered scan passes the filter on through another key") {
+    DynFilterParquetDb t;
+    // customers filters a (on cust); a's surviving rows then filter b on a different key (a.k =
+    // b.o_id): the predicate on customers reaches b, which shares no key with it.
+    const std::string sql = "SELECT a.o_id, b.cust, c.name FROM plume_remote('pq_orders') a "
+                            "JOIN customers c ON a.cust = c.cust "
+                            "JOIN (SELECT o_id, cust FROM plume_remote('pq_orders')) b ON b.o_id = a.k";
+    auto [plan, runtime] = t.ExpectMatch(sql);
+    const LeafStage *a = nullptr, *b = nullptr;
+    for (auto &s : plan->stages) {
+        if (s->IsLeaf() && static_cast<const LeafStage &>(*s).data_source->name == "pq_orders") {
+            auto *leaf = static_cast<const LeafStage *>(s.get());
+            (OnlyDynFilter(leaf).file_column == 1 ? a : b) = leaf;
+        }
+    }
+    CHECK(a && b);
+    CHECK(OnlyDynFilter(b).file_column == 0); // o_id
+    // cust 5, 100, 199 -> 300 rows of a, whose 300 distinct k values select 300 rows of b.
+    CHECK(RowCount(runtime->StageOutput(a->idx)) == 300);
+    CHECK(RowCount(runtime->StageOutput(b->idx)) == 300);
+    // a's own scan builds b's filter from the rows its probe keeps.
+    CHECK(OnlyDynFilter(b).source_stage == a->idx);
+}
+
+TEST_CASE("dynamic filter: dropped when the probe scan is shared with another consumer") {
+    // The materialized CTE's scan also feeds the count, which needs the rows the filter would drop.
+    auto plan = RemoteJoinPlan("WITH o AS MATERIALIZED (SELECT * FROM plume_remote('remote_orders')) "
+                               "SELECT o.o_id, c.name, x.n FROM o JOIN customers c ON o.cust = c.cust, "
+                               "(SELECT count(*) AS n FROM o) x");
+    CHECK(CountLeaves(*plan, DataSourceType::REMOTE_PARQUET) == 1);
+    CHECK(!HasDynFilter(FindLeaf(*plan, "remote_orders")));
+    CHECK(CountDynamicFilterBuilds(*plan) == 0);
+}
+
+TEST_CASE("dynamic filter: disabled via ConverterConfig -> leaf isn't marked") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
+    ConverterConfig cfg;
+    cfg.dynamic_filter = false;
+    auto plan = BuildPhysicalPlan(con,
+                                  "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                  "JOIN customers c ON o.cust = c.cust",
+                                  {}, cfg)
+                    .unwrap();
+
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    CHECK(!HasDynFilter(orders));
+    CHECK(orders->pipeline.dynamic_filter_probes.empty());
+    CHECK(CountDynamicFilterBuilds(*plan) == 0);
+}
+
+TEST_CASE("dynamic filter: build side too large relative to the probe -> not attached") {
+    duckdb::DuckDB db(nullptr);
+    // The probe (remote_orders) is only 10 rows; customers' 2 rows are not <= 10 * 0.2 = 2...
+    // make it unambiguous by using a threshold no real cardinality clears.
+    auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/10);
+    ConverterConfig cfg;
+    cfg.dynamic_filter_selectivity_threshold = 0.0; // nothing clears this but an empty build side
+    auto plan = BuildPhysicalPlan(con,
+                                  "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                  "JOIN customers c ON o.cust = c.cust",
+                                  {}, cfg)
+                    .unwrap();
+
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    CHECK(!HasDynFilter(orders));
+}
+
+TEST_CASE("dynamic filter: not attached for a join that keeps unmatched probe rows") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeRemoteJoinDb(db, /*orders_cardinality=*/1'000'000);
+    auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM plume_remote('remote_orders') o "
+                                       "LEFT JOIN customers c ON o.cust = c.cust", {}, Cfg(true))
+                    .unwrap();
+
+    const LeafStage *orders = FindLeaf(*plan, "remote_orders");
+    CHECK(!HasDynFilter(orders));
+}
+
+TEST_CASE("dynamic filter: not attached when the probe side isn't a remote parquet leaf") {
+    // Both sides local tables -> the probe side never traces to a REMOTE_PARQUET leaf.
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeDb(db);
+    auto plan = BuildPhysicalPlan(con, "SELECT o.o_id, c.name FROM orders o JOIN customers c "
+                                       "ON o.cust = c.c_id", {}, Cfg(true))
+                    .unwrap();
+    CHECK(CountDynamicFilterBuilds(*plan) == 0);
+}
+
+TEST_CASE("e2e: filters DuckDB proves empty by statistics") {
+    // amount <= 200 in every row: DuckDB replaces these subtrees with an EMPTY_RESULT.
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeDb(db);
+    ExpectMatch(con, "SELECT o_id, amount FROM orders WHERE amount > 1000", false);
+    ExpectMatch(con, "SELECT region, count(*) FROM orders WHERE amount > 1000 GROUP BY region", false);
+    ExpectMatch(con, "SELECT count(*), sum(amount) FROM orders WHERE amount > 1000", false);
+    ExpectMatch(con, "SELECT o.o_id, c.name FROM orders o JOIN customers c ON o.cust = c.c_id "
+                     "WHERE o.amount > 1000", false);
+}
+
+TEST_CASE("plume_remote: column statistics reach DuckDB's optimizer") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    auto orders = std::make_shared<FakeRemoteOrders>(1'000'000);
+    orders->col_stats.resize(2);
+    orders->col_stats[1].has_min = orders->col_stats[1].has_max = true;
+    orders->col_stats[1].min_value = duckdb::Value::INTEGER(1);
+    orders->col_stats[1].max_value = duckdb::Value::INTEGER(50);
+    auto catalog_ptr = std::make_shared<SourceCatalog>();
+    CHECK(catalog_ptr->Add(orders).is_ok());
+    auto registry = duckdb::make_shared_ptr<PlumeRemoteInfo>();
+    registry->catalog = catalog_ptr;
+    RegisterPlumeRemote(con, std::move(registry));
+
+    // cust > 100 can't hold for cust in [1, 50]: the remote scan is optimized away.
+    auto empty = BuildPhysicalPlan(con, "SELECT o_id FROM plume_remote('remote_orders') WHERE cust > 100").unwrap();
+    CHECK(CountLeaves(*empty, DataSourceType::REMOTE_PARQUET) == 0);
+    auto kept = BuildPhysicalPlan(con, "SELECT o_id FROM plume_remote('remote_orders') WHERE cust > 10").unwrap();
+    CHECK(CountLeaves(*kept, DataSourceType::REMOTE_PARQUET) == 1);
+}
+
+TEST_CASE("RemoteParquetDataSource: column min/max bound every file") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "plume_test_remote_stats";
+    fs::create_directories(dir);
+    const std::string a = (dir / "a.parquet").string();
+    const std::string b = (dir / "b.parquet").string();
+    {
+        duckdb::DuckDB db(nullptr);
+        duckdb::Connection con(db);
+        CHECK(!con.Query("COPY (SELECT range AS k FROM range(100, 300)) TO '" + a + "' (FORMAT PARQUET)")->HasError());
+        CHECK(!con.Query("COPY (SELECT range AS k FROM range(0, 100)) TO '" + b + "' (FORMAT PARQUET)")->HasError());
+    }
+
+    auto src = CreateRemoteParquetSource("stats", {"file://" + a, "file://" + b});
+    RemoteResolver resolver(AutoFetcher(), 2);
+    CHECK(src->Resolve(resolver).is_ok());
+    CHECK(resolver.Execute().is_ok());
+    CHECK(src->col_stats.size() == 1);
+    const auto &k = src->col_stats[0];
+    CHECK(k.has_min && k.min_value == duckdb::Value::BIGINT(0));
+    CHECK(k.has_max && k.max_value == duckdb::Value::BIGINT(299));
+    CHECK(k.not_null);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("ResolveAndRewriteSources: a source referenced twice is resolved once") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "plume_test_resolve_twice";
+    fs::create_directories(dir);
+    const std::string a = (dir / "a.parquet").string();
+    {
+        duckdb::DuckDB db(nullptr);
+        duckdb::Connection con(db);
+        CHECK(!con.Query("COPY (SELECT range AS k FROM range(0, 300)) TO '" + a + "' (FORMAT PARQUET)")->HasError());
+    }
+
+    // A self join: both references share one catalog entry, whose files must be queued once.
+    SourceCatalog catalog;
+    RemoteResolver resolver(AutoFetcher(), 4);
+    const std::string url = "file://" + a;
+    auto sql = ResolveAndRewriteSources("SELECT * FROM plume_remote(" + url + ") x JOIN plume_remote(" + url +
+                                            ") y ON x.k = y.k",
+                                        catalog, resolver);
+    CHECK(sql.is_ok());
+    CHECK(catalog.size() == 1);
+    auto src = catalog.Get(0).unwrap();
+    CHECK(src->cardinality_total == 300);
+    CHECK(src->cardinalities == std::vector<uint64_t>{300});
+    fs::remove_all(dir);
 }
 
 int main() { return plume_test::RunAll(); }

@@ -55,9 +55,15 @@ else
     cleanup cmake_bin
 fi
 
-# install libssl-dev
+# install libssl-dev and the libstdc++ headers/library clang links against
 # TODO: possible without sudo?
-sudo apt update && sudo apt install -y libssl-dev
+clang_bin=$(command -v clang || echo "$install_dir/llvm/bin/clang")
+gcc_version=$("$clang_bin" -v 2>&1 | sed -n 's|^Selected GCC installation: .*/\([0-9][0-9]*\)$|\1|p')
+apt_packages=(libssl-dev)
+if [ -n "$gcc_version" ]; then
+    apt_packages+=("libstdc++-${gcc_version}-dev")
+fi
+sudo apt update && sudo apt install -y "${apt_packages[@]}"
 
 # (optional) install ninja
 if has_command "ninja"; then

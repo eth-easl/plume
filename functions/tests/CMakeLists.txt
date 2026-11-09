@@ -35,29 +35,34 @@ endfunction()
 plume_add_function_test(test_stage
   test_stage.cpp
   ${FN_SRC}/functions/stage.cpp
-  ${FN_SRC}/functions/output_split.cpp)
+  ${FN_SRC}/util/dynamic_filter.cpp
+  ${FN_SRC}/util/output_split.cpp)
 
 plume_add_function_test(test_join
   test_join.cpp
   ${FN_SRC}/functions/stage.cpp
-  ${FN_SRC}/functions/output_split.cpp)
+  ${FN_SRC}/util/dynamic_filter.cpp
+  ${FN_SRC}/util/output_split.cpp)
 
 plume_add_function_test(test_csv
   test_csv.cpp
   ${FN_SRC}/functions/csv_prepare.cpp
   ${FN_SRC}/functions/csv_stage.cpp
-  ${FN_SRC}/functions/output_split.cpp)
+  ${FN_SRC}/util/dynamic_filter.cpp
+  ${FN_SRC}/util/output_split.cpp)
 
 plume_add_function_test(test_pq_prepare
   test_pq_prepare.cpp
-  ${FN_SRC}/functions/pq_prepare.cpp)
+  ${FN_SRC}/functions/pq_prepare.cpp
+  ${FN_SRC}/util/dynamic_filter.cpp)
 target_compile_definitions(test_pq_prepare PRIVATE
   PLUME_TEST_PARQUET="${CMAKE_SOURCE_DIR}/external/duckdb/data/parquet-testing/bug687_nulls.parquet")
 
 plume_add_function_test(test_pq_stage
   test_pq_stage.cpp
   ${FN_SRC}/functions/pq_stage.cpp
-  ${FN_SRC}/functions/output_split.cpp)
+  ${FN_SRC}/util/dynamic_filter.cpp
+  ${FN_SRC}/util/output_split.cpp)
 target_link_libraries(test_pq_stage PRIVATE plume_snappy) # parquet_encode.hpp hand-encodes Snappy fixtures
 
 # Decode microbenchmark (not a ctest; run manually against a parquet file).
@@ -69,7 +74,8 @@ target_include_directories(bench_pq_decode PRIVATE
 # Stage output-split microbenchmark (old vs new split over decoded parquet).
 add_executable(bench_pq_stage
   bench_pq_stage.cpp
-  ${FN_SRC}/functions/output_split.cpp)
+  ${FN_SRC}/util/dynamic_filter.cpp
+  ${FN_SRC}/util/output_split.cpp)
 target_link_libraries(bench_pq_stage PRIVATE plume plume_mock)
 target_include_directories(bench_pq_stage PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../include
@@ -95,10 +101,12 @@ plume_add_function_test(test_pq_e2e
   test_pq_e2e.cpp
   ${FN_SRC}/functions/pq_prepare.cpp
   ${FN_SRC}/functions/pq_stage.cpp
-  ${FN_SRC}/functions/output_split.cpp)
+  ${FN_SRC}/util/dynamic_filter.cpp
+  ${FN_SRC}/util/output_split.cpp)
 target_link_libraries(test_pq_e2e PRIVATE plume_snappy) # parquet_encode.hpp hand-encodes Snappy fixtures
 
 plume_add_function_test(test_file_output
   test_file_output.cpp
   ${FN_SRC}/functions/stage.cpp
-  ${FN_SRC}/functions/output_split.cpp)
+  ${FN_SRC}/util/dynamic_filter.cpp
+  ${FN_SRC}/util/output_split.cpp)

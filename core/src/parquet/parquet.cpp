@@ -3,6 +3,8 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 
+#include <algorithm>
+
 namespace plume::parquet {
 
 void ParquetConfig::Serialize(duckdb::Serializer &s) const {
@@ -13,6 +15,14 @@ void ParquetConfig::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(103, "has_pushed_filter", has_pushed_filter);
     s.WriteProperty(104, "pushed_filter", pushed_filter);
     s.WriteProperty(105, "max_region_size", max_region_size);
+    s.WriteList(106, "file_row_group_offsets", file_row_group_offsets.size(),
+                [&](duckdb::Serializer::List &list, duckdb::idx_t i) { list.WriteElement(file_row_group_offsets[i]); });
+    s.WriteList(107, "page_index_offsets", page_index_offsets.size(),
+                [&](duckdb::Serializer::List &list, duckdb::idx_t i) { list.WriteElement(page_index_offsets[i]); });
+    s.WriteList(108, "page_index_sizes", page_index_sizes.size(),
+                [&](duckdb::Serializer::List &list, duckdb::idx_t i) { list.WriteElement(page_index_sizes[i]); });
+    s.WritePropertyWithDefault(109, "dynamic_filters",
+        duckdb::vector<exec::DynamicFilterProbeSpec>(dynamic_filters.begin(), dynamic_filters.end()));
 }
 
 ParquetConfig ParquetConfig::Deserialize(duckdb::Deserializer &d) {
@@ -25,7 +35,26 @@ ParquetConfig ParquetConfig::Deserialize(duckdb::Deserializer &d) {
     c.has_pushed_filter = d.ReadProperty<bool>(103, "has_pushed_filter");
     c.pushed_filter = d.ReadProperty<expr::ExprNode>(104, "pushed_filter");
     c.max_region_size = d.ReadProperty<uint64_t>(105, "max_region_size");
+    d.ReadList(106, "file_row_group_offsets", [&](duckdb::Deserializer::List &list, duckdb::idx_t /*i*/) {
+        c.file_row_group_offsets.push_back(list.ReadElement<uint64_t>());
+    });
+    d.ReadList(107, "page_index_offsets", [&](duckdb::Deserializer::List &list, duckdb::idx_t /*i*/) {
+        c.page_index_offsets.push_back(list.ReadElement<int64_t>());
+    });
+    d.ReadList(108, "page_index_sizes", [&](duckdb::Deserializer::List &list, duckdb::idx_t /*i*/) {
+        c.page_index_sizes.push_back(list.ReadElement<uint64_t>());
+    });
+    auto dyn_filters = d.ReadPropertyWithDefault<duckdb::vector<exec::DynamicFilterProbeSpec>>(109, "dynamic_filters");
+    c.dynamic_filters.assign(dyn_filters.begin(), dyn_filters.end());
     return c;
+}
+
+int32_t ScanColumnIndex(const std::vector<uint32_t> &projection, int32_t file_col) {
+    if (file_col < 0 || projection.empty()) {
+        return file_col;
+    }
+    auto it = std::find(projection.begin(), projection.end(), static_cast<uint32_t>(file_col));
+    return it == projection.end() ? -1 : static_cast<int32_t>(it - projection.begin());
 }
 
 } // namespace plume::parquet

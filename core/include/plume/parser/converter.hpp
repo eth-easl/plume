@@ -2,6 +2,7 @@
 
 #include "plume/common/result.hpp"
 #include "plume/execution/operators/join.hpp"
+#include "plume/parser/dynamic_filter_planning.hpp"
 #include "plume/parser/physical_plan.hpp"
 #include "plume/parser/plan_builder.hpp"
 
@@ -18,6 +19,7 @@ class LogicalAggregate;
 class LogicalMaterializedCTE;
 class LogicalComparisonJoin;
 class LogicalColumnDataGet;
+class LogicalEmptyResult;
 class LogicalCrossProduct;
 } // namespace duckdb
 
@@ -33,6 +35,8 @@ struct ConverterConfig {
     bool early_aggregation = true;
     // Enables plan builder to optimize remote data fetching.
     bool optimize_remote_fetching = true;
+    // Enables attaching a runtime dynamic filter.
+    bool dynamic_filter = true;
 
     // Upper limit on the number of output splits produced.
     uint32_t max_splits = 1;
@@ -44,6 +48,26 @@ struct ConverterConfig {
 
     // Maximum gap to coalesce requests over.
     uint64_t coalesce_distance = 1 << 10;
+    // A dynamic filter is only attached when it is estimated to keep at most this fraction of
+    // the probe rows: the share of the build key's distinct values the build side keeps, if the
+    // build key traces back to a remote scan.
+    double dynamic_filter_max_match_fraction = 0.5;
+    // Otherwise, a dynamic filter is only attached when the build side's estimated cardinality
+    // is at most this fraction of the probe side's.
+    double dynamic_filter_selectivity_threshold = 0.2;
+    // The probe scan waits for the filter to prune row groups before fetching (pq_prepare) only
+    // if a row group's key range spans at most this fraction of the key column's overall range on
+    // average. Otherwise the fetch starts right away and only pq_stage applies the filter.
+    double dynamic_filter_max_rowgroup_coverage = 0.5;
+    // Upper limit on the exact distinct build keys a dynamic filter carries (0 => no exact set).
+    uint32_t dynamic_filter_max_values = 256;
+    // Bloom filter bits per estimated build-side row (0 => no Bloom filter, 10 bits => ~1% false positives).
+    uint32_t dynamic_filter_bloom_bits_per_key = 10;
+    // Upper limit on a dynamic filter's Bloom filter size.
+    uint64_t dynamic_filter_max_bloom_bytes = 4 << 20;
+    // Upper limit on the length of a chain of dynamic filters, each one's build side reading the
+    // next one's filtered scan. Each level puts a build and a filtered scan on the critical path.
+    uint32_t dynamic_filter_max_chain_depth = 2;
 };
 
 // Converts a bound + optimized DuckDB logical plan into Plume PhysicalPlan.
@@ -57,16 +81,24 @@ public:
 private:
     uint32_t SplitCount(uint64_t estimated_rows) const;
 
+    Result<PlanBuilder::SharedOpNode> BuildProjection(duckdb::LogicalOperator &op);
+    Result<PlanBuilder::SharedOpNode> BuildFilter(duckdb::LogicalFilter &filter);
+    Result<PlanBuilder::SharedOpNode> BuildAggregate(duckdb::LogicalAggregate &agg);
+    Result<PlanBuilder::SharedOpNode> BuildLimit(duckdb::LogicalLimit &limit);
+    Result<PlanBuilder::SharedOpNode> BuildOrder(duckdb::LogicalOrder &order);
+    Result<PlanBuilder::SharedOpNode> BuildTopN(duckdb::LogicalTopN &top);
+
     Result<PlanBuilder::SharedOpNode> BuildGet(duckdb::LogicalGet &get);
     Result<PlanBuilder::SharedOpNode> BuildChunkGet(duckdb::LogicalColumnDataGet &get);
-    Result<PlanBuilder::SharedOpNode> BuildAggregate(duckdb::LogicalAggregate &agg, PlanBuilder::SharedOpNode child);
-    Result<PlanBuilder::SharedOpNode> BuildDistinct(PlanBuilder::SharedOpNode child, const std::vector<uint32_t> &cols, uint64_t card);
-    Result<PlanBuilder::SharedOpNode> BuildMaterializedCTE(duckdb::LogicalMaterializedCTE &cte);
+    Result<PlanBuilder::SharedOpNode> BuildEmptyResult(duckdb::LogicalEmptyResult &empty);
+
     Result<PlanBuilder::SharedOpNode> BuildJoin(PlanBuilder::SharedOpNode left, PlanBuilder::SharedOpNode right, 
         duckdb::LogicalComparisonJoin &join, exec::JoinKind kind, uint64_t left_card, uint64_t right_card);
     Result<PlanBuilder::SharedOpNode> BuildComparisonJoin(duckdb::LogicalComparisonJoin &join);
     Result<PlanBuilder::SharedOpNode> BuildDelimJoin(duckdb::LogicalComparisonJoin &join);
     Result<PlanBuilder::SharedOpNode> BuildCrossProduct(duckdb::LogicalCrossProduct &cp);
+    
+    Result<PlanBuilder::SharedOpNode> BuildMaterializedCTE(duckdb::LogicalMaterializedCTE &cte);
 
     Result<PlanBuilder::SharedOpNode> Build(duckdb::LogicalOperator &op);
 
@@ -75,8 +107,11 @@ private:
     ConverterConfig cfg_;
     PlanBuilder builder_;
 
+    DynamicFilterContext dyn_filter_ctx_;
+
     std::map<uint64_t, PlanBuilder::SharedOpNode> cte_subs_;
     std::vector<PlanBuilder::SharedOpNode> delim_stack_;
+    size_t num_empty_results_ = 0;
 };
 
 Result<std::unique_ptr<PhysicalPlan>> BuildPhysicalPlan(duckdb::Connection &con, 

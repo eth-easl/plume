@@ -1,5 +1,6 @@
 #include "trace.hpp"
 
+#include <algorithm>
 #include <ctime>
 #include <fstream>
 #include <iomanip>

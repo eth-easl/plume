@@ -18,6 +18,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <string>
 
 namespace plume::client {
@@ -158,13 +159,66 @@ BlockSet MockRuntime::MaterializeTable(const LeafStage &stage) {
     return blocks;
 }
 
+const std::vector<dandelion::DataItem> &MockRuntime::DynamicFilterOutputs(size_t stage_idx) const {
+    static const std::vector<dandelion::DataItem> kNone;
+    auto it = stage_dyn_filters_.find(stage_idx);
+    return it == stage_dyn_filters_.end() ? kNone : it->second;
+}
+
+std::vector<size_t> MockRuntime::ExecutionOrder() const {
+    const size_t n = plan_->stages.size();
+    std::vector<uint8_t> state(n, 0); // 0 = unvisited, 1 = visiting, 2 = done
+    std::vector<size_t> order;
+    std::function<void(size_t)> visit = [&](size_t idx) {
+        if (state[idx] == 2) {
+            return;
+        }
+        if (state[idx] == 1) {
+            throw duckdb::InvalidInputException("Plume mock runtime: stage %zu depends on itself", idx);
+        }
+        state[idx] = 1;
+        const Stage &stage = *plan_->stages[idx];
+        for (size_t in : stage.input_stages) {
+            visit(in);
+        }
+        for (uint32_t src : stage.DynFilterSourceStages()) {
+            visit(src);
+        }
+        state[idx] = 2;
+        order.push_back(idx);
+    };
+    for (size_t i = 0; i < n; i++) {
+        visit(i);
+    }
+    return order;
+}
+
+void MockRuntime::CaptureDynamicFilters(const Stage &stage) {
+    auto &items = stage_dyn_filters_[stage.idx];
+    for (auto &o : Capture(1)) {
+        items.push_back({o.key, o.ident, dandelion::BinaryData(o.bytes.begin(), o.bytes.end())});
+    }
+}
+
+void MockRuntime::FeedDynamicFilters(const std::vector<uint32_t> &source_stages) {
+    if (source_stages.empty()) {
+        return;
+    }
+    mock::SetInput(3, std::vector<DataBuffer>{});
+    for (uint32_t src : source_stages) {
+        for (const auto &item : DynamicFilterOutputs(src)) {
+            mock::AddInput(3, mock::MakeBuffer(item.data.data(), item.data.size()), item.identifier, item.key);
+        }
+    }
+}
+
 uint32_t MockRuntime::ProducerPartitions(size_t stage_idx) const {
     uint32_t n = plan_->stages[stage_idx]->pipeline.output_split.partitions;
     return n < 1 ? 1 : n;
 }
 
 PartitionedBlocks MockRuntime::RunStage(const Stage &stage) {
-    if (stage.is_leaf()) {
+    if (stage.IsLeaf()) {
         const auto &leaf = static_cast<const LeafStage &>(stage);
         switch (leaf.data_source->type) {
         case DataSourceType::REMOTE_CSV:
@@ -188,7 +242,7 @@ PartitionedBlocks MockRuntime::InvokeBlockStage(const Stage &stage, const BlockS
     templ.push_back(mock::MakeBuffer(blob.data(), blob.size()));
     mock::SetInput(0, std::move(templ));
     mock::SetInput(1, AsBuffers(left));
-    if (stage.leads_with_join()) {
+    if (stage.LeadsWithJoin()) {
         mock::SetInput(2, AsBuffers(right));
     }
 
@@ -198,6 +252,7 @@ PartitionedBlocks MockRuntime::InvokeBlockStage(const Stage &stage, const BlockS
                                             status.error().message());
     }
 
+    CaptureDynamicFilters(stage);
     PartitionedBlocks out = CaptureKeyed();
     mock::Reset(); // releases the mock-owned output buffers; we copied what we need
     return out;
@@ -213,7 +268,7 @@ PartitionedBlocks MockRuntime::InvokeBlockStage(const Stage &stage, const BlockS
 PartitionedBlocks MockRuntime::RunBlockStage(const Stage &stage) {
     PartitionedBlocks out;
 
-    if (stage.is_leaf()) {
+    if (stage.IsLeaf()) {
         const auto &leaf = static_cast<const LeafStage &>(stage);
         auto it = provided_table_blocks_.find(stage.idx);
         BlockSet table = (it != provided_table_blocks_.end()) ? it->second : MaterializeTable(leaf);
@@ -223,10 +278,10 @@ PartitionedBlocks MockRuntime::RunBlockStage(const Stage &stage) {
 
     const PartitionedBlocks &lprod = stage_outputs_.at(stage.input_stages.at(0));
     const PartitionedBlocks *rprod =
-        stage.leads_with_join() ? &stage_outputs_.at(stage.input_stages.at(1)) : nullptr;
+        stage.LeadsWithJoin() ? &stage_outputs_.at(stage.input_stages.at(1)) : nullptr;
     const uint32_t parts = ProducerPartitions(stage.input_stages.at(0));
     const bool right_broadcast =
-        stage.leads_with_join() && ProducerPartitions(stage.input_stages.at(1)) <= 1;
+        stage.LeadsWithJoin() && ProducerPartitions(stage.input_stages.at(1)) <= 1;
 
     for (uint32_t p = 0; p < parts; p++) {
         BlockSet left = PartitionOf(lprod, p);
@@ -245,12 +300,16 @@ PartitionedBlocks MockRuntime::RunBlockStage(const Stage &stage) {
 // GET request line carries the url, its Range header the byte range. Reads the bytes
 // the request asks for (standing in for the runtime's HTTP fetch).
 std::vector<uint8_t> MockRuntime::ResolveRequest(const dandelion::DataItem &req) {
-    std::string s(req.data.begin(), req.data.end());
+    return ResolveRequest(req.data.data(), req.data.size());
+}
+
+std::vector<uint8_t> MockRuntime::ResolveRequest(const uint8_t *data, size_t size) {
+    std::string s(reinterpret_cast<const char *>(data), size);
     auto url_begin = s.find(' ') + 1;
     auto url_end = s.find(' ', url_begin);
     std::string url = s.substr(url_begin, url_end - url_begin);
     auto file = ReadFile(url);
-    auto [start, end] = ParseRange(mock::MakeBuffer(req.data.data(), req.data.size()));
+    auto [start, end] = ParseRange(mock::MakeBuffer(data, size));
     end = std::min<uint64_t>(end, file.size());
     return std::vector<uint8_t>(file.begin() + start, file.begin() + end);
 }
@@ -282,38 +341,81 @@ PartitionedBlocks MockRuntime::RunCsvStage(const LeafStage &stage) {
         throw duckdb::InvalidInputException("Plume mock runtime: csv_stage (stage %zu) failed: %s", stage.idx,
                                             st.error().message());
     }
+    CaptureDynamicFilters(stage);
     PartitionedBlocks out = CaptureKeyed();
     mock::Reset();
     return out;
 }
 
-// Parquet file source: the client precomputes the region infos + fetch requests
-// (BuildParquetStageInputs, the former pq_prepare: prune -> regions -> requests) ->
-// resolve each request from the local file -> pq_stage (decode + run the pipeline,
-// partitioning the output per the stage's OutputSplit).
+// Parquet file source. Without a prune-mode dynamic filter the client precomputes the region
+// infos + fetch requests (BuildParquetStageInputs); with one, pq_prepare plans them per file
+// from the footer once the pruning filters' producers ran (as plume_pq_prepare `by footer inner
+// url`). Each request is resolved from the local file, then pq_stage decodes + runs the pipeline,
+// evaluating every dynamic filter the stage consumes on the rows.
 PartitionedBlocks MockRuntime::RunParquetStage(const LeafStage &stage) {
     auto src = std::static_pointer_cast<RemoteParquetDataSource>(stage.data_source);
     const expr::ExprNode *pushed = stage.pushed_filter.get();
-    auto inputs = BuildParquetStageInputs(*src, *stage.projection, pushed, stage.source_splits).unwrap();
+    const std::vector<uint32_t> projection = stage.projection ? *stage.projection : std::vector<uint32_t>{};
+
+    dandelion::DataItemVec region_info;
+    dandelion::DataItemVec chunk_reqs;
+    if (stage.PrunesByDynFilter()) {
+        std::vector<exec::DynamicFilterProbeSpec> prune_filters;
+        for (const auto &in : stage.dynamic_filter_inputs) {
+            if (in.prune) {
+                prune_filters.push_back({in.filter_id, in.file_column});
+            }
+        }
+        auto inputs = catalog::BuildParquetPrepareInputs(*src, projection, pushed, std::move(prune_filters),
+                                                         stage.source_splits);
+        for (size_t f = 0; f < inputs.footers.size(); f++) {
+            const auto &footer = inputs.footers[f];
+            const auto &url = inputs.urls[f];
+            mock::Reset();
+            mock::AddInput(0, mock::MakeBuffer(inputs.cfg[0].data.data(), inputs.cfg[0].data.size()), "config", 0);
+            mock::AddInput(1, mock::MakeBuffer(footer.data.data(), footer.data.size()), footer.identifier, footer.key);
+            mock::AddInput(2, mock::MakeBuffer(url.data.data(), url.data.size()), url.identifier, url.key);
+            FeedDynamicFilters(stage.DynFilterSourceStages(/*prune_only=*/true));
+            auto st = fn::RunParquetPrepare();
+            if (st.is_error()) {
+                throw duckdb::InvalidInputException("Plume mock runtime: pq_prepare (stage %zu) failed: %s",
+                                                    stage.idx, st.error().message());
+            }
+            for (auto &o : Capture(0)) {
+                region_info.push_back({o.key, o.ident, dandelion::BinaryData(o.bytes.begin(), o.bytes.end())});
+            }
+            for (auto &o : Capture(1)) {
+                chunk_reqs.push_back({o.key, o.ident, dandelion::BinaryData(o.bytes.begin(), o.bytes.end())});
+            }
+        }
+    } else {
+        auto inputs = BuildParquetStageInputs(*src, projection, pushed, stage.source_splits).unwrap();
+        region_info = std::move(inputs.region_info);
+        chunk_reqs = std::move(inputs.chunk_reqs);
+    }
 
     auto blob = plume::SerializePipeline(stage.pipeline);
     mock::Reset();
     std::vector<DataBuffer> templ;
     templ.push_back(mock::MakeBuffer(blob.data(), blob.size()));
     mock::SetInput(0, std::move(templ));
-    for (auto &ro : inputs.region_info) {
+    mock::SetInput(1, std::vector<DataBuffer>{});
+    mock::SetInput(2, std::vector<DataBuffer>{});
+    for (auto &ro : region_info) {
         mock::AddInput(1, mock::MakeBuffer(ro.data.data(), ro.data.size()), ro.identifier, ro.key);
     }
-    for (auto &req : inputs.chunk_reqs) {
+    for (auto &req : chunk_reqs) {
         auto bytes = ResolveRequest(req);
         mock::AddInput(2, mock::MakeBuffer(bytes.data(), bytes.size()), req.identifier, req.key);
     }
+    FeedDynamicFilters(stage.DynFilterSourceStages());
 
     auto st = fn::RunParquetStage();
     if (st.is_error()) {
         throw duckdb::InvalidInputException("Plume mock runtime: pq_stage (stage %zu) failed: %s", stage.idx,
                                             st.error().message());
     }
+    CaptureDynamicFilters(stage);
     PartitionedBlocks out = CaptureKeyed();
     mock::Reset();
     return out;
@@ -322,10 +424,10 @@ PartitionedBlocks MockRuntime::RunParquetStage(const LeafStage &stage) {
 BlockSet MockRuntime::Run(const PhysicalPlan &plan, const std::unordered_map<size_t, BlockSet> &provided) {
     plan_ = &plan;
     provided_table_blocks_ = provided;
-    // Stages are emitted in dependency order (a stage's inputs always have smaller
-    // indices), so a single forward pass suffices.
-    for (const auto &stage : plan.stages) {
-        stage_outputs_[stage->idx] = RunStage(*stage);
+    stage_outputs_.clear();
+    stage_dyn_filters_.clear();
+    for (size_t idx : ExecutionOrder()) {
+        stage_outputs_[idx] = RunStage(*plan.stages[idx]);
     }
     // The root gathers into a single result; flatten its partitions (the default
     // single partition is the common case) into one block set.

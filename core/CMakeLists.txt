@@ -11,7 +11,9 @@ set(PLUME_CORE_ENGINE_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/common/types.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/csv/csv.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dandelion/s3.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/bloom_filter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/aggregate.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/dynamic_filter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/filter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/join.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/limit.cpp
@@ -50,9 +52,12 @@ set(PLUME_CORE_COMPILE_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dandelion/composition.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/compile.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/converter.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/dynamic_filter_planning.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/expression_translator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/physical_plan.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/plan_builder.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/transfer/join_graph.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/transfer/relation.cpp
 )
 
 set(PLUME_CORE_SOURCES ${PLUME_CORE_ENGINE_SOURCES})

@@ -3,10 +3,18 @@
 #include "plume/catalog/catalog.hpp"
 #include "plume/common/types.hpp"
 #include "plume/execution/operator.hpp"
+#include "plume/execution/operators/aggregate.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
+#include "plume/execution/operators/filter.hpp"
+#include "plume/execution/operators/join.hpp"
+#include "plume/execution/operators/projection.hpp"
+#include "plume/execution/operators/sort.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/parser/physical_plan.hpp"
 
+#include <algorithm>
 #include <memory>
+#include <unordered_map>
 
 namespace plume::parser {
 
@@ -41,6 +49,7 @@ PlanBuilder::SharedOpNode AddShuffle(PlanBuilder::SharedOpNode n, std::vector<ui
                 c->sources[1] = prev_splitter;
             }
         }
+        prev_splitter->consumers = std::move(n->consumers);
         n->consumers = { prev_splitter };
     }
 
@@ -155,10 +164,132 @@ Stage *PlanBuilder::StageAt(size_t idx) {
 
 LeafStage *PlanBuilder::LeafStageAt(size_t idx) {
     Stage *s = StageAt(idx);
-    if (!s || !s->is_leaf()) {
+    if (!s || !s->IsLeaf()) {
         return nullptr;
     }
     return static_cast<LeafStage*>(s);
+}
+
+std::pair<PlanBuilder::SharedOpNode, uint32_t> PlanBuilder::AppendColumn(PlanBuilder::SharedOpNode node,
+        expr::ExprNode value, ColumnType type) {
+    auto t = std::make_shared<exec::ProjectionTemplate>();
+    Schema out = node->output_schema;
+    for (uint32_t i = 0; i < out.columns.size(); i++) {
+        t->projections.push_back(expr::ExprNode::Reference(i, out.columns[i].type));
+    }
+    const uint32_t new_idx = static_cast<uint32_t>(out.columns.size());
+    t->projections.push_back(std::move(value));
+    out.columns.push_back({"__key" + std::to_string(new_idx), type, /*nullable=*/true});
+    return std::make_pair(After(std::move(node), std::move(t), std::move(out)), new_idx);
+}
+
+std::optional<PlanBuilder::ColumnSource> PlanBuilder::TraceColumnStep(const OperatorNode &node, uint32_t col_idx) {
+    // A node without a template is either a source (nothing to step to) or a splitter node.
+    if (!node.templ) {
+        if (node.sources[0]) {
+            return ColumnSource{0, col_idx}; // a splitter: passthrough, same columns
+        }
+        return std::nullopt;
+    }
+
+    // passthrough operators (filters, sort)
+    const auto *templ = node.templ.get();
+    if (dynamic_cast<const exec::FilterTemplate *>(templ) || dynamic_cast<const exec::SortTemplate *>(templ) ||
+        dynamic_cast<const exec::DynamicFilterBuildTemplate *>(templ)) {
+        return ColumnSource{0, col_idx}; // passthrough, same columns
+    }
+
+    // projection
+    if (auto *proj = dynamic_cast<const exec::ProjectionTemplate *>(templ)) {
+        if (col_idx >= proj->projections.size()) {
+            return std::nullopt;
+        }
+        const expr::ExprNode &e = proj->projections[col_idx];
+        if (e.kind != expr::ExprKind::REFERENCE) {
+            return std::nullopt; // a computed column -- can't trace a value back through it
+        }
+        return ColumnSource{0, static_cast<uint32_t>(e.ref_index)};
+    }
+
+    // aggregate
+    if (auto *agg = dynamic_cast<const exec::AggregateTemplate *>(templ)) {
+        // The output leads with the group keys; a group's rows all share its key.
+        if (col_idx >= agg->group_keys.size() || agg->group_keys[col_idx].kind != expr::ExprKind::REFERENCE) {
+            return std::nullopt;
+        }
+        return ColumnSource{0, static_cast<uint32_t>(agg->group_keys[col_idx].ref_index)};
+    }
+
+    // join
+    if (auto *join = dynamic_cast<const exec::JoinTemplate *>(templ)) {
+        // The natural layout (exec::JoinSchema): left columns, right columns, marker.
+        using K = exec::JoinKind;
+        const bool has_left = join->kind != K::RIGHT_SEMI && join->kind != K::RIGHT_ANTI;
+        const bool has_right = join->kind != K::SEMI && join->kind != K::ANTI && join->kind != K::MARK;
+        const auto left_size = static_cast<uint32_t>(node.sources[0]->output_schema.columns.size());
+        if (has_left && col_idx < left_size) {
+            return ColumnSource{0, col_idx};
+        }
+        const uint32_t right_idx = has_left ? col_idx - left_size : col_idx;
+        if (has_right && join->kind != K::SINGLE && right_idx < join->right_schema.columns.size()) {
+            return ColumnSource{1, right_idx};
+        }
+        return std::nullopt; // the marker, or a SINGLE join's build side
+    }
+    return std::nullopt; // anything else (limit, top-n, ...) -- filtering its input changes its output
+}
+
+std::optional<PlanBuilder::LeafColumn> PlanBuilder::TraceLeafColumn(const SharedOpNode &node, uint32_t col_idx) {
+    SharedOpNode cur = node;
+    uint32_t col = col_idx;
+    while (true) {
+        if (!cur->templ && !cur->sources[0]) {
+            break; // a source
+        }
+        auto step = TraceColumnStep(*cur, col);
+        if (!step) {
+            return std::nullopt;
+        }
+        col = step->column;
+        cur = cur->sources[step->src_idx];
+    }
+
+    LeafStage *leaf = LeafStageAt(cur->stage_idx);
+    if (!leaf) {
+        return std::nullopt;
+    }
+    uint32_t file_idx = col;
+    if (leaf->projection && !leaf->projection->empty()) {
+        if (col >= leaf->projection->size()) {
+            return std::nullopt;
+        }
+        file_idx = (*leaf->projection)[col];
+    }
+    return LeafColumn{cur, leaf, col, file_idx};
+}
+
+void PlanBuilder::AddDynamicFilter(DynamicFilterEdge edge) {
+    dynamic_filters_.push_back(std::move(edge));
+}
+
+void PlanBuilder::AttachDynamicFilters() {
+    // Edges with the same build node, column and parameters share one tap.
+    dynamic_filter_taps_.clear();
+    for (uint32_t i = 0; i < dynamic_filters_.size(); i++) {
+        const auto &e = dynamic_filters_[i];
+        auto &builds = e.build->dynamic_filter_builds;
+        auto shared = std::find_if(builds.begin(), builds.end(), [&](uint32_t t) {
+            const auto &tap = dynamic_filter_taps_[t];
+            return tap.build_column == e.build_column && tap.key_type == e.key_type &&
+                   tap.max_values == e.max_values && tap.bloom_bits == e.bloom_bits;
+        });
+        if (shared != builds.end()) {
+            dynamic_filter_taps_[*shared].edges.push_back(i);
+            continue;
+        }
+        builds.push_back(static_cast<uint32_t>(dynamic_filter_taps_.size()));
+        dynamic_filter_taps_.push_back({e.build_column, e.key_type, e.max_values, e.bloom_bits, {i}});
+    }
 }
 
 std::unique_ptr<PhysicalPlan> PlanBuilder::Export(PlanBuilder::SharedOpNode root) {
@@ -186,8 +317,36 @@ size_t PlanBuilder::NewLeafStage(std::shared_ptr<DataSource> data_src, Schema in
     return idx;
 }
 
+void PlanBuilder::EmitDynamicFilterTaps(const OperatorNode &node, size_t stage_idx) {
+    Stage *producer = StageAt(stage_idx);
+    for (uint32_t df_idx : node.dynamic_filter_builds) {
+        const auto &tap = dynamic_filter_taps_[df_idx];
+
+        producer->pipeline.operators.push_back(std::make_shared<exec::DynamicFilterBuildTemplate>(
+            tap.build_column, tap.key_type, tap.max_values, tap.bloom_bits, df_idx));
+        producer->dynamic_filter_outputs.push_back(df_idx);
+
+        for (uint32_t i : tap.edges) {
+            const auto &filter = dynamic_filters_[i];
+            // leaf targets always have a stage
+            Stage *consumer = StageAt(filter.target->stage_idx);
+            consumer->dynamic_filter_inputs.push_back(DynamicFilterInput{
+                df_idx, static_cast<uint32_t>(stage_idx), filter.target_column, filter.target_file_column, filter.prune});
+            exec::DynamicFilterProbeSpec spec{df_idx, filter.target_column};
+            auto &probes = consumer->pipeline.dynamic_filter_probes;
+            if (std::find(probes.begin(), probes.end(), spec) == probes.end()) {
+                probes.push_back(spec);
+            }
+        }
+    }
+}
+
 size_t PlanBuilder::MaterializeNode(SharedOpNode node) {
     if (node->stage_idx != kUnmaterialized) {
+        if (!node->materialized) {
+            node->materialized = true;
+            EmitDynamicFilterTaps(*node, node->stage_idx);
+        }
         return node->stage_idx;
     }
 
@@ -230,6 +389,8 @@ size_t PlanBuilder::MaterializeNode(SharedOpNode node) {
         plan_->stages[cur_id]->pipeline.operators.push_back(node->templ);
     }
     node->stage_idx = cur_id;
+    node->materialized = true;
+    EmitDynamicFilterTaps(*node, cur_id);
 
     return cur_id;
 }
