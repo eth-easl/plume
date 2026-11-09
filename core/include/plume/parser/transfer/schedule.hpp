@@ -1,8 +1,5 @@
 #pragma once
 
-// The predicate transfer schedule (predicate-transfer.md §4.4): which relation filters which, in
-// one forward pass over the join graph.
-
 #include "plume/parser/transfer/estimates.hpp"
 #include "plume/parser/transfer/join_graph.hpp"
 #include "plume/parser/transfer/relation.hpp"
@@ -30,12 +27,6 @@ public:
         uint32_t max_depth; // upper limit on a chain of transfers
     };
 
-    // Schedules relations by their estimated size before any transfer, smallest first (the
-    // paper's small -> large orientation; ties: the smaller after the filters received so far).
-    // A scheduled relation offers filters to unscheduled
-    // filterable ones, judged by its estimated size after the filters it received; each target
-    // column keeps its most selective offer. Transfers only go from earlier to later relations,
-    // so the result is acyclic.
     static TransferSchedule ForwardPass(const RelationSet &relations, const JoinGraph &graph, const Options &options);
 
     // Kept transfers, by target relation in scheduling order, then target column.

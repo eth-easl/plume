@@ -9,15 +9,11 @@ namespace plume::parser::transfer {
 
 namespace {
 
-// A join key traced to a relation column, and whether the path from the relation's source
-// point to the join is exclusive (every node on it feeds only the next one): then a filter on
-// the relation only removes rows that would reach this join.
 struct TracedKey {
     RelationColumn column;
     bool exclusive;
 };
 
-// Follows the key's values down through passthrough nodes to the first relation source point.
 std::optional<TracedKey> TraceKey(const RelationSet &relations, const PlanBuilder::SharedOpNode &input, uint32_t key,
                                   const PlanBuilder::SharedOpNode &root) {
     PlanBuilder::SharedOpNode cur = input;

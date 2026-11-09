@@ -23,9 +23,7 @@ void PredicateTransferPlanner::Plan(const PlanBuilder::SharedOpNode &root) {
 
         auto edge = MakeDynamicFilterEdge(cfg_, source.top, transfer.edge.source.column, target,
                                           transfer.source_max_distinct, /*prune=*/false);
-        // Waiting for the filter before fetching only pays off if it can prune row groups: the
-        // row groups must be clustered on the key, and the filter must carry its exact keys
-        // (a Bloom filter only prunes by its min/max range, which spans most of the file).
+        // Waiting for the filter before fetching only pays off if it can prune row groups.
         edge.prune = RowGroupsPrunable(target, cfg_) && edge.max_values > 0 &&
                      transfer.source_max_distinct <= static_cast<double>(edge.max_values);
         builder_.AddDynamicFilter(std::move(edge));

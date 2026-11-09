@@ -5,10 +5,6 @@
 
 namespace plume::parser::transfer {
 
-double DistinctKeys(double card, double domain) {
-    return domain > 0 ? std::min(card, domain) : card;
-}
-
 Selectivity EstimateSelectivity(double source_distinct, double key_domain, double target_card,
                                 const SelectivityThresholds &thresholds) {
     if (!std::isfinite(source_distinct)) {

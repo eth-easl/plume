@@ -15,8 +15,7 @@ bool IsLeaf(const PlanBuilder::OperatorNode &node) {
     return !node.templ && !node.sources[0];
 }
 
-// Every leaf reachable from `root`, in a deterministic (depth-first, left to right) order,
-// and every node reachable from it in `visited`.
+// Collectes every leaf reachable from `root` (in depth-first, left-to-right order).
 void CollectLeaves(const SharedOpNode &node, std::unordered_set<const PlanBuilder::OperatorNode *> &visited,
                    std::vector<SharedOpNode> &leaves) {
     if (!node || !visited.insert(node.get()).second) {
@@ -59,7 +58,7 @@ RelationSet RelationSet::Discover(PlanBuilder &builder, const SharedOpNode &root
         rel.stage = stage;
         rel.top = chain.back();
         rel.card = card;
-        // A filter at a forked chain's scan would thin the other branches too.
+        // a filter at a forked chain's scan would thin the other branches too
         rel.filterable = !forked && stage->data_source->type == catalog::DataSourceType::REMOTE_PARQUET;
 
         // Where each of the top's columns is read from.
@@ -75,9 +74,6 @@ RelationSet RelationSet::Discover(PlanBuilder &builder, const SharedOpNode &root
         set.relations_.push_back(std::move(rel));
     };
 
-    // Walks up the chain from its last node: through a node whose only consumer reads only it.
-    // Where the chain forks into several single-input consumers, it ends (a relation of its own,
-    // e.g. for a join reading the shared node) and every branch continues as a forked relation.
     auto walk = [&](auto &self, const SharedOpNode &leaf, LeafStage *stage, std::vector<SharedOpNode> chain,
                     bool forked) -> void {
         const SharedOpNode &cur = chain.back();

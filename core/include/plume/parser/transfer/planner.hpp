@@ -1,8 +1,5 @@
 #pragma once
 
-// The predicate transfer dynamic filter planner (see predicate-transfer.md): relations -> join
-// graph -> forward-pass schedule -> dynamic filter edges.
-
 #include "plume/parser/dynamic_filter_planning.hpp"
 #include "plume/parser/plan_builder.hpp"
 

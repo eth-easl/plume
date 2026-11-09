@@ -8,8 +8,11 @@ namespace plume::parser::transfer {
 
 namespace {
 
-// Whether offer `a` beats `b` for the same target column: more selective, then a shorter chain.
-bool Better(const Transfer &a, const Transfer &b) {
+inline double DistinctKeys(double card, double domain) {
+    return domain > 0 ? std::min(card, domain) : card;
+}
+
+inline bool Better(const Transfer &a, const Transfer &b) {
     if (a.fraction != b.fraction) {
         return a.fraction < b.fraction;
     }

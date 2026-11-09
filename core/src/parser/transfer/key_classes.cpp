@@ -8,7 +8,6 @@ namespace plume::parser::transfer {
 
 namespace {
 
-// A column's own domain: its leaf column's distinct count, else its scan's row count, else 0.
 double ColumnDomain(const RelationSet &relations, RelationColumn col) {
     const auto leaf = relations.LeafColumnOf(col);
     return leaf ? static_cast<double>(LeafColumnDomain(*leaf)) : 0.0;
