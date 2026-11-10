@@ -309,7 +309,7 @@ json SourceItemSet(const std::string& var, const DataItemVec& items) {
             {"data", json::binary(itm.data)}
         });
     }
-    return json{{"identifier", var}, {"items", json_items}};
+    return json{{"items", json_items}};
 }
 
 } // namespace
