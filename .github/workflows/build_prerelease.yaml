@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v3
-    - run: sudo apt install lld
+    - run: sudo apt-get update && sudo apt-get install -y -o Acquire::Retries=5 lld
     - run: ./scripts/build_dandelion.sh
     - name: upload operators
       shell: bash
