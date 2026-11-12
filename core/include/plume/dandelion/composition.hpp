@@ -31,9 +31,9 @@ BinaryData RegistrationBody(const DandelionComposition& comp);
 Result<BinaryData> InvocationBody(const DandelionComposition& comp, bool is_registered = false);
 
 Result<DataSetVec> ParseResponseBody(const BinaryData& body,
-    std::string* timestamps = nullptr);
+    std::string* traces = nullptr);
 
 Result<std::string> ParseAndRenderResponseBody(const dandelion::BinaryData& data, 
-    const Schema &schema, std::string* timestamps = nullptr);
+    const Schema &schema, std::string* traces = nullptr);
 
 } // namespace plume::dandelion

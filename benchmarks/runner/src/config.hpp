@@ -50,7 +50,7 @@ struct BenchmarkConfig {
     std::string query_dir;            // directory holding the .sql files
     std::string dandelion_url;        // empty -> compile only (no invocation)
     int request_timeout_s = 60;
-    std::string results_prefix;       // output dir for timings/timestamps/planning
+    std::string results_prefix;       // output dir for timings/planning/traces
     bool debug_prints = false;
 
     // DataSource and scale-factor label for single/throughput modes.

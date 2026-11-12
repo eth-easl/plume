@@ -336,7 +336,7 @@ Result<BinaryData> InvocationBody(const DandelionComposition& comp, bool is_regi
     return json::to_bson(body);
 }
 
-Result<DataSetVec> ParseResponseBody(const BinaryData& body, std::string* timestamps) {
+Result<DataSetVec> ParseResponseBody(const BinaryData& body, std::string* traces) {
     json body_json;
     try {
         body_json= json::from_bson(body);
@@ -376,11 +376,11 @@ Result<DataSetVec> ParseResponseBody(const BinaryData& body, std::string* timest
         return Error("Body does not contain array field called 'sets'.");
     }
 
-    if (timestamps) {
-        if (body_json.contains("timestamps")) {
-            *timestamps = body_json["timestamps"].get<std::string>();
+    if (traces) {
+        if (body_json.contains("trace")) {
+            *traces = body_json["trace"].get<std::string>();
         } else {
-            *timestamps = "";
+            *traces = "";
         }
     }
 
@@ -417,8 +417,8 @@ Result<std::string> RenderChunks(const std::vector<std::unique_ptr<duckdb::DataC
 } // namespace
 
 Result<std::string> ParseAndRenderResponseBody(const dandelion::BinaryData& data, const Schema &schema, 
-        std::string* timestamps) {
-    TRY(auto sets, dandelion::ParseResponseBody(data, timestamps));
+        std::string* traces) {
+    TRY(auto sets, dandelion::ParseResponseBody(data, traces));
     if (sets.size() == 0) {
         return "";
     }

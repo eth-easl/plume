@@ -102,6 +102,15 @@ Result<void> Runner::Run() {
         checksum_file_ = std::move(cf);
         LogInfo("Loaded checksums from '", config_.checksum_path, "'");
     }
+    if (!config_.dandelion_url.empty()) {
+        auto collector = DandelionTraceCollector::Init(config_.dandelion_url);
+        if (collector.is_ok()) {
+            traces_ = std::move(collector).unwrap();
+            LogDebug("Dandelion reports ", traces_->TimestampNames().size(), " timestamps");
+        } else {
+            std::cerr << "warning: not collecting dandelion traces: " << collector.error().message() << "\n";
+        }
+    }
 
     Result<void> status = Ok();
     switch (config_.type) {
@@ -179,12 +188,12 @@ Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp, std::
     Invocation &inv = invocations_[idx];
 
     dandelion::BinaryData resp_body(resp.text.begin(), resp.text.end());
-    std::string timestamps;
+    std::string trace;
     if (resp_string) {
         TRY(*resp_string, dandelion::ParseAndRenderResponseBody(resp_body, inv.out_schema));
     }
 
-    TRY(auto sets, dandelion::ParseResponseBody(resp_body, &timestamps));
+    TRY(auto sets, dandelion::ParseResponseBody(resp_body, &trace));
     if (inv.expected_checksum) {
         TRY(auto actual, ComputeChecksum(sets));
         if (!(actual == *inv.expected_checksum)) {
@@ -195,7 +204,12 @@ Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp, std::
     }
 
     inv.latencies_ms.push_back(static_cast<int64_t>(resp.elapsed * 1000.0));
-    inv.timestamps.push_back(std::move(timestamps));
+    if (traces_) {
+        auto status = traces_->AddTrace(inv.name, trace);
+        if (status.is_error()) {
+            std::cerr << "warning: dropping trace of '" << inv.name << "': " << status.error().message() << "\n";
+        }
+    }
     return Ok();
 }
 
@@ -546,20 +560,13 @@ Result<void> Runner::ExportResults() {
         }
     }
 
-    // timestamps.txt
-    {
-        std::ofstream f(config_.results_prefix + "/timestamps.txt", std::ios::trunc);
-        for (const auto &inv : invocations_) {
-            f << "Query " << inv.name << ":\n[\n";
-            for (const auto &ts : inv.timestamps) {
-                f << ts << ",\n";
-            }
-            f.seekp(-2, f.cur); // remove last ',\n'
-            f << "\n]\n";
-        }
-    }
+    LogInfo("Wrote timings.txt, planning.txt to ", config_.results_prefix);
 
-    LogInfo("Wrote timings.txt, planning.txt, timestamps.txt to ", config_.results_prefix);
+    // traces.plmt.gz (only if dandelion returned traces)
+    if (traces_ && !traces_->Empty()) {
+        TRYV(traces_->ExportToFile(config_.results_prefix + "/traces.plmt.gz"));
+        LogInfo("Wrote ", traces_->Len(), " traces to traces.plmt.gz");
+    }
     return Ok();
 }
 
