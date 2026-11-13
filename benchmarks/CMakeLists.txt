@@ -6,6 +6,7 @@
 #   - runner/  : plume_bench — the config-driven dandelion benchmark harness,
 #                reused by any benchmark suite.
 #   - tpch/    : TPC-H queries/configs/traces run through the runner/ harness.
+#   - tpcds/   : TPC-DS queries/configs run through the runner/ harness.
 #   - ubench/  : a vibe-coded micro-benchmark tool (traced per-operator compute
 #                analysis), built only when PLUME_BUILD_UBENCH (declared at
 #                the top level) is ON and the function executables are being

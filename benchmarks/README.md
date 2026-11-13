@@ -1,6 +1,6 @@
 # Benchmark harness (`plume_bench`)
 
-Config-driven runner for TPC-H-style SQL queries against a Dandelion instance. Built directly on `core` (reuses `CompileQuery` + the dandelion API), so it measures both planning time (compile) and execution time (invocation) in one
+Config-driven runner for TPC-H/TPC-DS-style SQL queries against a Dandelion instance. Built directly on `core` (reuses `CompileQuery` + the dandelion API), so it measures both planning time (compile) and execution time (invocation) in one
 binary.
 
 ## Running
@@ -10,11 +10,11 @@ binary.
 ./benchmarks/plume_bench <path-to-config>
 ```
 
-Multiple configs run in sequence. A config with no `dandelionUrl` compiles every query (planning time only) and skips invocation.
+Multiple configs run in sequence. Each suite keeps its configs and checksums under `<suite>/config/`. A config with no `dandelionUrl` compiles every query (planning time only) and skips invocation.
 
 ## Queries
 
-Plain `.sql` files under `tpch/queries/`, referencing tables as `[table]` placeholders resolved at run time against the config's data source — a bracket-list of split files when `tableNumFiles[table] > 1`, else a single path.
+Plain `.sql` files under `<suite>/queries/`, referencing tables as `[table]` placeholders resolved at run time against the config's data source — a bracket-list of split files when `tableNumFiles[table] > 1`, else a single path.
 
 ## Benchmark Types
 
