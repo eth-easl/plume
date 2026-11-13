@@ -26,14 +26,4 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
 
 Result<std::vector<std::string>> ParseCompositionInputNames(const DandelionComposition &comp);
 
-BinaryData RegistrationBody(const DandelionComposition& comp);
-
-Result<BinaryData> InvocationBody(const DandelionComposition& comp, bool is_registered = false);
-
-Result<DataSetVec> ParseResponseBody(const BinaryData& body,
-    std::string* traces = nullptr);
-
-Result<std::string> ParseAndRenderResponseBody(const dandelion::BinaryData& data, 
-    const Schema &schema, std::string* traces = nullptr);
-
 } // namespace plume::dandelion

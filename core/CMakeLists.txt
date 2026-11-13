@@ -49,6 +49,7 @@ set(PLUME_CORE_COMPILE_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/catalog/plume_remote.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/catalog/remote_resolver.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/catalog/source_scan.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/dandelion/api.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dandelion/composition.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/compile.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/converter.cpp
@@ -83,6 +84,21 @@ target_link_libraries(plume PUBLIC plume_duckdb)
 target_link_libraries(plume PRIVATE plume_snappy)
 if(PLUME_WITH_COMPILE_LAYER)
   target_link_libraries(plume PRIVATE cpr::cpr nlohmann_json::nlohmann_json)
+
+  # Dandelion request/response protobuf metadata (client side only). The generated
+  # header is private to src/dandelion/api.cpp; no protobuf type leaks into the
+  # public headers.
+  add_library(plume_dandelion_proto STATIC ${CMAKE_CURRENT_SOURCE_DIR}/proto/dandelion.proto)
+  protobuf_generate(
+    TARGET plume_dandelion_proto
+    LANGUAGE cpp
+    IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto
+    PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto
+    PROTOC_OPTIONS ${PLUME_PROTOC_EXTRA_ARGS}
+  )
+  target_include_directories(plume_dandelion_proto SYSTEM PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/proto)
+  target_link_libraries(plume_dandelion_proto PUBLIC ${PLUME_PROTOBUF_TARGET})
+  target_link_libraries(plume PRIVATE plume_dandelion_proto)
 endif()
 if(PLUME_RECYCLING_ALLOCATOR)
   target_compile_definitions(plume PRIVATE PLUME_RECYCLING_ALLOCATOR)

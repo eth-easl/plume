@@ -76,3 +76,7 @@ function cmake_build_and_install() {
     fi
     popd
 }
+
+function add_to_bashrc() {
+    grep -qxF "$1" "$HOME/.bashrc" || echo "$1" >> "$HOME/.bashrc"
+}
