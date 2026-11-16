@@ -58,7 +58,7 @@ void CheckExternalRead(int32_t codec, const std::string &path) {
         chunk.SetValue(3, r, Value::DOUBLE(10.0 + r + 0.25).DefaultCastAs(LogicalType::DECIMAL(9, 2)));
         chunk.SetValue(4, r, Value::DATE(duckdb::Date::FromDate(2021, 3, r + 1)));
     }
-    chunk.SetCardinality(n);
+    chunk.SetChildCardinality(n);
 
     auto buf = parquet::WriteParquet(schema, {&chunk}, codec).unwrap();
     {
@@ -66,20 +66,22 @@ void CheckExternalRead(int32_t codec, const std::string &path) {
         f.write(reinterpret_cast<const char *>(buf.data()), buf.size());
     }
 
-    duckdb::DuckDB db(nullptr); // duckdb_glue's LoadAllExtensions registers parquet
+    duckdb::DuckDB db(nullptr); // duckdb_glue registers parquet
     duckdb::Connection con(db);
 
     auto res = con.Query("SELECT id, label, big, price, dt FROM read_parquet('" + path + "') ORDER BY id");
     CHECK_MSG(!res->HasError(), res->HasError() ? res->GetError().c_str() : "");
     CHECK(res->RowCount() == 3);
+    auto out = res->Fetch(); // 3 rows fit in a single chunk
+    CHECK(out && out->size() == 3);
 
     // Spot-check values, types, and the preserved NULL.
-    CHECK(res->GetValue(0, 0).GetValue<int32_t>() == 1);
-    CHECK(res->GetValue(1, 0).ToString() == "alpha");
-    CHECK(res->GetValue(1, 1).IsNull());
-    CHECK(res->GetValue(2, 2).GetValue<int64_t>() == int64_t(3) * 1000000000);
-    CHECK(res->GetValue(3, 0).ToString() == "10.25"); // DECIMAL(9,2) round-trip
-    CHECK(res->GetValue(4, 2).ToString() == "2021-03-03");
+    CHECK(out->GetValue(0, 0).GetValue<int32_t>() == 1);
+    CHECK(out->GetValue(1, 0).ToString() == "alpha");
+    CHECK(out->GetValue(1, 1).IsNull());
+    CHECK(out->GetValue(2, 2).GetValue<int64_t>() == int64_t(3) * 1000000000);
+    CHECK(out->GetValue(3, 0).ToString() == "10.25"); // DECIMAL(9,2) round-trip
+    CHECK(out->GetValue(4, 2).ToString() == "2021-03-03");
 
     std::remove(path.c_str());
 }

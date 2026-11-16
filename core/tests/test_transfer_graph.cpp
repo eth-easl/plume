@@ -1,17 +1,10 @@
-// Unit tests for the predicate transfer dynamic filter planner (parser/transfer/, see
-// predicate-transfer.md): relation discovery, join graph edges and their closure, key class
-// domains, the forward pass, and the planner's emitted dynamic filters. The node graphs
-// are built by hand through PlanBuilder, as the converter would.
-
 #include "test_util.hpp"
 
 #include "plume/catalog/catalog.hpp"
 #include "plume/catalog/parquet.hpp"
-#include "plume/execution/operators/aggregate.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/operators/join.hpp"
-#include "plume/execution/operators/projection.hpp"
 #include "plume/expression/expression.hpp"
 #include "plume/parser/converter.hpp"
 #include "plume/parser/dynamic_filter_planning.hpp"
@@ -22,7 +15,6 @@
 #include "duckdb/common/types/value.hpp"
 
 #include <algorithm>
-#include <limits>
 
 using namespace plume;
 using namespace plume::parser;

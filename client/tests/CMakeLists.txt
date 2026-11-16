@@ -35,7 +35,7 @@ endif()
 # real DuckDB instance + the parquet extension. Only built when that extension
 # archive has been built (setup.sh builds only core_functions by default):
 #   ninja -C build/duckdb parquet_extension
-set(PLUME_PARQUET_EXT_LIB "${CMAKE_SOURCE_DIR}/build/duckdb/extension/parquet/libparquet_extension.a")
+set(PLUME_PARQUET_EXT_LIB "${DUCKDB_BUILD_DIR}/extension/parquet/libparquet_extension.a")
 if(EXISTS "${PLUME_PARQUET_EXT_LIB}")
   add_executable(test_parquet_external test_parquet_external.cpp)
   target_link_libraries(test_parquet_external PRIVATE plume_client plume_test_support)

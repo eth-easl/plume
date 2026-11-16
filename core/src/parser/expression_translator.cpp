@@ -32,69 +32,79 @@ Result<std::vector<expr::ExprNode>> TranslateChildren(const duckdb::vector<duckd
 
 } // namespace
 
-Result<expr::ExprNode> TranslateExpression(const Expression &expr) {
-    switch (expr.GetExpressionClass()) {
-    case ExpressionClass::BOUND_REF: {
-        auto &ref = expr.Cast<duckdb::BoundReferenceExpression>();
-        return expr::ExprNode::Reference(static_cast<uint32_t>(ref.index), FromLogicalType(ref.return_type));
+static Result<expr::ExprNode> TranslateFunction(const duckdb::BoundFunctionExpression &fn) {
+    if (duckdb::BoundComparisonExpression::IsComparison(fn.GetExpressionType())) {
+        TRY(auto left, TranslateExpression(duckdb::BoundComparisonExpression::Left(fn)));
+        TRY(auto right, TranslateExpression(duckdb::BoundComparisonExpression::Right(fn)));
+        return expr::ExprNode::Comparison(fn.GetExpressionType(), std::move(left), std::move(right));
     }
-    case ExpressionClass::BOUND_CONSTANT: {
-        auto &c = expr.Cast<duckdb::BoundConstantExpression>();
-        return expr::ExprNode::Constant(c.value, FromLogicalType(c.return_type));
-    }
-    case ExpressionClass::BOUND_FUNCTION: {
-        auto &fn = expr.Cast<duckdb::BoundFunctionExpression>();
-        TRY(auto children, TranslateChildren(fn.children));
-        return expr::ExprNode::Function(fn.function.name, FromLogicalType(fn.return_type), std::move(children));
-    }
-    case ExpressionClass::BOUND_COMPARISON: {
-        auto &cmp = expr.Cast<duckdb::BoundComparisonExpression>();
-        TRY(auto left, TranslateExpression(*cmp.left));
-        TRY(auto right, TranslateExpression(*cmp.right));
-        return expr::ExprNode::Comparison(cmp.GetExpressionType(), std::move(left), std::move(right));
-    }
-    case ExpressionClass::BOUND_CONJUNCTION: {
-        auto &conj = expr.Cast<duckdb::BoundConjunctionExpression>();
-        TRY(auto children, TranslateChildren(conj.children));
-        return expr::ExprNode::Conjunction(conj.GetExpressionType(), std::move(children));
-    }
-    case ExpressionClass::BOUND_OPERATOR: {
-        auto &op = expr.Cast<duckdb::BoundOperatorExpression>();
-        TRY(auto children, TranslateChildren(op.children));
-        return expr::ExprNode::Operator(op.GetExpressionType(), FromLogicalType(op.return_type), std::move(children));
-    }
-    case ExpressionClass::BOUND_CASE: {
-        auto &c = expr.Cast<duckdb::BoundCaseExpression>();
-        std::vector<expr::ExprNode> children;
-        children.reserve(c.case_checks.size() * 2 + 1);
-        for (auto &check : c.case_checks) {
-            TRY(auto when, TranslateExpression(*check.when_expr));
-            TRY(auto then, TranslateExpression(*check.then_expr));
-            children.push_back(std::move(when));
-            children.push_back(std::move(then));
-        }
-        TRY(auto else_node, TranslateExpression(*c.else_expr));
-        children.push_back(std::move(else_node));
-        return expr::ExprNode::Case(std::move(children), FromLogicalType(c.return_type));
-    }
-    case ExpressionClass::BOUND_BETWEEN: {
+    switch (fn.GetExpressionType()) {
+    case duckdb::ExpressionType::COMPARE_BETWEEN: {
         // Lower to `input >= lower AND input <= upper` (inclusivity from the
         // between flags). Reuses Plume's comparison/conjunction IR.
-        auto &b = expr.Cast<duckdb::BoundBetweenExpression>();
-        TRY(auto input_ir, TranslateExpression(*b.input));
-        TRY(auto lower, TranslateExpression(*b.lower));
-        TRY(auto upper, TranslateExpression(*b.upper));
-        auto lower_cmp = expr::ExprNode::Comparison(b.LowerComparisonType(), input_ir, std::move(lower));
-        auto upper_cmp = expr::ExprNode::Comparison(b.UpperComparisonType(), std::move(input_ir), std::move(upper));
+        using duckdb::BoundBetweenExpression;
+        TRY(auto input_ir, TranslateExpression(BoundBetweenExpression::Input(fn)));
+        TRY(auto lower, TranslateExpression(BoundBetweenExpression::LowerBound(fn)));
+        TRY(auto upper, TranslateExpression(BoundBetweenExpression::UpperBound(fn)));
+        auto lower_cmp =
+            expr::ExprNode::Comparison(BoundBetweenExpression::LowerComparisonType(fn), input_ir, std::move(lower));
+        auto upper_cmp = expr::ExprNode::Comparison(BoundBetweenExpression::UpperComparisonType(fn),
+                                                    std::move(input_ir), std::move(upper));
         std::vector<expr::ExprNode> args;
         args.push_back(std::move(lower_cmp));
         args.push_back(std::move(upper_cmp));
         return expr::ExprNode::Conjunction(duckdb::ExpressionType::CONJUNCTION_AND, std::move(args));
     }
-    case ExpressionClass::BOUND_CAST: {
-        auto &cast = expr.Cast<duckdb::BoundCastExpression>();
-        TRY(auto child, TranslateExpression(*cast.child));
-        return expr::ExprNode::Cast(std::move(child), FromLogicalType(cast.return_type), cast.try_cast);
+    case duckdb::ExpressionType::OPERATOR_CAST: {
+        using duckdb::BoundCastExpression;
+        TRY(auto child, TranslateExpression(BoundCastExpression::Child(fn)));
+        return expr::ExprNode::Cast(std::move(child), FromLogicalType(BoundCastExpression::TargetType(fn)),
+                                    BoundCastExpression::IsTryCast(fn));
+    }
+    default: {
+        TRY(auto children, TranslateChildren(fn.GetChildren()));
+        return expr::ExprNode::Function(fn.Function().GetName().GetIdentifierName(),
+                                        FromLogicalType(fn.GetReturnType()), std::move(children));
+    }
+    }
+}
+
+Result<expr::ExprNode> TranslateExpression(const Expression &expr) {
+    switch (expr.GetExpressionClass()) {
+    case ExpressionClass::BOUND_REF: {
+        auto &ref = expr.Cast<duckdb::BoundReferenceExpression>();
+        return expr::ExprNode::Reference(static_cast<uint32_t>(ref.Index()), FromLogicalType(ref.GetReturnType()));
+    }
+    case ExpressionClass::BOUND_CONSTANT: {
+        auto &c = expr.Cast<duckdb::BoundConstantExpression>();
+        return expr::ExprNode::Constant(c.GetValue(), FromLogicalType(c.GetReturnType()));
+    }
+    case ExpressionClass::BOUND_FUNCTION:
+        return TranslateFunction(expr.Cast<duckdb::BoundFunctionExpression>());
+    case ExpressionClass::BOUND_CONJUNCTION: {
+        auto &conj = expr.Cast<duckdb::BoundConjunctionExpression>();
+        TRY(auto children, TranslateChildren(conj.GetChildren()));
+        return expr::ExprNode::Conjunction(conj.GetExpressionType(), std::move(children));
+    }
+    case ExpressionClass::BOUND_OPERATOR: {
+        auto &op = expr.Cast<duckdb::BoundOperatorExpression>();
+        TRY(auto children, TranslateChildren(op.GetChildren()));
+        return expr::ExprNode::Operator(op.GetExpressionType(), FromLogicalType(op.GetReturnType()),
+                                        std::move(children));
+    }
+    case ExpressionClass::BOUND_CASE: {
+        auto &c = expr.Cast<duckdb::BoundCaseExpression>();
+        std::vector<expr::ExprNode> children;
+        children.reserve(c.CaseChecks().size() * 2 + 1);
+        for (auto &check : c.CaseChecks()) {
+            TRY(auto when, TranslateExpression(*check.when_expr));
+            TRY(auto then, TranslateExpression(*check.then_expr));
+            children.push_back(std::move(when));
+            children.push_back(std::move(then));
+        }
+        TRY(auto else_node, TranslateExpression(c.Else()));
+        children.push_back(std::move(else_node));
+        return expr::ExprNode::Case(std::move(children), FromLogicalType(c.GetReturnType()));
     }
     case ExpressionClass::BOUND_COLUMN_REF:
         return Error("Unresolved BoundColumnRefExpression — ColumnBindingResolver must run first.");
@@ -120,20 +130,21 @@ Result<expr::ExprNode> CombinePredicates(const duckdb::vector<duckdb::unique_ptr
 }
 
 Result<exec::AggregateSpec> TranslateAggregate(const duckdb::BoundAggregateExpression &agg) {
-    if (agg.filter) {
+    if (agg.GetFilter()) {
         return Error("Aggregate FILTER clause is not supported.", ErrorKind::NotImplemented);
     }
-    if (agg.order_bys) {
+    if (agg.GetOrderBys()) {
         return Error("Ordered aggregates are not supported.", ErrorKind::NotImplemented);
     }
     exec::AggregateSpec spec;
     // statistics_propagation can swap sum -> sum_no_overflow when it proves no
     // overflow; Plume only registers plain sum (same result), so normalize back.
-    spec.func_name = (agg.function.name == "sum_no_overflow") ? "sum" : agg.function.name;
-    spec.return_type = FromLogicalType(agg.return_type);
+    const auto &func_name = agg.Function().GetName().GetIdentifierName();
+    spec.func_name = (func_name == "sum_no_overflow") ? "sum" : func_name;
+    spec.return_type = FromLogicalType(agg.GetReturnType());
     spec.distinct = agg.IsDistinct();
-    spec.arguments.reserve(agg.children.size());
-    for (auto &child : agg.children) {
+    spec.arguments.reserve(agg.GetChildren().size());
+    for (auto &child : agg.GetChildren()) {
         TRY(auto arg, TranslateExpression(*child));
         spec.arguments.push_back(std::move(arg));
     }
@@ -172,12 +183,15 @@ Result<uint32_t> JoinKeyIndex(const duckdb::Expression &side) {
         return Error("Join keys must be plain columns (expression join keys not supported).",
                      ErrorKind::NotImplemented);
     }
-    return static_cast<uint32_t>(side.Cast<duckdb::BoundReferenceExpression>().index);
+    return static_cast<uint32_t>(side.Cast<duckdb::BoundReferenceExpression>().Index());
 }
 
 bool IsEquiCondition(const duckdb::JoinCondition &cond) {
-    return cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-           cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+    if (!cond.IsComparison()) {
+        return false;
+    }
+    const auto cmp = cond.GetComparisonType();
+    return cmp == duckdb::ExpressionType::COMPARE_EQUAL || cmp == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 }
 
 } // namespace plume::parser

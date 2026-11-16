@@ -5,6 +5,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -50,17 +51,18 @@ duckdb::Vector &HashableColumn(duckdb::DataChunk &chunk, duckdb::idx_t c, duckdb
     duckdb::FlatVector::SetValidity(*canon, duckdb::FlatVector::Validity(src));
     if (id == duckdb::LogicalTypeId::DOUBLE) {
         auto *sdata = duckdb::FlatVector::GetData<double>(src);
-        auto *ddata = duckdb::FlatVector::GetData<double>(*canon);
+        auto *ddata = duckdb::FlatVector::GetDataMutable<double>(*canon);
         for (duckdb::idx_t r = 0; r < count; r++) {
             ddata[r] = CanonicalizeDouble(sdata[r]);
         }
     } else {
         auto *sdata = duckdb::FlatVector::GetData<float>(src);
-        auto *ddata = duckdb::FlatVector::GetData<float>(*canon);
+        auto *ddata = duckdb::FlatVector::GetDataMutable<float>(*canon);
         for (duckdb::idx_t r = 0; r < count; r++) {
             ddata[r] = static_cast<float>(CanonicalizeDouble(sdata[r]));
         }
     }
+    duckdb::FlatVector::SetSize(*canon, count); // v2 vectors carry their own size
     duckdb::Vector &ref = *canon;
     storage.push_back(std::move(canon));
     return ref;

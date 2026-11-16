@@ -1,11 +1,3 @@
-// Regression tests for PlanBuilder's remote-registry sharing (Scan()/RemoteRegistry* in
-// plan_builder.cpp): a second Scan() over the same remote data source with the same pushed
-// projection/filter must reuse the first Scan()'s exact leaf node (not just its stage), so that
-// a differing residual filter/projection chained after it (via After()) forks into its own
-// downstream stage instead of being fused onto the shared leaf's pipeline - and an identical
-// residual chain gets deduplicated onto the same downstream stage instead of building a
-// redundant duplicate.
-
 #include "test_util.hpp"
 
 #include "plume/catalog/catalog.hpp"

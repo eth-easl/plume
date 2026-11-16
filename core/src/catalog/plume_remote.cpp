@@ -6,6 +6,7 @@
 #include "plume/catalog/remote_resolver.hpp"
 #include "plume/common/result.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -211,7 +212,7 @@ namespace {
 
 duckdb::unique_ptr<duckdb::FunctionData> PlumeRemoteBind(duckdb::ClientContext &,
         duckdb::TableFunctionBindInput &input, duckdb::vector<duckdb::LogicalType> &return_types,
-        duckdb::vector<std::string> &names) {
+        duckdb::vector<duckdb::Identifier> &names) {
     auto *registry = static_cast<PlumeRemoteInfo *>(input.info.get());
     if (!registry) {
         throw duckdb::InvalidInputException("plume_remote: missing source registry");
@@ -232,7 +233,7 @@ duckdb::unique_ptr<duckdb::FunctionData> PlumeRemoteBind(duckdb::ClientContext &
     auto bind_data = duckdb::make_uniq<PlumeRemoteBindData>();
     bind_data->info = data_source;
     for (const auto &col : bind_data->info->schema->columns) {
-        names.push_back(col.name);
+        names.emplace_back(col.name);
         return_types.push_back(ToLogicalType(col.type));
     }
     return std::move(bind_data);

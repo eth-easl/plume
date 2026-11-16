@@ -25,6 +25,9 @@
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -56,6 +59,70 @@ using catalog::DataSource;
 using catalog::kPlumeRemoteName;
 using catalog::PlumeRemoteBindData;
 using catalog::SourceCatalog;
+
+namespace {
+
+bool IsRuntimeTableFilter(const duckdb::Expression &e) {
+    return e.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+           e.Cast<duckdb::BoundFunctionExpression>().Function().GetName().GetIdentifierName().rfind(
+               "__internal_tablefilter_", 0) == 0;
+}
+
+bool ContainsRuntimeTableFilter(const duckdb::Expression &e) {
+    if (IsRuntimeTableFilter(e)) {
+        return true;
+    }
+    bool found = false;
+    duckdb::ExpressionIterator::EnumerateChildren(
+        e, [&](const duckdb::Expression &child) { found = found || ContainsRuntimeTableFilter(child); });
+    return found;
+}
+
+// Drops runtime filters from the top-level AND chain. Returns nullptr if nothing required is left.
+Result<duckdb::unique_ptr<duckdb::Expression>> StripRuntimeTableFilters(duckdb::unique_ptr<duckdb::Expression> e) {
+    if (IsRuntimeTableFilter(*e)) {
+        return duckdb::unique_ptr<duckdb::Expression>();
+    }
+    if (e->GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
+        auto &children = e->Cast<duckdb::BoundConjunctionExpression>().GetChildrenMutable();
+        duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> kept;
+        for (auto &child : children) {
+            TRY(auto stripped, StripRuntimeTableFilters(std::move(child)));
+            if (stripped) {
+                kept.push_back(std::move(stripped));
+            }
+        }
+        if (kept.empty()) {
+            return duckdb::unique_ptr<duckdb::Expression>();
+        }
+        if (kept.size() == 1) {
+            return std::move(kept[0]);
+        }
+        children = std::move(kept);
+        return e;
+    }
+    if (ContainsRuntimeTableFilter(*e)) {
+        return Error("Runtime table filter nested below a non-AND expression is not supported.",
+                     ErrorKind::NotImplemented);
+    }
+    return e;
+}
+
+void RemapCombinedJoinRefs(expr::ExprNode &node, uint32_t duck_left_size, bool swapped, uint32_t left_size) {
+    if (node.kind == expr::ExprKind::REFERENCE) {
+        const bool from_duck_left = node.ref_index < duck_left_size;
+        if (!swapped) {
+            node.ref_index = from_duck_left ? node.ref_index : node.ref_index - duck_left_size + left_size;
+        } else {
+            node.ref_index = from_duck_left ? node.ref_index + left_size : node.ref_index - duck_left_size;
+        }
+    }
+    for (auto &child : node.children) {
+        RemapCombinedJoinRefs(child, duck_left_size, swapped, left_size);
+    }
+}
+
+} // namespace
 
 Result<std::unique_ptr<PhysicalPlan>> Converter::Convert(duckdb::LogicalOperator &root) {
     TRY(auto root_node, Build(root));
@@ -370,7 +437,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
     auto table = get.GetTable();
     std::shared_ptr<DataSource> data_source = nullptr;
     bool is_remote = false;
-    if (!table && get.function.name == kPlumeRemoteName && get.bind_data) {
+    if (!table && get.function.GetName().GetIdentifierName() == kPlumeRemoteName && get.bind_data) {
         data_source = get.bind_data->Cast<PlumeRemoteBindData>().info;
         if (!data_source->schema) {
             return Error("Remote data source should have been resolved by now.", ErrorKind::RuntimeError);
@@ -385,7 +452,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
             if (constraint->type != duckdb::ConstraintType::NOT_NULL) {
                 continue;
             }
-            idx_t col_idx = constraint->Cast<duckdb::NotNullConstraint>().index.index;
+            duckdb::idx_t col_idx = constraint->Cast<duckdb::NotNullConstraint>().index.index;
             if (col_idx < not_null_cols.size()) {
                 not_null_cols[col_idx] = true;
             }
@@ -398,9 +465,9 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
         if (cid.IsVirtualColumn()) {
             return Error("Virtual/row-id columns are not supported.", ErrorKind::NotImplemented);
         }
-        const idx_t idx = cid.GetPrimaryIndex();
+        const duckdb::idx_t idx = cid.GetPrimaryIndex();
         Column col;
-        col.name = get.names[idx];
+        col.name = get.names[idx].GetIdentifierName();
         col.type = FromLogicalType(get.returned_types[idx]);
         if (data_source && idx < data_source->schema->columns.size()) {
             col.nullable = data_source->schema->columns[idx].nullable;
@@ -414,47 +481,37 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
     
     std::vector<expr::ExprNode> filter_preds;                     // pipeline FILTER (scanned-position refs)
     std::shared_ptr<expr::ExprNode> pushed_filter_pred = nullptr; // reader pruning (storage-index refs)
-    if (!get.table_filters.filters.empty()) {
-        std::vector<duckdb::idx_t> keys;
-        for (auto &kv : get.table_filters.filters) {
-            keys.push_back(kv.first);
-        }
-
+    // Since DuckDB v2, table filters are keyed by projection index (position in
+    // column_ids, not table column index). Multi-column filters are only pushed
+    // partially, i.e. the predicate also stays in a LogicalFilter above the scan,
+    // so they are ignored here.
+    if (get.table_filters.HasFilters()) {
         std::vector<expr::ExprNode> pushed_filter_preds;
-        for (auto storage_idx : keys) {
-            const auto &filter = *get.table_filters.filters.at(storage_idx);
-            
-            // Skipping runtime/accelerator filters as Plume handles them differently.
-            switch (filter.filter_type) {
-            case duckdb::TableFilterType::OPTIONAL_FILTER:
-            case duckdb::TableFilterType::DYNAMIC_FILTER:
-            case duckdb::TableFilterType::BLOOM_FILTER:
-                continue;
-            default:
-                break;
+        for (auto &entry : get.table_filters) {
+            const auto pos = static_cast<uint32_t>(entry.GetIndex().GetIndex());
+            if (pos >= column_ids.size()) {
+                return Error("Pushed-down filter on a non-scanned column.", ErrorKind::RuntimeError);
             }
+            const duckdb::idx_t storage_idx = column_ids[pos].GetPrimaryIndex();
+            const auto &filter = entry.Filter();
 
             // reconstruct filter
             // TODO: is this necessary for materialized tables?
-            uint32_t pos = 0;
-            for (; pos < column_ids.size(); pos++) {
-                if (column_ids[pos].GetPrimaryIndex() == storage_idx) {
-                    break;
-                }
-            }
-            if (pos == column_ids.size()) {
-                return Error("Pushed-down filter on a non-scanned column.", ErrorKind::RuntimeError);
-            }
             auto colref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(get.returned_types[storage_idx], pos);
             TRY(auto reconstructed, TryCatch([&] { return filter.ToExpression(*colref); }));
+            TRY(reconstructed, StripRuntimeTableFilters(std::move(reconstructed)));
+            if (!reconstructed) {
+                continue; // only runtime/accelerator filters, which Plume handles differently
+            }
             TRY(auto filter_pred, TranslateExpression(*reconstructed));
             filter_preds.push_back(std::move(filter_pred));
 
             // filter pushed into stage preparation
             if (is_remote && cfg_.filter_pushdown) {
-                auto sref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
-                    get.returned_types[storage_idx], static_cast<duckdb::idx_t>(storage_idx));
+                auto sref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(get.returned_types[storage_idx],
+                                                                                storage_idx);
                 TRY(auto sreconstructed, TryCatch([&] { return filter.ToExpression(*sref); }));
+                TRY(sreconstructed, StripRuntimeTableFilters(std::move(sreconstructed)));
                 TRY(auto spred, TranslateExpression(*sreconstructed));
                 pushed_filter_preds.push_back(std::move(spred));
             }
@@ -472,7 +529,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
 
     PlanBuilder::SharedOpNode cur;
     if (table) {
-        data_source = CreateTableSource(table->name, schema_scanned);
+        data_source = CreateTableSource(table->name.GetIdentifierName(), schema_scanned);
         // TODO: do we need to push a projection if not all columns are to be read here?
         cur = builder_.Scan(data_source, schema_scanned, nullptr, nullptr);
     } else if (data_source) {
@@ -542,7 +599,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildChunkGet(duckdb::LogicalColumn
         schema.columns.push_back(std::move(col));
     }
 
-    const std::string table_name = "__chunk_get_" + std::to_string(get.table_index);
+    const std::string table_name = "__chunk_get_" + std::to_string(get.table_index.index);
 
     std::string cols_ddl;
     for (size_t c = 0; c < num_cols; c++) {
@@ -630,24 +687,24 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
             continue;
         }
         uint32_t lk;
-        if (cond.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-            lk = static_cast<uint32_t>(cond.left->Cast<duckdb::BoundReferenceExpression>().index);
+        if (cond.GetLHS().GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+            lk = static_cast<uint32_t>(cond.GetLHS().Cast<duckdb::BoundReferenceExpression>().Index());
         } else {
-            TRY(auto value, TranslateExpression(*cond.left));
+            TRY(auto value, TranslateExpression(cond.GetLHS()));
             auto type = value.return_type;
             std::tie(left, lk) = builder_.AppendColumn(std::move(left), std::move(value), type);
         }
         uint32_t rk;
-        if (cond.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-            rk = static_cast<uint32_t>(cond.right->Cast<duckdb::BoundReferenceExpression>().index);
+        if (cond.GetRHS().GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+            rk = static_cast<uint32_t>(cond.GetRHS().Cast<duckdb::BoundReferenceExpression>().Index());
         } else {
-            TRY(auto value, TranslateExpression(*cond.right));
+            TRY(auto value, TranslateExpression(cond.GetRHS()));
             auto type = value.return_type;
             std::tie(right, rk) = builder_.AppendColumn(std::move(right), std::move(value), type);
         }
         left_keys.push_back(lk);
         right_keys.push_back(rk);
-        keys_match_null.push_back(cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+        keys_match_null.push_back(cond.GetComparisonType() == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
     }
     const bool has_equi_keys = !left_keys.empty();
 
@@ -680,11 +737,21 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
     if (!residual_conditions.empty()) {
         std::vector<expr::ExprNode> preds;
         preds.reserve(residual_conditions.size());
+        // Before any swap, the DuckDB left child had this many columns.
+        const uint32_t duck_left_size = duck_swapped ? right_size_orig : left_size_orig;
         for (auto *cond : residual_conditions) {
-            TRY(auto lhs, TranslateExpression(*cond->left));
-            TRY(auto rhs, TranslateExpression(*cond->right));
+            if (!cond->IsComparison()) {
+                // Since DuckDB v2 a join condition can be an arbitrary expression over
+                // `duck_left ++ duck_right`; remap it onto Plume's `left ++ right`.
+                TRY(auto pred, TranslateExpression(cond->GetJoinExpression()));
+                RemapCombinedJoinRefs(pred, duck_left_size, duck_swapped, left_size);
+                preds.push_back(std::move(pred));
+                continue;
+            }
+            TRY(auto lhs, TranslateExpression(cond->GetLHS()));
+            TRY(auto rhs, TranslateExpression(cond->GetRHS()));
             expr::OffsetReferences(duck_swapped ? lhs : rhs, left_size);
-            preds.push_back(expr::ExprNode::Comparison(cond->comparison, std::move(lhs), std::move(rhs)));
+            preds.push_back(expr::ExprNode::Comparison(cond->GetComparisonType(), std::move(lhs), std::move(rhs)));
         }
         t->has_residual = true;
         t->residual = preds.size() == 1 ? std::move(preds[0])
@@ -866,9 +933,9 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildCrossProduct(duckdb::LogicalCr
 
 Result<PlanBuilder::SharedOpNode> Converter::BuildMaterializedCTE(duckdb::LogicalMaterializedCTE &cte) {
     TRY(auto def, Build(*cte.children[0]));
-    cte_subs_[cte.table_index] = std::move(def);
+    cte_subs_[cte.table_index.index] = std::move(def);
     auto body = Build(*cte.children[1]);
-    cte_subs_.erase(cte.table_index);
+    cte_subs_.erase(cte.table_index.index);
     return body;
 }
 
@@ -920,7 +987,7 @@ Result<PlanBuilder::SharedOpNode> Converter::Build(duckdb::LogicalOperator &op) 
 
     case LogicalOperatorType::LOGICAL_CTE_REF: {
         auto &ref = op.Cast<duckdb::LogicalCTERef>();
-        auto it = cte_subs_.find(ref.cte_index);
+        auto it = cte_subs_.find(ref.cte_index.index);
         if (it == cte_subs_.end()) {
             return Error("Reference to a non-materialized CTE is not supported.",
                          ErrorKind::NotImplemented);
@@ -973,8 +1040,9 @@ void NameOutputColumns(duckdb::LogicalOperator &root, Schema &schema) {
         }
     }
     for (size_t i = 0; i < node->expressions.size() && i < schema.columns.size(); i++) {
-        if (!node->expressions[i]->GetName().empty())
-            schema.columns[i].name = node->expressions[i]->GetName();
+        const auto &name = node->expressions[i]->GetName().GetIdentifierName();
+        if (!name.empty())
+            schema.columns[i].name = name;
     }
 }
 

@@ -894,6 +894,24 @@ TEST_CASE("e2e: correlated subquery over a join (DELIM join)") {
     ExpectMatch(con, sql, /*ordered=*/false, {}, /*pre_aggregate=*/false);
 }
 
+// An OR predicate spanning both join sides (TPC-H Q7/Q19-shaped). DuckDB v2
+// attaches it to the join as an expression condition over `left ++ right`,
+// which Plume evaluates as a residual next to the equi key.
+TEST_CASE("e2e: join with an OR condition spanning both sides") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeDb(db);
+    for (const char *sql :
+         {"SELECT o_id, c_id FROM orders o JOIN customers c ON o.cust = c.c_id "
+          "WHERE (o.region = 'east' AND c.tier = 1) OR (o.region = 'west' AND c.tier = 2)",
+          "SELECT o_id, name FROM customers c JOIN orders o ON o.cust = c.c_id "
+          "WHERE (c.name = 'carol' AND o.amount > 50) OR (c.tier = 2 AND o.region = 'west')",
+          // expression join keys: Plume appends computed key columns to both sides
+          "SELECT o_id, c_id FROM orders o JOIN customers c ON CAST(o.cust AS BIGINT) = CAST(c.c_id AS BIGINT) "
+          "WHERE (o.region = 'east' AND c.tier = 1) OR (o.region = 'west' AND c.tier = 2)"}) {
+        ExpectMatch(con, sql, /*ordered=*/false);
+    }
+}
+
 // The non-inner join kinds, each matched against DuckDB. The query syntax maps to
 // the join types DuckDB's planner/optimizer emits: FULL OUTER -> OUTER, EXISTS ->
 // RIGHT_SEMI, NOT EXISTS -> RIGHT_ANTI, IN -> SEMI, NOT IN -> MARK + filter. (A

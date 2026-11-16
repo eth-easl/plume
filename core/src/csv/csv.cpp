@@ -287,7 +287,7 @@ Result<void> ParseCSVChunk(const uint8_t *data, size_t size, const CSVRegionInfo
 
         // Emit the current chunk once full and start a fresh one.
         if (chunk && cur == STANDARD_VECTOR_SIZE) {
-            chunk->SetCardinality(cur);
+            chunk->SetChildCardinality(cur);
             TRYV(emit(std::move(chunk)));
             chunk.reset();
             cur = 0;
@@ -337,7 +337,7 @@ Result<void> ParseCSVChunk(const uint8_t *data, size_t size, const CSVRegionInfo
 
     // Emit the final partial chunk.
     if (chunk && cur > 0) {
-        chunk->SetCardinality(cur);
+        chunk->SetChildCardinality(cur);
         TRYV(emit(std::move(chunk)));
     }
     return Ok();

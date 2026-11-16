@@ -5,6 +5,7 @@
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -89,7 +90,7 @@ Result<void> SplitOutputOperator::Push(std::unique_ptr<DataChunk> chunk) {
         for (idx_t i = 0; i < chunk_size; i++) {
             selection->set_index(i, i);
         }
-        auto view = std::make_unique<SelectionVector>(selection->data());
+        auto view = std::make_unique<SelectionVector>(selection->data(), chunk_size);
         TRYV(sink_->Accept(0, shared_chunk, std::move(view), chunk_size, selection));
     }
 
@@ -122,7 +123,7 @@ Result<void> SplitOutputOperator::Push(std::unique_ptr<DataChunk> chunk) {
         if (count == 0) {
             continue;
         }
-        auto view = std::make_unique<SelectionVector>(selection->data() + offsets[i]);
+        auto view = std::make_unique<SelectionVector>(selection->data() + offsets[i], count);
         TRYV(sink_->Accept(i, shared_chunk, std::move(view), count, selection));
     }
     return Ok();

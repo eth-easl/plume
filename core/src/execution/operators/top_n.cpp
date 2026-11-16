@@ -79,7 +79,7 @@ TopNOperator::TopNOperator(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>
     key_executor_ = std::make_unique<duckdb::ExpressionExecutor>();
     for (auto &e : key_exprs_) {
         key_executor_->AddExpression(*e);
-        key_types_.push_back(e->return_type);
+        key_types_.push_back(e->GetReturnType());
     }
     heap_.reserve(capacity_);
 }
@@ -168,7 +168,7 @@ Result<void> TopNOperator::Finish() {
                 result->SetValue(c, i, r.row[c]);
             }
         }
-        result->SetCardinality(batch);
+        result->SetChildCardinality(batch);
         TRYV(next_->Push(std::move(result)));
     }
 

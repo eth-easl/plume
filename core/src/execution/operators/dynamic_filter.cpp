@@ -7,6 +7,10 @@
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
+
+#include <type_traits>
 
 #include <limits>
 #include <type_traits>
@@ -382,10 +386,17 @@ void ReduceFlatAllValid(const T *__restrict data, idx_t count, bool &has_value, 
 // reinterpreted instead of surfacing as their plain integer representation.
 template <class T> Value MakeValue(const T &v, const LogicalType &key_type) {
     Value val = Value::CreateValue<T>(v);
-    if (val.type() != key_type) {
-        val.Reinterpret(key_type);
+    if (val.type() == key_type) {
+        return val;
     }
-    return val;
+    // Only integral physical types back a different logical type (DATE, DECIMAL, TIME, ...).
+    if constexpr (std::is_same_v<T, duckdb::hugeint_t>) {
+        return Value::Numeric(key_type, v);
+    } else if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool> && !std::is_same_v<T, uint64_t>) {
+        return Value::Numeric(key_type, static_cast<int64_t>(v));
+    } else {
+        throw duckdb::InternalException("Cannot represent physical key as %s", key_type.ToString());
+    }
 }
 
 template <class T>

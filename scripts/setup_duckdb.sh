@@ -10,7 +10,7 @@ REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
 # configuration
-readonly duckdb_tag="v1.5.4"
+readonly duckdb_tag="v2.0.0"
 duckdb_dir="external/duckdb" # relative to repository root
 build_dir="build/duckdb"     # relative to repository root
 while getopts 'd:b:' flag; do
@@ -64,7 +64,7 @@ if [[ "${CXX:-}" == *dandelion* || "${CC:-}" == *dandelion* ]]; then
     *)       duckdb_arch="$(uname -m)" ;;
   esac
   CMAKE_COMPILER_ARGS+=(-DDUCKDB_EXPLICIT_PLATFORM="dandelion_${duckdb_arch}")
-  CMAKE_COMPILER_ARGS+=(-DDISABLE_EXTENSION_LOAD=TRUE)
+  CMAKE_COMPILER_ARGS+=(-DENABLE_EXTENSION_LOAD=OFF)
   # Dandelion libc headers use the C99 keyword 'restrict' as a parameter name, which is invalid in 
   # C++ and breaks every header in this class. Mapping it to __restrict neutralises it.
   CMAKE_COMPILER_ARGS+=(-DCMAKE_CXX_FLAGS="-Drestrict=__restrict ${EXTRA_SECTION_FLAGS}")
@@ -79,4 +79,4 @@ cmake -S "${duckdb_dir}" -B "${build_dir}" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       "${CMAKE_COMPILER_ARGS[@]}" \
       -DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DBUILD_BENCHMARKS=0 \
       -DENABLE_SANITIZER=0 -DDISABLE_UNITY=0 -DENABLE_JEMALLOC=0
-ninja -C "${build_dir}" -j"$(nproc)" duckdb_static core_functions_extension parquet_extension dummy_static_extension_loader
+ninja -C "${build_dir}" -j"$(nproc)" duckdb_static core_functions_extension parquet_extension

@@ -50,7 +50,7 @@ DataBuffer MakeBlock(Allocator &alloc, const std::vector<int32_t> &region, const
         chunk.SetValue(0, r, Value::INTEGER(region[r]));
         chunk.SetValue(1, r, Value::INTEGER(amount[r]));
     }
-    chunk.SetCardinality(region.size());
+    chunk.SetChildCardinality(region.size());
     auto block = ExportChunk(RegionAmount(), chunk, alloc).unwrap();
     auto buf = mock::MakeBuffer(block.data, block.size);
     alloc.Free(block.data, block.size);
@@ -126,7 +126,7 @@ ChunkList MakeChunks(Allocator &alloc, uint32_t n, int32_t region_val) {
             c->SetValue(0, r, Value::INTEGER(region_val));
             c->SetValue(1, r, Value::INTEGER(static_cast<int32_t>(base + r)));
         }
-        c->SetCardinality(k);
+        c->SetChildCardinality(k);
         chunks.push_back(std::move(c));
     }
     return chunks;
@@ -210,7 +210,7 @@ TEST_CASE("SplitOutput: hash round-trip preserves rows and routes by key") {
             c->SetValue(1, r, Value::INTEGER(amount));
             expected.insert({region, amount});
         }
-        c->SetCardinality(k);
+        c->SetChildCardinality(k);
         chunks.push_back(std::move(c));
     }
 
@@ -288,7 +288,7 @@ TEST_CASE("SplitOutput: varchar heap gather round-trips") {
             c->SetValue(1, r, Value(s));
             expected.insert({region, s});
         }
-        c->SetCardinality(k);
+        c->SetChildCardinality(k);
         chunks.push_back(std::move(c));
     }
 

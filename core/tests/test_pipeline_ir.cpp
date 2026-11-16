@@ -1,9 +1,3 @@
-// Milestone-3 tests:
-//  (1) pipeline serialize -> deserialize round-trip (structural equality)
-//  (2) R2 end-to-end proof: build Plume IR, reconstruct DuckDB bound
-//      expressions via the registry (no instance), run them through
-//      ExpressionExecutor over a DataChunk, and verify results.
-
 #include "test_util.hpp"
 
 #include "plume/execution/operators/filter.hpp"
@@ -16,8 +10,8 @@
 #include "plume/memory/allocator.hpp"
 
 #include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 using namespace plume;
 using namespace plume::exec;
@@ -115,13 +109,13 @@ TEST_CASE("R2: IR -> bound expression -> ExpressionExecutor, no instance") {
     DataChunk input;
     input.Initialize(alloc.Get(), {LogicalType::INTEGER, LogicalType::INTEGER});
     const idx_t n = 6;
-    auto a = FlatVector::GetData<int32_t>(input.data[0]);
-    auto b = FlatVector::GetData<int32_t>(input.data[1]);
+    auto a = FlatVector::GetDataMutable<int32_t>(input.data[0]);
+    auto b = FlatVector::GetDataMutable<int32_t>(input.data[1]);
     for (idx_t i = 0; i < n; i++) {
         a[i] = int32_t(i) * 30; // 0 30 60 90 120 150
         b[i] = int32_t(i) - 2;  // -2 -1 0 1 2 3
     }
-    input.SetCardinality(n);
+    input.SetChildCardinality(n);
 
     // Reconstruct bound expressions from Plume IR (registry-resolved '+').
     auto add_res = plume::expr::BuildExpression(AddCols());

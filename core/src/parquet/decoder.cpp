@@ -4,6 +4,8 @@
 
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 #include "snappy.h"
 
@@ -849,14 +851,15 @@ void ColumnChunkReader::EnsureDictVector(const duckdb::LogicalType &type) {
     }
     dict_vec_ = std::make_unique<duckdb::Vector>(type, dict_size_ + 1);
     if (is_varchar_) {
-        auto *d = FlatVector::GetData<string_t>(*dict_vec_);
+        auto *d = FlatVector::GetDataMutable<string_t>(*dict_vec_);
         for (size_t i = 0; i < dict_size_; i++) {
             d[i] = StringVector::AddString(*dict_vec_, dict_views_[i].ptr, dict_views_[i].len);
         }
     } else {
-        std::memcpy(FlatVector::GetData(*dict_vec_), dict_raw_.data(), dict_size_ * stride_);
+        std::memcpy(FlatVector::GetDataMutable(*dict_vec_), dict_raw_.data(), dict_size_ * stride_);
     }
-    FlatVector::Validity(*dict_vec_).SetInvalid(dict_size_); // null sentinel
+    FlatVector::ValidityMutable(*dict_vec_).SetInvalid(dict_size_); // null sentinel
+    FlatVector::SetSize(*dict_vec_, dict_size_ + 1);
     dict_vec_built_ = true;
 }
 
@@ -1005,8 +1008,8 @@ void ColumnChunkReader::EmitFromPage(duckdb::Vector &vec, size_t dst_off, size_t
     using duckdb::StringVector;
 
     if (is_varchar_) {
-        auto *dst = FlatVector::GetData<string_t>(vec);
-        auto &validity = FlatVector::Validity(vec);
+        auto *dst = FlatVector::GetDataMutable<string_t>(vec);
+        auto &validity = FlatVector::ValidityMutable(vec);
         for (size_t i = 0; i < m; i++) {
             if (page_has_nulls_ && page_def_[page_cursor_ + i] == 0) {
                 validity.SetInvalid(dst_off + i);
@@ -1024,7 +1027,7 @@ void ColumnChunkReader::EmitFromPage(duckdb::Vector &vec, size_t dst_off, size_t
     // fully regardless of `keep` and let the caller's Slice compact.
     (void)keep;
 
-    auto *base = FlatVector::GetData(vec);
+    auto *base = FlatVector::GetDataMutable(vec);
     if (!page_has_nulls_) {
         EmitFixedNonNull(base + dst_off * stride_, m);
         return;
@@ -1032,7 +1035,7 @@ void ColumnChunkReader::EmitFromPage(duckdb::Vector &vec, size_t dst_off, size_t
 
     // Nullable: decode the run's non-null values contiguously, then scatter them
     // into the vector's row slots, marking the gaps invalid.
-    auto &validity = FlatVector::Validity(vec);
+    auto &validity = FlatVector::ValidityMutable(vec);
     size_t nn = 0;
     for (size_t i = 0; i < m; i++) {
         nn += (page_def_[page_cursor_ + i] != 0);
@@ -1081,6 +1084,9 @@ size_t ColumnChunkReader::ReadInto(duckdb::Vector &vec, size_t n, const uint8_t 
         EmitFromPage(vec, produced, m, keep);
         produced += m;
         page_cursor_ += m;
+    }
+    if (produced > 0) {
+        duckdb::FlatVector::SetSize(vec, produced);
     }
     emitted_ += produced;
     return produced;

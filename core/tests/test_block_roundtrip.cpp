@@ -1,8 +1,3 @@
-// Milestone-2 round-trip test: build a DataChunk covering all v1 types (incl.
-// nulls, short/long/empty varchar) -> ExportChunk to a block -> ImportBlock back
-// -> ExportChunk again, asserting value equality and byte-for-byte block
-// stability, plus the zero-copy property for fixed-width columns.
-
 #include "test_util.hpp"
 
 #include "plume/memory/adapter.hpp"
@@ -13,7 +8,7 @@
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/datetime.hpp"
 #include "duckdb/common/types/value.hpp"
-#include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cstring>
 
@@ -93,7 +88,7 @@ void FillChunk(DataChunk &chunk, Allocator &alloc) {
     FlatVector::SetNull(chunk.data[7], 5, true); // c_date
     FlatVector::SetNull(chunk.data[9], 0, true);  // c_hugeint
     FlatVector::SetNull(chunk.data[10], 3, true); // c_i8
-    chunk.SetCardinality(n);
+    chunk.SetChildCardinality(n);
 }
 
 bool ValuesEqual(DataChunk &a, DataChunk &b) {
@@ -182,7 +177,7 @@ TEST_CASE("all-valid non-nullable columns store no validity mask") {
     for (idx_t r = 0; r < 4; r++) {
         c.SetValue(0, r, Value::INTEGER(int32_t(r)));
     }
-    c.SetCardinality(4);
+    c.SetChildCardinality(4);
 
     OwnedBlock b = ExportChunk(s, c, alloc).unwrap();
     auto *descs = reinterpret_cast<const ColumnDescriptor *>(b.data + sizeof(BlockHeader));

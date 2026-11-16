@@ -28,6 +28,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -76,7 +77,7 @@ OwnedBlock MakeBlock(Allocator &alloc, const Schema &schema, const std::vector<s
             }
         }
     }
-    chunk.SetCardinality(rows);
+    chunk.SetChildCardinality(rows);
     return ExportChunk(schema, chunk, alloc).unwrap();
 }
 
@@ -101,7 +102,7 @@ OwnedBlock MakeVarcharBlock(Allocator &alloc, const Schema &schema,
             chunk.SetValue(0, r, Value(LogicalType::VARCHAR));
         }
     }
-    chunk.SetCardinality(rows);
+    chunk.SetChildCardinality(rows);
     return ExportChunk(schema, chunk, alloc).unwrap();
 }
 
@@ -318,11 +319,11 @@ TEST_CASE("BuildRangeFilter: min == max -> single equality, prunes correctly") {
     DataChunk input;
     input.Initialize(alloc.Get(), {LogicalType::INTEGER});
     const idx_t n = 3;
-    auto col = FlatVector::GetData<int32_t>(input.data[0]);
+    auto col = FlatVector::GetDataMutable<int32_t>(input.data[0]);
     col[0] = 41;
     col[1] = 42;
     col[2] = 43;
-    input.SetCardinality(n);
+    input.SetChildCardinality(n);
 
     auto expr = BuildExpression(*node).unwrap();
     ExpressionExecutor executor;
@@ -349,13 +350,13 @@ TEST_CASE("BuildRangeFilter: min != max -> closed range, prunes correctly") {
     DataChunk input;
     input.Initialize(alloc.Get(), {LogicalType::INTEGER});
     const idx_t n = 5;
-    auto col = FlatVector::GetData<int32_t>(input.data[0]);
+    auto col = FlatVector::GetDataMutable<int32_t>(input.data[0]);
     col[0] = 5;
     col[1] = 10;
     col[2] = 15;
     col[3] = 20;
     col[4] = 25;
-    input.SetCardinality(n);
+    input.SetChildCardinality(n);
 
     auto expr = BuildExpression(*node).unwrap();
     ExpressionExecutor executor;
@@ -441,7 +442,7 @@ OwnedBlock MakeValueBlock(Allocator &alloc, const Schema &schema, const std::vec
     for (idx_t r = 0; r < vals.size(); r++) {
         chunk.SetValue(0, r, vals[r].DefaultCastAs(types[0]));
     }
-    chunk.SetCardinality(vals.size());
+    chunk.SetChildCardinality(vals.size());
     return ExportChunk(schema, chunk, alloc).unwrap();
 }
 
@@ -832,11 +833,12 @@ TEST_CASE("DynamicFilterProbe: dictionary entries are checked once, rows by look
 
     // Dictionary [10, 20, 30, NULL].
     duckdb::Vector dict(LogicalType::INTEGER, 4);
-    auto *d = FlatVector::GetData<int32_t>(dict);
+    auto *d = FlatVector::GetDataMutable<int32_t>(dict);
     d[0] = 10;
     d[1] = 20;
     d[2] = 30;
-    FlatVector::Validity(dict).SetInvalid(3);
+    FlatVector::ValidityMutable(dict).SetInvalid(3);
+    FlatVector::SetSize(dict, 4);
     CHECK(probe->SetDictionary(&dict, 4) == 1);
 
     auto select = [&](duckdb::Vector &keys, idx_t n) {
@@ -863,11 +865,12 @@ TEST_CASE("DynamicFilterProbe: dictionary entries are checked once, rows by look
 
     // Keys over another dictionary, or flat keys, are checked row by row.
     duckdb::Vector other(LogicalType::INTEGER, 4);
-    auto *o = FlatVector::GetData<int32_t>(other);
+    auto *o = FlatVector::GetDataMutable<int32_t>(other);
     o[0] = 20;
     o[1] = 40;
     o[2] = 20;
     o[3] = 10;
+    FlatVector::SetSize(other, 4);
     duckdb::Vector other_keys(LogicalType::INTEGER);
     other_keys.Dictionary(other, 4, idx, 5);
     CHECK(select(other_keys, 5) == std::vector<idx_t>({0, 2}));

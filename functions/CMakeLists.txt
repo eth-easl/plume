@@ -23,7 +23,7 @@ endif()
 
 function(plume_function name)
   add_executable(${name} ${ARGN} ${PLUME_ABI_BACKEND})
-  target_link_libraries(${name} PRIVATE plume ${DUCKDB_DUMMY_EXTENSION_LOADER_LIB})
+  target_link_libraries(${name} PRIVATE plume)
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 endfunction()
 

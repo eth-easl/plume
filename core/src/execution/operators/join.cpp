@@ -6,6 +6,7 @@
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/validity_mask.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <string>
 #include <unordered_map>
@@ -122,7 +123,7 @@ struct OutputBuilder {
     }
 
     Result<void> Advance() {
-        chunk->SetCardinality(++cur);
+        chunk->SetChildCardinality(++cur);
         if (cur == STANDARD_VECTOR_SIZE) {
             TRYV(next->Push(std::move(chunk)));
             chunk.reset();
@@ -224,7 +225,7 @@ JoinOperator::JoinOperator(std::vector<uint32_t> left_keys, std::vector<uint32_t
         }
         residual_scratch_ = std::make_unique<DataChunk>();
         residual_scratch_->Initialize(alloc_.Get(), natural_types);
-        residual_scratch_->SetCardinality(1);
+        residual_scratch_->SetChildCardinality(1);
     }
 }
 

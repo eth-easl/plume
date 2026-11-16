@@ -20,6 +20,8 @@
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 
 #include <algorithm>
 #include <cstdint>

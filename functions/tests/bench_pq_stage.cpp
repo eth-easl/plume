@@ -105,7 +105,7 @@ struct OldBuilder {
             }
             dst.SetValue(col, cur, std::move(v));
         }
-        dst.SetCardinality(++cur);
+        dst.SetChildCardinality(++cur);
         pending_rows++;
         if (Estimate() >= target) {
             Flush();
@@ -232,7 +232,7 @@ int main(int argc, char **argv) {
             for (size_t c = 0; c < ncol; c++) {
                 readers[c].ReadInto(chunk->data[c], n);
             }
-            chunk->SetCardinality(n);
+            chunk->SetChildCardinality(n);
             rows += n;
             chunks.push_back(std::move(chunk));
         }

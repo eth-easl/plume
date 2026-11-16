@@ -42,7 +42,7 @@ DataBuffer Make2ColBlock(Allocator &alloc, const Schema &schema, const std::vect
         chunk.SetValue(0, r, Value::INTEGER(c0[r]));
         chunk.SetValue(1, r, Value::INTEGER(c1[r]));
     }
-    chunk.SetCardinality(c0.size());
+    chunk.SetChildCardinality(c0.size());
     auto block = ExportChunk(schema, chunk, alloc).unwrap();
     auto buf = mock::MakeBuffer(block.data, block.size);
     alloc.Free(block.data, block.size);

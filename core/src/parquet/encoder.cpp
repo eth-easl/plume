@@ -6,6 +6,7 @@
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include "snappy.h"
 
@@ -159,7 +160,7 @@ Result<void> EncodeColumnValues(const ColumnType &type, bool nullable,
                 PutI32(values, duckdb::FlatVector::GetData<duckdb::date_t>(vec)[r].days);
                 break;
             case TypeId::TIME:
-                PutI64(values, duckdb::FlatVector::GetData<duckdb::dtime_t>(vec)[r].micros);
+                PutI64(values, duckdb::FlatVector::GetData<duckdb::dtime_t>(vec)[r].value);
                 break;
             case TypeId::DECIMAL:
                 // DuckDB's decimal physical storage is int16 (w<=4), int32 (<=9), int64

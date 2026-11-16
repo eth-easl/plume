@@ -18,6 +18,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <string>
 #include <string_view>
@@ -68,7 +69,7 @@ DataBuffer MakeBlock(Allocator &alloc, const std::vector<int32_t> &region, const
         chunk.SetValue(1, r, name[r].empty() ? Value(LogicalType::VARCHAR) : Value(name[r]));
         chunk.SetValue(2, r, amount[r] == INT32_MIN ? Value(LogicalType::INTEGER) : Value::INTEGER(amount[r]));
     }
-    chunk.SetCardinality(region.size());
+    chunk.SetChildCardinality(region.size());
     auto block = ExportChunk(MixedSchema(), chunk, alloc).unwrap();
     auto buf = mock::MakeBuffer(block.data, block.size);
     alloc.Free(block.data, block.size);

@@ -21,6 +21,10 @@ class LogicalComparisonJoin;
 class LogicalColumnDataGet;
 class LogicalEmptyResult;
 class LogicalCrossProduct;
+class LogicalFilter;
+class LogicalLimit;
+class LogicalOrder;
+class LogicalTopN;
 } // namespace duckdb
 
 namespace plume::parser {
