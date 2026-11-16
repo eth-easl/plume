@@ -1,5 +1,7 @@
 #include "dandelion_trace.hpp"
 
+#include "plume/dandelion/api.hpp"
+
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <zlib.h>
@@ -98,13 +100,18 @@ Result<DandelionTraceCollector> DandelionTraceCollector::Init(const std::string 
     if (resp.error && resp.error.code != cpr::ErrorCode::OK) {
         return Error("Request to '" + url + "' failed: " + resp.error.message);
     }
+    auto status = dandelion::ParseStatusBody(dandelion::BinaryData(resp.text.begin(), resp.text.end()));
     if (resp.status_code < 200 || resp.status_code >= 300) {
-        return Error("Request to '" + url + "' returned HTTP " + std::to_string(resp.status_code) + ": " + resp.text);
+        return Error("Request to '" + url + "' returned HTTP " + std::to_string(resp.status_code) + ": " +
+                     (status.is_ok() ? status.unwrap() : resp.text));
+    }
+    if (status.is_error()) {
+        return Error("Invalid response from '" + url + "': " + status.error().message(), ErrorKind::InvalidInput);
     }
 
     std::vector<std::string> names;
     try {
-        json j = json::parse(resp.text);
+        json j = json::parse(status.unwrap());
         if (!j.is_array()) {
             return Error("Timestamp names from '" + url + "' are not a json array.", ErrorKind::InvalidInput);
         }

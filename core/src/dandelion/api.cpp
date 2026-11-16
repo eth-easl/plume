@@ -115,6 +115,7 @@ Result<std::string> RenderChunks(const std::vector<std::unique_ptr<duckdb::DataC
 Result<BinaryData> RegistrationBody(const DandelionComposition& comp) {
     pb::RegisterComposition meta;
     meta.set_composition(comp.dsl);
+    // input_sets (static sets of the composition) are left empty.
     return FrameHeader(meta, 0);
 }
 
@@ -191,6 +192,20 @@ Result<DataSetVec> ParseResponseBody(const BinaryData& body, std::string* traces
         *traces = meta.has_trace() ? meta.trace() : "";
     }
     return out_sets;
+}
+
+Result<std::string> ParseStatusBody(const BinaryData& body) {
+    TRY(auto frame, ReadFrame(body));
+    pb::StatusResponse meta;
+    if (frame.meta_size > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            !meta.ParseFromArray(body.data() + frame.meta_pos, static_cast<int>(frame.meta_size))) {
+        return Error("Could not parse dandelion status response metadata.", ErrorKind::InvalidInput);
+    }
+    if (frame.payload_pos != body.size()) {
+        return Error(std::to_string(body.size() - frame.payload_pos) +
+                     " trailing bytes after dandelion status response.", ErrorKind::InvalidInput);
+    }
+    return meta.message();
 }
 
 Result<std::string> ParseAndRenderResponseBody(const BinaryData& data, const Schema &schema,

@@ -34,6 +34,9 @@ Result<BinaryData> InvocationBody(const DandelionComposition& comp, bool is_regi
 // receives the response's trace (empty if none).
 Result<DataSetVec> ParseResponseBody(const BinaryData& body, std::string* traces = nullptr);
 
+// Parses a StatusResponse body and returns its message.
+Result<std::string> ParseStatusBody(const BinaryData& body);
+
 // Parses a response and renders its first output set as tab-separated rows.
 Result<std::string> ParseAndRenderResponseBody(const BinaryData& data,
     const Schema &schema, std::string* traces = nullptr);

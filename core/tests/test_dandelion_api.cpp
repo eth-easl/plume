@@ -49,7 +49,7 @@ std::pair<std::string, BinaryData> Unframe(const BinaryData &body) {
     return {meta, BinaryData(body.begin() + pos + meta_len, body.end())};
 }
 
-BinaryData Frame(const dfe::DandelionResponse &meta, const BinaryData &payload, uint64_t version = kWireVersion) {
+BinaryData Frame(const google::protobuf::MessageLite &meta, const BinaryData &payload, uint64_t version = kWireVersion) {
     BinaryData out;
     AppendVarint(out, version);
     std::string m = meta.SerializeAsString();
@@ -113,6 +113,7 @@ TEST_CASE("registration body") {
     dfe::RegisterComposition reg;
     CHECK(reg.ParseFromString(meta_bytes));
     CHECK(reg.composition() == comp.dsl);
+    CHECK(reg.input_sets_size() == 0);
     CHECK(payload.empty());
 }
 
@@ -127,7 +128,7 @@ TEST_CASE("response: sets, items, payload slicing and trace") {
     i1->set_identifier("out1");
     i1->set_payload_length(4);
     meta.add_sets(); // empty set
-    meta.set_trace("{\"ts\":[]}");
+    meta.set_timestamps("{\"ts\":[]}");
 
     std::string trace;
     auto sets = ParseResponseBody(Frame(meta, Bytes("abcdefg")), &trace).unwrap();
@@ -147,6 +148,15 @@ TEST_CASE("response: missing trace yields empty string") {
     std::string trace = "stale";
     CHECK(ParseResponseBody(Frame(meta, {}), &trace).is_ok());
     CHECK(trace.empty());
+}
+
+TEST_CASE("status response: message is returned") {
+    dfe::StatusResponse meta;
+    meta.set_message("[\"Arrival\",\"End\"]");
+    CHECK(ParseStatusBody(Frame(meta, {})).unwrap() == "[\"Arrival\",\"End\"]");
+    CHECK(ParseStatusBody(Frame(meta, Bytes("x"))).is_error());               // trailing bytes
+    CHECK(ParseStatusBody(Frame(meta, {}, /*version=*/2)).is_error());        // wrong version
+    CHECK(ParseStatusBody(BinaryData{}).is_error());                          // empty
 }
 
 TEST_CASE("response: malformed frames are rejected") {
