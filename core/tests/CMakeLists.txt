@@ -32,3 +32,9 @@ add_library(plume_test_runner STATIC runner.cpp)
 target_include_directories(plume_test_runner PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(plume_test_runner PUBLIC plume)
 target_link_libraries(test_runner PRIVATE plume_test_runner)
+
+# Dandelion request/response encoding (client-side compile layer only).
+if(PLUME_WITH_COMPILE_LAYER)
+  plume_add_test(test_dandelion_api test_dandelion_api.cpp)
+  target_link_libraries(test_dandelion_api PRIVATE plume_dandelion_proto)
+endif()
