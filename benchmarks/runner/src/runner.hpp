@@ -33,6 +33,7 @@ class Runner {
     struct Invocation {
         std::string name;                     // display name (e.g. "q6" or "q6_sf1")
         dandelion::BinaryData body;           // dandelion invocation body
+        std::string composition_dsl;          // composition DSL the body was built from
         Schema out_schema;                    // schema of the result
         int64_t planning_ms = 0;              // CompileQuery wall time
         std::vector<int64_t> latencies_ms;    // per-invocation execution latency

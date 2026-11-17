@@ -162,6 +162,7 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
     Invocation inv;
     inv.name = key;
     inv.body = std::move(body);
+    inv.composition_dsl = std::move(compiled.composition.dsl);
     inv.planning_ms = planning_ms;
     if (checksum_file_) {
         inv.expected_checksum = checksum_file_->Find(checksum_query, checksum_scale_factor);
@@ -182,7 +183,9 @@ Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp, std::
         return Error("dandelion request failed: " + resp.error.message, ErrorKind::Generic);
     }
     if (resp.status_code < 200 || resp.status_code >= 300) {
-        return Error("dandelion returned HTTP " + std::to_string(resp.status_code) + ": " + resp.text,
+        auto status_msg_res = dandelion::ParseStatusBody(dandelion::BinaryData(resp.text.begin(), resp.text.end()));
+        const std::string status_msg = status_msg_res.is_ok() ? std::move(status_msg_res).unwrap() : resp.text;
+        return Error("dandelion returned HTTP " + std::to_string(resp.status_code) + ": " + status_msg,
                      ErrorKind::Generic);
     }
     Invocation &inv = invocations_[idx];
@@ -561,6 +564,17 @@ Result<void> Runner::ExportResults() {
     }
 
     LogInfo("Wrote timings.txt, planning.txt to ", config_.results_prefix);
+
+    // <name>.ddsl (a file per invocation containing the dandelion composition)
+    for (const auto &inv : invocations_) {
+        const std::string path = config_.results_prefix + "/" + inv.name + ".ddsl";
+        std::ofstream f(path, std::ios::trunc);
+        if (!f) {
+            return Error("Could not write composition file '" + path + "'");
+        }
+        f << inv.composition_dsl;
+    }
+    LogInfo("Wrote ", invocations_.size(), " composition(s) (.ddsl) to ", config_.results_prefix);
 
     // traces.plmt.gz (only if dandelion returned traces)
     if (traces_ && !traces_->Empty()) {
