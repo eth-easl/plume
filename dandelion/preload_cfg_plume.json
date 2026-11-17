@@ -35,6 +35,15 @@
             "inputSets": ["template", "inData", "inData2"],
             "outputSets": ["outData", "dynFilter", "stdio"]
         }
+    },{
+        "name": "plume_df_combine",
+        "engineType": "Kvm",
+        "ctxSize": 1073741824,
+        "binaryPath": "~/plume_functions/plume_df_combine",
+        "metadata": {
+            "inputSets": ["dynFilter"],
+            "outputSets": ["dynFilter", "stdio"]
+        }
     }],
     "compositions": []
 }

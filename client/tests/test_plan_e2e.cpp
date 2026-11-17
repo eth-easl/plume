@@ -1094,6 +1094,8 @@ TEST_CASE("dynamic filter: producing leaf stage's dynFilter output is actually b
     CHECK(Contains(comp.dsl, dyn_var + " = dynFilter"));
     // The function it's declared on must expose the output at all.
     CHECK(Contains(comp.dsl, "=> (outData, dynFilter"));
+    // A local-table leaf runs as one instance -> its single filter item needs no combination.
+    CHECK(!Contains(comp.dsl, "plume_df_combine"));
 }
 
 TEST_CASE("dynamic filter: probe column sorted in the files -> pq_prepare prunes before the fetch") {
@@ -1350,8 +1352,9 @@ struct DynFilterParquetDb {
 
     // Runs `sql` (over plume_remote('pq_orders')) through the mock runtime and checks the result
     // against DuckDB running it over read_parquet. Returns the plan and the runtime for inspection.
-    std::pair<std::unique_ptr<PhysicalPlan>, std::unique_ptr<MockRuntime>> ExpectMatch(const std::string &sql) {
-        auto plan = BuildPhysicalPlan(con, sql, *catalog, Cfg(true)).unwrap();
+    std::pair<std::unique_ptr<PhysicalPlan>, std::unique_ptr<MockRuntime>> ExpectMatch(
+            const std::string &sql, const ConverterConfig &cfg = Cfg(true)) {
+        auto plan = BuildPhysicalPlan(con, sql, *catalog, cfg).unwrap();
         auto runtime = std::make_unique<MockRuntime>(con);
         auto plume_rows = PlumeRows(runtime->Run(*plan));
         std::string duck_sql = sql;
@@ -1490,6 +1493,41 @@ TEST_CASE("dynamic filter e2e: a filtered scan passes the filter on through anot
     CHECK(RowCount(runtime->StageOutput(b->idx)) == 300);
     // a's own scan builds b's filter from the rows its probe keeps.
     CHECK(OnlyDynFilter(b).source_stage == a->idx);
+}
+
+TEST_CASE("dynamic filter e2e: a parallel producer's filter items are combined before the scan") {
+    DynFilterParquetDb t;
+    // The grouped aggregate over customers runs once per shuffle partition and taps its keys, so
+    // each instance emits a filter item: plume_df_combine merges them into one per filter id.
+    const std::string sql = "SELECT o.o_id, c.n FROM plume_remote('pq_orders') o "
+                            "JOIN (SELECT cust, count(*) AS n FROM customers GROUP BY cust) c ON o.cust = c.cust";
+    const auto cfg = Cfg(true, /*max_splits=*/4, /*target_rows_per_split=*/1);
+    auto [plan, runtime] = t.ExpectMatch(sql, cfg);
+    const LeafStage *orders = FindLeaf(*plan, "pq_orders");
+    const auto &in = OnlyDynFilter(orders);
+    const Stage &producer = *plan->stages[in.source_stage];
+    CHECK(!producer.IsLeaf());
+    CHECK(plan->stages[producer.input_stages.at(0)]->pipeline.output_split.partitions > 1);
+
+    // The scan gets the single combined item; cust 5, 100, 199 -> 300 rows of 20480.
+    CHECK(runtime->DynamicFilterOutputs(in.source_stage).size() == 1);
+    CHECK(runtime->DynamicFilterOutputs(in.source_stage)[0].identifier == exec::DynamicFilterIdent(in.filter_id));
+    CHECK(RowCount(runtime->StageOutput(orders->idx)) == 300);
+
+    auto comp = dandelion::BuildDandelionComposition(t.con, *plan, "DF", cfg).unwrap();
+    const std::string src = std::to_string(in.source_stage);
+    CHECK(Contains(comp.dsl, "function plume_df_combine (dynFilter) => (dynFilter"));
+    CHECK(Contains(comp.dsl, "dfltr_" + src + " = dynFilter"));
+    CHECK(Contains(comp.dsl, "plume_df_combine (dynFilter = all dfltr_" + src + ") => (dfltrc_" + src +
+                                 " = dynFilter);"));
+    // Every consumer binds the combined items: only the combiner reads the raw ones.
+    CHECK(Contains(comp.dsl, "inBuffers = keyed data_" + std::to_string(orders->idx) + ", dynFilter = all dfltrc_" + src));
+    size_t raw_reads = 0;
+    const std::string raw = "all dfltr_" + src;
+    for (size_t pos = comp.dsl.find(raw); pos != std::string::npos; pos = comp.dsl.find(raw, pos + 1)) {
+        raw_reads++;
+    }
+    CHECK(raw_reads == 1);
 }
 
 TEST_CASE("dynamic filter: dropped when the probe scan is shared with another consumer") {

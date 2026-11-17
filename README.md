@@ -16,7 +16,7 @@ Plume executes data analytics queries on [Dandelion](https://github.com/eth-easl
 The repository is structured as follows:
 
 - `core/` — the query engine + SQL compiler, built as the `plume` library shared by `functions/` and `client/`.
-- `functions/` — the Dandelion-invoked function executables (`plume_stage`, `plume_{csv,pq}_{prepare,stage}`) and their host ABI.
+- `functions/` — the Dandelion-invoked function executables (`plume_stage`, `plume_{csv,pq}_{prepare,stage}`, `plume_df_combine`) and their host ABI.
 - `client/` — the SQL -> Dandelion-composition compiler plus the `plume_export`/ `plume` binaries
 - `benchmarks/` — the TPC-H harness + a simple micro-benchmark tool, built against `client`.
 - `cmake/` — shared CMake modules (DuckDB, cpr, nlohmann_json) and the tracked DuckDB extraction patches.

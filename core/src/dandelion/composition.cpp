@@ -41,24 +41,50 @@ std::string RemoteInfoVar(int stage) { return "info_" + std::to_string(stage); }
 std::string RemoteReqVar(int stage) { return "req_" + std::to_string(stage); }
 std::string OutVar(int stage) { return "out_" + std::to_string(stage); }
 std::string DynFilterVar(int stage) { return "dfltr_" + std::to_string(stage); }
+std::string CombinedDynFilterVar(int stage) { return "dfltrc_" + std::to_string(stage); }
 
-std::string DynFilterBinding(const std::vector<uint32_t> &stages) {
+bool MayRunParallel(const PhysicalPlan &plan, const parser::Stage &stage, const ConverterConfig &config) {
+    if (stage.IsLeaf()) {
+        const auto &leaf = static_cast<const LeafStage &>(stage);
+        switch (leaf.data_source->type) {
+        case DataSourceType::LOCAL_TABLE:
+            return false; // every materialized block has key 0 -> a single keyed instance
+        case DataSourceType::REMOTE_PARQUET:
+        case DataSourceType::REMOTE_CSV:
+            // One instance per region: at least one per file, max_region_bytes can add more.
+            return leaf.source_splits > 1 || leaf.data_source->paths.size() > 1 || config.max_region_bytes > 0;
+        }
+        return true;
+    }
+    for (size_t in : stage.input_stages) {
+        if (plan.stages[in]->pipeline.output_split.partitions > 1) {
+            return true; // keyed input -> one instance per partition
+        }
+    }
+    return false;
+}
+
+std::string DynFilterBinding(const std::vector<uint32_t> &stages, const std::vector<bool> &combined) {
+    auto var = [&combined](uint32_t stage) {
+        return combined[stage] ? CombinedDynFilterVar(static_cast<int>(stage)) : DynFilterVar(static_cast<int>(stage));
+    };
     if (stages.size() == 1) {
-        return "all " + DynFilterVar(static_cast<int>(stages[0]));
+        return "all " + var(stages[0]);
     }
     std::string out = "all {";
     for (size_t i = 0; i < stages.size(); i++) {
-        out += (i ? ", " : "") + DynFilterVar(static_cast<int>(stages[i]));
+        out += (i ? ", " : "") + var(stages[i]);
     }
     return out + "}";
 }
 
 struct DeclarationTracker {
-    bool using_http = false;    // -> the runtime-provided HTTP function (file fetches)
-    bool using_stage = false;   // -> plume_stage (BLOCKS / join / compute stages)
-    bool using_csv = false;     // -> plume_csv_stage
-    bool using_pq_prep = false; // -> plume_pq_prepare
-    bool using_pq = false;      // -> plume_pq_stage
+    bool using_http = false;       // -> the runtime-provided HTTP function (file fetches)
+    bool using_stage = false;      // -> plume_stage (BLOCKS / join / compute stages)
+    bool using_csv = false;        // -> plume_csv_stage
+    bool using_pq_prep = false;    // -> plume_pq_prepare
+    bool using_pq = false;         // -> plume_pq_stage
+    bool using_df_combine = false; // -> plume_df_combine
 
     void AppendDeclarations(std::ostringstream &out) const {
         if (using_http) {
@@ -75,6 +101,9 @@ struct DeclarationTracker {
         }
         if (using_pq) {
             out << "function plume_pq_stage (template, regionInfo, inBuffers, dynFilter) => (outData, dynFilter" EXTRA_OUT_SET ");\n";
+        }
+        if (using_df_combine) {
+            out << "function plume_df_combine (dynFilter) => (dynFilter" EXTRA_OUT_SET ");\n";
         }
     }
 };
@@ -96,6 +125,15 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
     auto dyn_filter_output = [](const parser::Stage &s) -> std::string {
         return s.ProducesDynFilter() ? ", " + DynFilterVar(static_cast<int>(s.idx)) + " = dynFilter" : "";
     };
+    std::vector<bool> combined(plan.stages.size(), false);
+    for (const auto &stage : plan.stages) {
+        if (stage->ProducesDynFilter() && MayRunParallel(plan, *stage, config)) {
+            combined[stage->idx] = true;
+            dt.using_df_combine = true;
+            fappls << "  plume_df_combine (dynFilter = all " << DynFilterVar(static_cast<int>(stage->idx))
+                   << ") => (" << CombinedDynFilterVar(static_cast<int>(stage->idx)) << " = dynFilter);\n";
+        }
+    }
     for (const auto &stage : plan.stages) {
         std::string st_var = StageTemplVar(stage->idx);
         comp_input << st_var << ", ";
@@ -137,7 +175,7 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
                     // evaluates every filter (pruning or probe-only) on the rows.
                     std::string stage_dyn_filter;
                     if (leaf_stage->ConsumesDynFilter()) {
-                        stage_dyn_filter = ", dynFilter = " + DynFilterBinding(leaf_stage->DynFilterSourceStages());
+                        stage_dyn_filter = ", dynFilter = " + DynFilterBinding(leaf_stage->DynFilterSourceStages(), combined);
                     }
                     if (leaf_stage->PrunesByDynFilter()) {
                         std::vector<exec::DynamicFilterProbeSpec> prune_filters;
@@ -160,7 +198,7 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
                         fappls << "  plume_pq_prepare (config = all " << cfg_var
                               << ", footer = anyKeyed " << footer_var
                               << ", url = anyKeyed " << url_var << ", dynFilter = "
-                              << DynFilterBinding(leaf_stage->DynFilterSourceStages(/*prune_only=*/true))
+                              << DynFilterBinding(leaf_stage->DynFilterSourceStages(/*prune_only=*/true), combined)
                               << ") => (" << info_var << " = region, " 
                               << req_var << " = chunkReq) by footer inner url;\n";
                     } else {
