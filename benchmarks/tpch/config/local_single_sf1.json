@@ -13,11 +13,11 @@
 
     "dandelionUrl": "http://localhost:8080",
     "requestTimeout": 30,
-    "resultsPrefix": "~/plume_results/local_sf1_single",
+    "resultsPrefix": "~/plume_results/local_single_sf1",
     "debugPrints": false,
     "maxSplits": 12,
     "targetRowsPerSplit": 131072,
     "dynamicFilter": true,
 
-    "benchmarkConfig": { "repetitions": 1 }
+    "benchmarkConfig": { "repetitions": 2 }
 }
