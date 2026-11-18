@@ -8,6 +8,7 @@
 
 #include <fstream>
 #include <limits>
+#include <iostream>
 
 namespace plume::bench {
 
@@ -202,6 +203,11 @@ Result<void> DandelionTraceCollector::AddTrace(const std::string &query, const s
 
         TRY(rec.node, GetUnsigned<uint32_t>(inv, "nodeId"));
 
+        if (inv.contains("peakMem")) {
+            TRY(rec.peak_memory, GetUnsigned<uint64_t>(inv, "peakMem"));
+            run.flags |= kHasMem;
+        }
+
         auto ts_it = inv.find("ts");
         if (has_ts != (ts_it != inv.end())) {
             return Error("Trace invocations disagree on the presence of 'ts'.", ErrorKind::InvalidInput);
@@ -294,6 +300,7 @@ Result<void> DandelionTraceCollector::ExportToFile(const std::string &path) cons
         for (const auto &run : q.runs) {
             const bool has_ts = run.flags & kHasTs;
             const bool has_data = run.flags & kHasData;
+            const bool has_mem = run.flags & kHasMem;
             w.U8(kTagRun);
             w.U8(run.flags);
             w.U16(static_cast<uint16_t>(run.ids.size()));
@@ -307,6 +314,9 @@ Result<void> DandelionTraceCollector::ExportToFile(const std::string &path) cons
                 w.U16(rec.group);
                 w.U16(rec.id);
                 w.U32(rec.node);
+                if (has_mem) {
+                    w.U64(rec.peak_memory);
+                }
                 if (has_ts) {
                     for (size_t t = 0; t < n_ts; t++) {
                         w.U64(run.ts[r * n_ts + t]);

@@ -34,6 +34,7 @@ class DandelionTraceCollector {
   private:
     static constexpr uint8_t kHasTs = 1u << 0;
     static constexpr uint8_t kHasData = 1u << 1;
+    static constexpr uint8_t kHasMem = 1u << 2;
     static constexpr uint32_t kNoParent = 0xFFFFFFFFu;
 
     struct DataEntry {
@@ -46,6 +47,7 @@ class DandelionTraceCollector {
         uint16_t group = 0;
         uint16_t id = 0;
         uint32_t node = 0;
+        uint64_t peak_memory = 0; // bytes, 0 = not reported
         uint32_t data_begin = 0; // index into Run::data
         uint16_t n_data = 0;
     };

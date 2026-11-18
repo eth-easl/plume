@@ -103,7 +103,7 @@ struct DeclarationTracker {
             out << "function plume_pq_stage (template, regionInfo, inBuffers, dynFilter) => (outData, dynFilter" EXTRA_OUT_SET ");\n";
         }
         if (using_df_combine) {
-            out << "function plume_df_combine (dynFilter) => (dynFilter" EXTRA_OUT_SET ");\n";
+            out << "function plume_df_combine (dynFilter) => (combDynFilter" EXTRA_OUT_SET ");\n";
         }
     }
 };
@@ -131,7 +131,7 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
             combined[stage->idx] = true;
             dt.using_df_combine = true;
             fappls << "  plume_df_combine (dynFilter = all " << DynFilterVar(static_cast<int>(stage->idx))
-                   << ") => (" << CombinedDynFilterVar(static_cast<int>(stage->idx)) << " = dynFilter);\n";
+                   << ") => (" << CombinedDynFilterVar(static_cast<int>(stage->idx)) << " = combDynFilter);\n";
         }
     }
     for (const auto &stage : plan.stages) {
