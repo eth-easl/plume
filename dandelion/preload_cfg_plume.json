@@ -42,7 +42,7 @@
         "binaryPath": "~/plume_functions/plume_df_combine",
         "metadata": {
             "inputSets": ["dynFilter"],
-            "outputSets": ["dynFilter", "stdio"]
+            "outputSets": ["combDynFilter", "stdio"]
         }
     }],
     "compositions": []
