@@ -6,27 +6,33 @@
 
 namespace plume::util {
 
-Result<std::optional<std::vector<BoundDynamicFilter>>> BindDynamicFilters(
-        size_t set_idx, const std::vector<exec::DynamicFilterProbeSpec> &specs) {
+Result<std::map<uint32_t, exec::DynamicFilter>> ReadDynamicFilters(size_t set_idx) {
     std::map<uint32_t, exec::DynamicFilter> filters;
     auto itms = abi::GetOptionalInputSet(set_idx);
-    if (itms) {
-        for (auto &itm : *itms) {
-            TRY(auto id, exec::ParseDynamicFilterIdent(itm.ident));
-            
-            exec::DynamicFilter filter;
-            TRYV(TryCatch([&] {
-                filter = DeserializeFromBytes<exec::DynamicFilter>(itm.buffer.data(), itm.buffer.size());
-            }));
-            
-            auto it = filters.find(id);
-            if (it == filters.end()) {
-                filters.emplace(id, std::move(filter));
-            } else {
-                TRYV(TryCatch([&] { it->second.Merge(filter); }));
-            }
+    if (!itms) {
+        return filters;
+    }
+    for (auto &itm : *itms) {
+        TRY(auto id, exec::ParseDynamicFilterIdent(itm.ident));
+
+        exec::DynamicFilter filter;
+        TRYV(TryCatch([&] {
+            filter = DeserializeFromBytes<exec::DynamicFilter>(itm.buffer.data(), itm.buffer.size());
+        }));
+
+        auto it = filters.find(id);
+        if (it == filters.end()) {
+            filters.emplace(id, std::move(filter));
+        } else {
+            TRYV(TryCatch([&] { it->second.Merge(filter); }));
         }
-    }    
+    }
+    return filters;
+}
+
+Result<std::optional<std::vector<BoundDynamicFilter>>> BindDynamicFilters(
+        size_t set_idx, const std::vector<exec::DynamicFilterProbeSpec> &specs) {
+    TRY(auto filters, ReadDynamicFilters(set_idx));
 
     std::vector<BoundDynamicFilter> bound_filters;
     for (const auto &spec : specs) {

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace plume::parser {
 
@@ -22,7 +23,9 @@ using catalog::DataSource;
 
 namespace {
 
-PlanBuilder::SharedOpNode AddShuffle(PlanBuilder::SharedOpNode n, std::vector<uint32_t> key_columns, uint32_t num_splits) {
+using SharedOpNode = PlanBuilder::SharedOpNode;
+
+SharedOpNode AddShuffle(SharedOpNode n, std::vector<uint32_t> key_columns, uint32_t num_splits) {
     // Make sure number of splits is at least set to one which indicates a shuffle.
     num_splits = num_splits == 0 ? 1 : num_splits;
 
@@ -62,7 +65,7 @@ PlanBuilder::SharedOpNode AddShuffle(PlanBuilder::SharedOpNode n, std::vector<ui
     return new_splitter;
 }
 
-PlanBuilder::SharedOpNode FindEquivalentConsumer(const PlanBuilder::SharedOpNode &src,
+SharedOpNode FindEquivalentConsumer(const SharedOpNode &src,
         const exec::OperatorTemplate &templ, const Schema &output_schema) {
     for (auto &c : src->consumers) {
         if (c->templ) {
@@ -72,6 +75,120 @@ PlanBuilder::SharedOpNode FindEquivalentConsumer(const PlanBuilder::SharedOpNode
         } else if (auto found = FindEquivalentConsumer(c, templ, output_schema)) {
             return found;
         }
+    }
+    return nullptr;
+}
+
+bool IsSubset(const std::vector<uint32_t> &keys, const std::vector<uint32_t> &of) {
+    for (uint32_t k : keys) {
+        if (std::find(of.begin(), of.end(), k) == of.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsKeyedSplitWithin(const PlanBuilder::OperatorNode &splitter, const std::vector<uint32_t> &columns) {
+    return splitter.num_splits > 1 && !splitter.key_columns.empty() && IsSubset(splitter.key_columns, columns);
+}
+
+std::vector<uint32_t> GroupKeyColumns(const exec::AggregateTemplate &agg) {
+    std::vector<uint32_t> cols;
+    for (const auto &g : agg.group_keys) {
+        if (g.kind == expr::ExprKind::REFERENCE) {
+            cols.push_back(static_cast<uint32_t>(g.ref_index));
+        }
+    }
+    return cols;
+}
+
+void RemoveConsumer(PlanBuilder::OperatorNode &node, const PlanBuilder::OperatorNode *consumer) {
+    auto &cs = node.consumers;
+    cs.erase(std::remove_if(cs.begin(), cs.end(), [&](const SharedOpNode &c) { return c.get() == consumer; }),
+             cs.end());
+}
+
+bool ProbeSideCounts(exec::JoinKind kind) {
+    using K = exec::JoinKind;
+    return kind == K::INNER || kind == K::LEFT || kind == K::SEMI || kind == K::ANTI || kind == K::MARK ||
+           kind == K::SINGLE;
+}
+
+bool BuildSideCounts(exec::JoinKind kind) {
+    using K = exec::JoinKind;
+    return kind == K::INNER || kind == K::RIGHT || kind == K::RIGHT_SEMI || kind == K::RIGHT_ANTI;
+}
+
+// Check whether the partial is fused into a stage whose input is partitioned by its group keys.
+bool StageIsCoPartitioned(const SharedOpNode &partial, const std::vector<uint32_t> &group_cols) {
+    const SharedOpNode &input = partial->sources[0];
+    if (input->num_splits > 0 || input->consumers.size() != 1) {
+        return false; // the partial runs in a stage of its own, or shares its input
+    }
+
+    // Trace the group keys back to the node leading the stage (whose input is a split).
+    SharedOpNode cur = input;
+    std::vector<uint32_t> cols = group_cols;
+    while (true) {
+        if (!cur->sources[0]) {
+            return false; // reached a source: a leaf stage isn't partitioned by key
+        }
+        if (cur->sources[0]->num_splits > 0) {
+            break;
+        }
+        std::vector<uint32_t> next;
+        for (uint32_t c : cols) {
+            auto step = PlanBuilder::TraceColumnStep(*cur, c);
+            if (step && step->src_idx == 0) {
+                next.push_back(step->column);
+            }
+        }
+        cols = std::move(next);
+        cur = cur->sources[0];
+    }
+
+    // Map the keys into the leading node's input split(s).
+    std::array<std::vector<uint32_t>, 2> side_cols;
+    for (uint32_t c : cols) {
+        auto step = PlanBuilder::TraceColumnStep(*cur, c);
+        if (step) {
+            side_cols[step->src_idx].push_back(step->column);
+        }
+    }
+
+    if (!cur->sources[1]) {
+        return IsKeyedSplitWithin(*cur->sources[0], side_cols[0]);
+    }
+
+    // A join stage: both sides keyed with the same partition count.
+    const auto *join = dynamic_cast<const exec::JoinTemplate *>(cur->templ.get());
+    const auto &probe = *cur->sources[0];
+    const auto &build = *cur->sources[1];
+    if (!join || probe.num_splits <= 1 || probe.num_splits != build.num_splits) {
+        return false;
+    }
+    return (ProbeSideCounts(join->kind) && IsKeyedSplitWithin(probe, side_cols[0])) ||
+           (BuildSideCounts(join->kind) && IsKeyedSplitWithin(build, side_cols[1]));
+}
+
+SharedOpNode FindExistingSplit(const SharedOpNode &partial, const std::vector<uint32_t> &group_cols) {
+    SharedOpNode producer = partial->sources[0];
+    while (!producer->templ && producer->sources[0]) {
+        producer = producer->sources[0]; // splitters pass columns through unchanged
+    }
+
+    std::vector<SharedOpNode> stack(producer->consumers.begin(), producer->consumers.end());
+    std::unordered_set<const PlanBuilder::OperatorNode *> seen;
+    while (!stack.empty()) {
+        SharedOpNode n = std::move(stack.back());
+        stack.pop_back();
+        if (n->templ || !seen.insert(n.get()).second) {
+            continue; // not a splitter
+        }
+        if (IsKeyedSplitWithin(*n, group_cols)) {
+            return n;
+        }
+        stack.insert(stack.end(), n->consumers.begin(), n->consumers.end());
     }
     return nullptr;
 }
@@ -266,6 +383,79 @@ std::optional<PlanBuilder::LeafColumn> PlanBuilder::TraceLeafColumn(const Shared
         file_idx = (*leaf->projection)[col];
     }
     return LeafColumn{cur, leaf, col, file_idx};
+}
+
+PlanBuilder::SharedOpNode PlanBuilder::FindCoPartitioning(const SharedOpNode &partial) {
+    const auto *agg = dynamic_cast<const exec::AggregateTemplate *>(partial->templ.get());
+    if (!agg || !partial->sources[0]) {
+        return nullptr;
+    }
+    const std::vector<uint32_t> group_cols = GroupKeyColumns(*agg);
+    if (group_cols.empty()) {
+        return nullptr;
+    }
+    if (partial->consumers.size() == 1 && StageIsCoPartitioned(partial, group_cols)) {
+        return partial->sources[0];
+    }
+    return FindExistingSplit(partial, group_cols);
+}
+
+void PlanBuilder::UndoEarlyAggregate(const SharedOpNode &last, const SharedOpNode &new_source) {
+    const SharedOpNode partial = last->early_agg->partial;
+
+    // Find the chain node reading the partial (the combine, or a splitter in front of it).
+    SharedOpNode reader = last;
+    while (reader->sources[0] != partial) {
+        reader = reader->sources[0];
+    }
+
+    // Unhook the chain from the partial, and the partial (and splitters left without consumers)
+    // from its input.
+    RemoveConsumer(*partial, reader.get());
+    SharedOpNode dropped = partial;
+    while (dropped->consumers.empty() && dropped->sources[0]) {
+        SharedOpNode src = dropped->sources[0];
+        RemoveConsumer(*src, dropped.get());
+        if (src->templ || !src->sources[0]) {
+            break; // only splitters are dropped beyond the partial
+        }
+        dropped = std::move(src);
+    }
+
+    last->templ = last->early_agg->single_phase;
+    last->output_schema = exec::AggregateSchema(*last->early_agg->single_phase, new_source->output_schema);
+    last->sources[0] = new_source;
+    new_source->consumers.push_back(last);
+    last->early_agg = nullptr;
+}
+
+void PlanBuilder::CollapseEarlyAggregates(const SharedOpNode &root) {
+    std::unordered_set<const OperatorNode *> visited;
+    // Iterative post-order walk: a node is handled once its sources are.
+    std::vector<std::pair<SharedOpNode, bool>> stack{{root, false}};
+    while (!stack.empty()) {
+        auto [node, expanded] = stack.back();
+        stack.pop_back();
+        if (!expanded) {
+            if (!visited.insert(node.get()).second) {
+                continue;
+            }
+            stack.emplace_back(node, true);
+            for (const auto &src : node->sources) {
+                if (src && !visited.count(src.get())) {
+                    stack.emplace_back(src, false);
+                }
+            }
+            continue;
+        }
+        if (!node->early_agg) {
+            continue;
+        }
+        if (SharedOpNode source = FindCoPartitioning(node->early_agg->partial)) {
+            UndoEarlyAggregate(node, source);
+        }
+        node->early_agg = nullptr;
+    }
 }
 
 void PlanBuilder::AddDynamicFilter(DynamicFilterEdge edge) {

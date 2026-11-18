@@ -7,6 +7,7 @@
 #include "plume/csv/csv.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/functions/csv.hpp"
+#include "plume/functions/dynamic_filter.hpp"
 #include "plume/functions/parquet.hpp"
 #include "plume/functions/stage.hpp"
 #include "plume/memory/adapter.hpp"
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <fstream>
 #include <functional>
+#include <set>
 #include <string>
 
 namespace plume::client {
@@ -198,6 +200,37 @@ void MockRuntime::CaptureDynamicFilters(const Stage &stage) {
     for (auto &o : Capture(1)) {
         items.push_back({o.key, o.ident, dandelion::BinaryData(o.bytes.begin(), o.bytes.end())});
     }
+}
+
+void MockRuntime::CombineDynamicFilters(const Stage &stage) {
+    auto it = stage_dyn_filters_.find(stage.idx);
+    if (it == stage_dyn_filters_.end()) {
+        return;
+    }
+    std::set<std::string> idents;
+    bool several_instances = false;
+    for (const auto &item : it->second) {
+        several_instances |= !idents.insert(item.identifier).second;
+    }
+    if (!several_instances) {
+        return;
+    }
+
+    mock::Reset();
+    mock::SetInput(0, std::vector<DataBuffer>{});
+    for (const auto &item : it->second) {
+        mock::AddInput(0, mock::MakeBuffer(item.data.data(), item.data.size()), item.identifier, item.key);
+    }
+    auto st = fn::RunDynamicFilterCombine();
+    if (st.is_error()) {
+        throw duckdb::InvalidInputException("Plume mock runtime: df_combine (stage %zu) failed: %s", stage.idx,
+                                            st.error().message());
+    }
+    it->second.clear();
+    for (auto &o : Capture(0)) {
+        it->second.push_back({o.key, o.ident, dandelion::BinaryData(o.bytes.begin(), o.bytes.end())});
+    }
+    mock::Reset();
 }
 
 void MockRuntime::FeedDynamicFilters(const std::vector<uint32_t> &source_stages) {
@@ -428,6 +461,7 @@ BlockSet MockRuntime::Run(const PhysicalPlan &plan, const std::unordered_map<siz
     stage_dyn_filters_.clear();
     for (size_t idx : ExecutionOrder()) {
         stage_outputs_[idx] = RunStage(*plan.stages[idx]);
+        CombineDynamicFilters(*plan.stages[idx]);
     }
     // The root gathers into a single result; flatten its partitions (the default
     // single partition is the common case) into one block set.

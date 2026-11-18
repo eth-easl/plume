@@ -24,7 +24,7 @@ struct QueryResponse {
     
 struct CompiledQuery {
     dandelion::DandelionComposition composition;
-    Schema output_schema;
+    std::shared_ptr<parser::PhysicalPlan> plan;
 
     Result<dandelion::BinaryData> Request();
     std::string ResultToString(const dandelion::BinaryData& data);

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -20,8 +21,12 @@ struct BoundDynamicFilter {
     exec::DynamicFilter filter;
 };
 
+// Reads the dynamic filters of the (optional) input set combining instances with the same id. 
+// An absent set yields an empty map.
+Result<std::map<uint32_t, exec::DynamicFilter>> ReadDynamicFilters(size_t set_idx);
+
 // Reads the dynamic filters of the (optional) input set and binds each spec to its filter.
-// Returns a none o
+// Returns nullopt if a bound filter has no bounds (i.e. has no non-NULL key, so no probe row can match).
 Result<std::optional<std::vector<BoundDynamicFilter>>> BindDynamicFilters(
     size_t set_idx, const std::vector<exec::DynamicFilterProbeSpec> &specs);
 
