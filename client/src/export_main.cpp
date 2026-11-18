@@ -20,6 +20,7 @@ struct Args {
     std::string output_prefix = "."; // where the composition + buffers are written
     plume::parser::ConverterConfig config;
     size_t fetcher_threads = 10;
+    bool print_plan = false; // print the physical plan to stderr
 };
 
 plume::Result<Args> ParseArgs(int argc, char **argv) {
@@ -35,6 +36,8 @@ plume::Result<Args> ParseArgs(int argc, char **argv) {
         };
         if (arg == "--output") {
             TRY(a.output_prefix, next("--output"));
+        } else if (arg == "--print-plan") {
+            a.print_plan = true;
         } else if (arg == "--no-pre-aggregate") {
             a.config.early_aggregation = false;
         } else if (arg == "--no-projection-pushdown") {
@@ -92,7 +95,7 @@ plume::Result<int> RunMain(int argc, char **argv) {
         fprintf(stderr,
                 "usage: %s [sql] [--output PREFIX] [--no-pre-aggregate] [--no-projection-pushdown] "
                 "[--no-filter-pushdown] [--no-optimize-remote-fetching] [--max-splits N] "
-                "[--target-rows-per-split N] [--max-region-size N] [--fetcher-threads N]\n"
+                "[--target-rows-per-split N] [--max-region-size N] [--fetcher-threads N] [--print-plan]\n"
                 "       (sql read from stdin if omitted)\n",
                 argv[0]);
         return 2;
@@ -103,6 +106,9 @@ plume::Result<int> RunMain(int argc, char **argv) {
 
     plume::client::Client client(args.config, args.fetcher_threads);
     TRY(auto compiled, client.Resolve(args.sql, "Query"));
+    if (args.print_plan) {
+        std::cerr << compiled.plan->ToString() << std::endl;
+    }
     const auto &comp = compiled.composition;
 
     json manifest;
@@ -113,7 +119,7 @@ plume::Result<int> RunMain(int argc, char **argv) {
     manifest["composition"] = "composition.dwf";
 
     // output schema
-    auto schema_buf = plume::SerializeToBuffer(compiled.output_schema);
+    auto schema_buf = plume::SerializeToBuffer(compiled.plan->output_schema);
     WriteBytes(prefix / "schema.bin", schema_buf.data(), schema_buf.size());
     manifest["schema"] = "schema.bin";
 

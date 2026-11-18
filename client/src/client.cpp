@@ -19,7 +19,7 @@ namespace {
 CompiledQuery ToCompiledQuery(parser::CompiledComposition &&cc) {
     CompiledQuery out;
     out.composition = std::move(cc.composition);
-    out.output_schema = std::move(cc.plan->output_schema);
+    out.plan = std::move(cc.plan);
     return out;
 }
 
@@ -46,7 +46,7 @@ Result<dandelion::BinaryData> CompiledQuery::Request() {
 }
 
 std::string CompiledQuery::ResultToString(const dandelion::BinaryData& data) {
-    auto maybe_result_str = dandelion::ParseAndRenderResponseBody(data, output_schema);
+    auto maybe_result_str = dandelion::ParseAndRenderResponseBody(data, plan->output_schema);
     if (maybe_result_str.is_error()) {
         return "<Error: " + maybe_result_str.error_msg() + ">";
     }

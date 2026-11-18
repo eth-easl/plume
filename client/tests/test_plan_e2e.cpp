@@ -1678,4 +1678,81 @@ TEST_CASE("ResolveAndRewriteSources: a source referenced twice is resolved once"
     fs::remove_all(dir);
 }
 
+// --- collapsed early aggregates (PlanBuilder::CollapseEarlyAggregates) --------------------
+
+namespace {
+
+// `l` has keys 1..20 (two rows each), `r` keys 1..5 and 30: most of `l` is unmatched, so a
+// grouping by `r.k` after an outer join has a NULL group whose rows come from every partition.
+duckdb::Connection MakeOuterJoinDb(duckdb::DuckDB &db) {
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE l(k INTEGER, v INTEGER)");
+    con.Query("INSERT INTO l SELECT i % 20 + 1, i FROM range(40) t(i)");
+    con.Query("CREATE TABLE r(k INTEGER, w INTEGER)");
+    con.Query("INSERT INTO r VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (30, 300)");
+    return con;
+}
+
+void ExpectMatchAllModes(duckdb::Connection &con, const std::string &sql) {
+    for (bool pre_aggregate : {true, false}) {
+        for (uint32_t splits : {1u, 4u}) {
+            ExpectMatch(con, sql, /*ordered=*/false, {}, pre_aggregate, splits, /*target_rows_per_split=*/1);
+        }
+    }
+}
+
+} // namespace
+
+TEST_CASE("structure: an aggregate over a keyed join on its group key is fused into the join stage") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeDb(db);
+    const char *sql = "SELECT c_id, count(*), sum(amount) FROM orders JOIN customers ON cust = c_id GROUP BY c_id";
+    auto plan = BuildPhysicalPlan(con, sql, {}, Cfg(true, /*max_splits=*/4, /*target_rows_per_split=*/1)).unwrap();
+
+    CHECK(CountOps(*plan, exec::OpType::AGGREGATE) == 1); // no partial + combine
+    size_t join_stages = 0;
+    for (const auto &s : plan->stages) {
+        if (!s->LeadsWithJoin()) {
+            continue;
+        }
+        join_stages++;
+        bool has_agg = false;
+        for (const auto &op : s->pipeline.operators) {
+            has_agg |= op->type == exec::OpType::AGGREGATE;
+        }
+        CHECK(has_agg);
+    }
+    CHECK(join_stages == 1);
+}
+
+TEST_CASE("e2e: aggregates over keyed joins on their group keys (pre-aggregate on and off)") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeDb(db);
+    for (const char *sql : {
+             "SELECT c_id, count(*), sum(amount), avg(amount) FROM orders JOIN customers ON cust = c_id GROUP BY c_id",
+             "SELECT cust, name, min(amount), max(amount) FROM orders JOIN customers ON cust = c_id GROUP BY cust, name",
+             "SELECT region, count(*) FROM orders JOIN customers ON cust = c_id GROUP BY region",
+         }) {
+        ExpectMatchAllModes(con, sql);
+    }
+}
+
+TEST_CASE("e2e: aggregates over outer joins group the NULL-extended keys correctly") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeOuterJoinDb(db);
+    for (const char *sql : {
+             // grouped by the NULL-extended side: one NULL group across partitions
+             "SELECT r.k, count(*), sum(v) FROM l LEFT JOIN r ON l.k = r.k GROUP BY r.k",
+             "SELECT r.k, count(*), sum(v) FROM r RIGHT JOIN l ON l.k = r.k GROUP BY r.k",
+             "SELECT l.k, count(*), sum(w) FROM l RIGHT JOIN r ON l.k = r.k GROUP BY l.k",
+             "SELECT l.k, r.k, count(*) FROM l FULL OUTER JOIN r ON l.k = r.k GROUP BY l.k, r.k",
+             "SELECT r.k, count(*) FROM l FULL OUTER JOIN r ON l.k = r.k GROUP BY r.k",
+             // grouped by the preserved side
+             "SELECT l.k, count(*), sum(w) FROM l LEFT JOIN r ON l.k = r.k GROUP BY l.k",
+             "SELECT r.k, count(*), sum(v) FROM l RIGHT JOIN r ON l.k = r.k GROUP BY r.k",
+         }) {
+        ExpectMatchAllModes(con, sql);
+    }
+}
+
 int main() { return plume_test::RunAll(); }
