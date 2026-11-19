@@ -7,6 +7,7 @@
 #include "plume/catalog/plume_remote.hpp"
 #include "plume/catalog/remote_resolver.hpp"
 #include "plume/dandelion/composition.hpp"
+#include "plume/execution/operators/aggregate.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/join.hpp"
 #include "plume/execution/pipeline.hpp"
@@ -18,6 +19,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include "duckdb/common/string_util.hpp"
+
 #include <filesystem>
 #include <map>
 #include <set>
@@ -325,11 +328,9 @@ TEST_CASE("structure: decimal aggregate decompositions build (pre-aggregate on a
 }
 
 // avg(DECIMAL) must come out correctly scaled even without pre-aggregation. The
-// single-phase aggregate resolves DuckDB's native decimal avg via the physical
-// storage-type fallback in ResolveAggregateFunction, which needs an
-// AverageDecimalBindData (the decimal's scale) at Finalize time; Plume's aggregate
-// operator never runs DuckDB's bind step (a null AggregateInputData), so without
-// special-casing this the result comes back unscaled (10^scale too large).
+// single-phase aggregate runs DuckDB's decimal avg, whose Finalize descales by the
+// AverageDecimalBindData that ResolveAggregateFunction builds through the contextless
+// bind; if that bind data were dropped the result would come back 10^scale too large.
 TEST_CASE("e2e: decimal avg (pre-aggregate on and off)") {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
@@ -1771,6 +1772,112 @@ TEST_CASE("e2e: aggregates over outer joins group the NULL-extended keys correct
          }) {
         ExpectMatchAllModes(con, sql);
     }
+}
+
+// Aggregates DuckDB binds through a bind callback (min/max over every type, sum/avg over DECIMAL)
+// or swaps for sum_no_overflow from statistics run as the very kernels DuckDB would run, NULLs and
+// grouped + ungrouped included, with and without pre-aggregation.
+TEST_CASE("e2e: bound aggregates across types (pre-aggregate on and off)") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE t(g VARCHAR, i INTEGER, b BIGINT, d4 DECIMAL(9,2), d8 DECIMAL(18,3), "
+              "d16 DECIMAL(30,4), f DOUBLE, s VARCHAR, dt DATE)");
+    con.Query("INSERT INTO t VALUES "
+              "('x', 1, 10, 1.25, 100.125, 12345678901234.5678, 0.5, 'banana', DATE '2024-03-01'), "
+              "('x', -7, 20, 3.50, -2.500, -1.0001, 1.25, 'a long string that is not inlined', DATE '2023-12-31'), "
+              "('y', 4, NULL, NULL, 7.000, 3.3333, NULL, NULL, NULL), "
+              "('y', NULL, 40, 9.99, NULL, NULL, -3.0, 'cherry', DATE '2025-01-15'), "
+              "('z', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+    const std::string aggs = "min(i), max(i), sum(i), avg(i), min(b), max(b), sum(b), "
+                             "min(d4), max(d4), sum(d4), avg(d4), sum(d8), avg(d8), sum(d16), avg(d16), "
+                             "min(f), max(f), min(s), max(s), min(dt), max(dt), count(s)";
+    for (bool pa : {true, false}) {
+        ExpectMatch(con, "SELECT g, " + aggs + " FROM t GROUP BY g", /*ordered=*/false, {}, pa);
+        ExpectMatch(con, "SELECT " + aggs + " FROM t", /*ordered=*/false, {}, pa);
+    }
+}
+
+// Statistics on a local table prove sum(INTEGER) cannot overflow an int64, so DuckDB binds
+// sum_no_overflow; the plan keeps that name so the stage runs the int64 kernel too.
+TEST_CASE("structure: sum_no_overflow survives into the plan") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE t(g INTEGER, i INTEGER)");
+    con.Query("INSERT INTO t VALUES (1, 5), (1, 6), (2, 7)");
+    for (bool pa : {true, false}) {
+        auto plan = BuildPhysicalPlan(con, "SELECT g, sum(i) FROM t GROUP BY g", {}, Cfg(pa)).unwrap();
+        bool found = false;
+        for (const auto &stage : plan->stages) {
+            for (const auto &op : stage->pipeline.operators) {
+                if (op->type != exec::OpType::AGGREGATE) {
+                    continue;
+                }
+                for (const auto &spec : static_cast<const exec::AggregateTemplate &>(*op).aggregates) {
+                    found = found || spec.func_name == "sum_no_overflow";
+                }
+            }
+        }
+        CHECK(found);
+        ExpectMatch(con, "SELECT g, sum(i) FROM t GROUP BY g", /*ordered=*/false, {}, pa);
+    }
+}
+
+// A real parquet source's footer statistics (DECIMAL and DATE bounds included) and its exact row
+// count reach DuckDB's optimizer, so it proves the sums cannot overflow an int64 and binds
+// sum_no_overflow; the stages then run that kernel and the result still matches DuckDB.
+TEST_CASE("e2e: remote parquet stats enable sum_no_overflow") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "plume_test_remote_stats";
+    fs::create_directories(dir);
+    const std::string path = (dir / "t.parquet").string();
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    CHECK(!con.Query("COPY (SELECT (range % 7)::INTEGER AS g, (range - 500)::INTEGER AS i, "
+                     "((range % 1000) / 100)::DECIMAL(9,2) AS d9, (range * 1.25)::DECIMAL(18,2) AS d18, "
+                     "DATE '2024-01-01' + (range % 365)::INTEGER AS dt FROM range(5000)) TO '" + path +
+                     "' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)")->HasError());
+
+    auto src = CreateRemoteParquetSource("pq_stats", {"file://" + path});
+    RemoteResolver resolver(AutoFetcher(), 2);
+    CHECK(src->Resolve(resolver).is_ok());
+    CHECK(resolver.Execute().is_ok());
+    CHECK(src->col_stats.size() == 5);
+    CHECK(src->col_stats[2].has_min && src->col_stats[2].min_value == duckdb::Value::DECIMAL(0, 9, 2));
+    CHECK(src->col_stats[3].has_max && src->col_stats[3].max_value.type() == duckdb::LogicalType::DECIMAL(18, 2));
+    CHECK(src->col_stats[4].has_min && src->col_stats[4].min_value == duckdb::Value::DATE(2024, 1, 1));
+
+    auto catalog = std::make_shared<SourceCatalog>();
+    CHECK(catalog->Add(src).is_ok());
+    auto registry = duckdb::make_shared_ptr<PlumeRemoteInfo>();
+    registry->catalog = catalog;
+    RegisterPlumeRemote(con, std::move(registry));
+
+    const std::string body = "g, sum(i), sum(d9), sum(d18), avg(d18), min(dt), max(dt) FROM %s "
+                             "WHERE dt >= DATE '2024-03-01' GROUP BY g";
+    auto with = [&](const std::string &from) { return duckdb::StringUtil::Format("SELECT " + body, from); };
+    for (bool pa : {true, false}) {
+        auto plan = BuildPhysicalPlan(con, with("plume_remote('pq_stats')"), *catalog, Cfg(pa)).unwrap();
+        size_t no_overflow = 0;
+        for (const auto &stage : plan->stages) {
+            for (const auto &op : stage->pipeline.operators) {
+                if (op->type != exec::OpType::AGGREGATE) {
+                    continue;
+                }
+                for (const auto &spec : static_cast<const exec::AggregateTemplate &>(*op).aggregates) {
+                    no_overflow += spec.func_name == "sum_no_overflow";
+                }
+            }
+        }
+        CHECK(no_overflow == 3); // sum(i), sum(d9), sum(d18); avg's partial sum is Plume's own
+
+        MockRuntime runtime(con);
+        auto plume_rows = PlumeRows(runtime.Run(*plan));
+        auto duck_rows = DuckRows(con, with("read_parquet('" + path + "')"));
+        std::sort(plume_rows.begin(), plume_rows.end());
+        std::sort(duck_rows.begin(), duck_rows.end());
+        CHECK(plume_rows == duck_rows);
+    }
+    fs::remove_all(dir);
 }
 
 int main() { return plume_test::RunAll(); }

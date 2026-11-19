@@ -28,77 +28,6 @@ template <class T> T LoadLE(const uint8_t *p) {
     return v;
 }
 
-std::optional<Value> DecodeStat(const std::vector<uint8_t> &bytes, const ColumnType &ct) {
-    const LogicalType lt = ToLogicalType(ct);
-    auto norm = [&](Value v) -> std::optional<Value> {
-        try {
-            return v.DefaultCastAs(lt);
-        } catch (...) {
-            return std::nullopt;
-        }
-    };
-    switch (ct.id) {
-    case TypeId::BOOLEAN:
-        if (bytes.size() == 1) {
-            return Value::BOOLEAN(bytes[0] != 0);
-        }
-        return std::nullopt;
-    case TypeId::INT8:
-    case TypeId::INT16:
-    case TypeId::INT32: // parquet's smallest physical int is INT32
-        if (bytes.size() == 4) {
-            return norm(Value::INTEGER(LoadLE<int32_t>(bytes.data())));
-        }
-        return std::nullopt;
-    case TypeId::DATE:
-        if (bytes.size() == 4) {
-            return norm(Value::DATE(duckdb::date_t(LoadLE<int32_t>(bytes.data()))));
-        }
-        return std::nullopt;
-    case TypeId::TIME: // TIME_MICROS
-        if (bytes.size() == 8) {
-            return Value::TIME(duckdb::dtime_t(LoadLE<int64_t>(bytes.data())));
-        }
-        return std::nullopt;
-    case TypeId::INT64:
-        if (bytes.size() == 8) {
-            return norm(Value::BIGINT(LoadLE<int64_t>(bytes.data())));
-        }
-        return std::nullopt;
-    case TypeId::FLOAT:
-        if (bytes.size() == 4) {
-            return norm(Value::FLOAT(LoadLE<float>(bytes.data())));
-        }
-        return std::nullopt;
-    case TypeId::DOUBLE:
-        if (bytes.size() == 8) {
-            return norm(Value::DOUBLE(LoadLE<double>(bytes.data())));
-        }
-        return std::nullopt;
-    case TypeId::DECIMAL: // only INT16/INT32/INT64-backed decimals (little-endian)
-        if (bytes.size() == 2) {
-            return norm(Value::DECIMAL(LoadLE<int16_t>(bytes.data()), ct.decimal_width, ct.decimal_scale));
-        }
-        if (bytes.size() == 4) {
-            return norm(Value::DECIMAL(LoadLE<int32_t>(bytes.data()), ct.decimal_width, ct.decimal_scale));
-        }
-        if (bytes.size() == 8) {
-            return norm(Value::DECIMAL(LoadLE<int64_t>(bytes.data()), ct.decimal_width, ct.decimal_scale));
-        }
-        return std::nullopt;
-    case TypeId::VARCHAR:
-        // Unsigned bytewise order, same as duckdb's string comparison. A truncated min (max) is
-        // still a lower (upper) bound; one cut within a UTF-8 sequence fails to construct.
-        try {
-            return Value(std::string(reinterpret_cast<const char *>(bytes.data()), bytes.size()));
-        } catch (...) {
-            return std::nullopt;
-        }
-    default:
-        return std::nullopt;
-    }
-}
-
 // The column chunk's decoded [min, max], if its statistics have both.
 std::optional<std::pair<Value, Value>> DecodeMinMax(const ColumnStats &stats, const ColumnType &ct) {
     if (!stats.has_min || !stats.has_max) {
@@ -255,6 +184,77 @@ bool StatsMayContainAny(const ColumnStats &stats, const ColumnType &type, const 
 }
 
 } // namespace
+
+std::optional<Value> DecodeStat(const std::vector<uint8_t> &bytes, const ColumnType &ct) {
+    const LogicalType lt = ToLogicalType(ct);
+    auto norm = [&](Value v) -> std::optional<Value> {
+        try {
+            return v.DefaultCastAs(lt);
+        } catch (...) {
+            return std::nullopt;
+        }
+    };
+    switch (ct.id) {
+    case TypeId::BOOLEAN:
+        if (bytes.size() == 1) {
+            return Value::BOOLEAN(bytes[0] != 0);
+        }
+        return std::nullopt;
+    case TypeId::INT8:
+    case TypeId::INT16:
+    case TypeId::INT32: // parquet's smallest physical int is INT32
+        if (bytes.size() == 4) {
+            return norm(Value::INTEGER(LoadLE<int32_t>(bytes.data())));
+        }
+        return std::nullopt;
+    case TypeId::DATE:
+        if (bytes.size() == 4) {
+            return norm(Value::DATE(duckdb::date_t(LoadLE<int32_t>(bytes.data()))));
+        }
+        return std::nullopt;
+    case TypeId::TIME: // TIME_MICROS
+        if (bytes.size() == 8) {
+            return Value::TIME(duckdb::dtime_t(LoadLE<int64_t>(bytes.data())));
+        }
+        return std::nullopt;
+    case TypeId::INT64:
+        if (bytes.size() == 8) {
+            return norm(Value::BIGINT(LoadLE<int64_t>(bytes.data())));
+        }
+        return std::nullopt;
+    case TypeId::FLOAT:
+        if (bytes.size() == 4) {
+            return norm(Value::FLOAT(LoadLE<float>(bytes.data())));
+        }
+        return std::nullopt;
+    case TypeId::DOUBLE:
+        if (bytes.size() == 8) {
+            return norm(Value::DOUBLE(LoadLE<double>(bytes.data())));
+        }
+        return std::nullopt;
+    case TypeId::DECIMAL: // only INT16/INT32/INT64-backed decimals (little-endian)
+        if (bytes.size() == 2) {
+            return norm(Value::DECIMAL(LoadLE<int16_t>(bytes.data()), ct.decimal_width, ct.decimal_scale));
+        }
+        if (bytes.size() == 4) {
+            return norm(Value::DECIMAL(LoadLE<int32_t>(bytes.data()), ct.decimal_width, ct.decimal_scale));
+        }
+        if (bytes.size() == 8) {
+            return norm(Value::DECIMAL(LoadLE<int64_t>(bytes.data()), ct.decimal_width, ct.decimal_scale));
+        }
+        return std::nullopt;
+    case TypeId::VARCHAR:
+        // Unsigned bytewise order, same as duckdb's string comparison. A truncated min (max) is
+        // still a lower (upper) bound; one cut within a UTF-8 sequence fails to construct.
+        try {
+            return Value(std::string(reinterpret_cast<const char *>(bytes.data()), bytes.size()));
+        } catch (...) {
+            return std::nullopt;
+        }
+    default:
+        return std::nullopt;
+    }
+}
 
 bool RowGroupMayMatch(const ExprNode &pred, const RowGroupMeta &rgm, const Schema &file_schema) {
     return PredicateMayMatch(pred, [&](uint32_t c) { return c < rgm.columns.size() ? &rgm.columns[c].stats : nullptr; },

@@ -242,7 +242,12 @@ duckdb::unique_ptr<duckdb::FunctionData> PlumeRemoteBind(duckdb::ClientContext &
 duckdb::unique_ptr<duckdb::NodeStatistics> PlumeRemoteCardinality(duckdb::ClientContext &,
         const duckdb::FunctionData *bind_data) {
     auto &data_source = bind_data->Cast<PlumeRemoteBindData>().info;
-    return duckdb::make_uniq<duckdb::NodeStatistics>(static_cast<duckdb::idx_t>(data_source->cardinality_total));
+    const auto rows = static_cast<duckdb::idx_t>(data_source->cardinality_total);
+    if (data_source->type == DataSourceType::REMOTE_PARQUET) {
+        // Exact (the footers' row counts), so also an upper bound, e.g. for sum_no_overflow.
+        return duckdb::make_uniq<duckdb::NodeStatistics>(rows, rows);
+    }
+    return duckdb::make_uniq<duckdb::NodeStatistics>(rows); // CSV: sampled estimate
 }
 
 duckdb::unique_ptr<duckdb::BaseStatistics> PlumeRemoteStatistics(duckdb::ClientContext &,
@@ -255,8 +260,10 @@ duckdb::unique_ptr<duckdb::BaseStatistics> PlumeRemoteStatistics(duckdb::ClientC
 
     const RemoteColumnStats &source_stats = data_source->col_stats[col_idx];
     auto base = duckdb::BaseStatistics::CreateUnknown(ToLogicalType(data_source->schema->columns[col_idx].type));
-    if (source_stats.has_min) duckdb::NumericStats::SetMin(base, source_stats.min_value);
-    if (source_stats.has_max) duckdb::NumericStats::SetMax(base, source_stats.max_value);
+    if (base.GetStatsType() == duckdb::StatisticsType::NUMERIC_STATS) {
+        if (source_stats.has_min) duckdb::NumericStats::SetMin(base, source_stats.min_value);
+        if (source_stats.has_max) duckdb::NumericStats::SetMax(base, source_stats.max_value);
+    }
     if (source_stats.has_distinct) base.SetDistinctCount(static_cast<duckdb::idx_t>(source_stats.distinct_count));
     if (source_stats.not_null) base.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
     return base.ToUnique();

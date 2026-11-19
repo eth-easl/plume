@@ -41,6 +41,7 @@
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/common/types/decimal.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -119,6 +120,18 @@ void RemapCombinedJoinRefs(expr::ExprNode &node, uint32_t duck_left_size, bool s
     for (auto &child : node.children) {
         RemapCombinedJoinRefs(child, duck_left_size, swapped, left_size);
     }
+}
+
+// Result type of DuckDB's sum over an avg argument.
+ColumnType AvgSumType(const ColumnType &arg) {
+    // NOTE: DOUBLE stays DOUBLE, DECIMAL(w,s) widens to DECIMAL(38,s), integers widen to HUGEINT.
+    if (arg.id == TypeId::DOUBLE) {
+        return ColumnType{TypeId::DOUBLE};
+    }
+    if (arg.id == TypeId::DECIMAL) {
+        return ColumnType{TypeId::DECIMAL, duckdb::Decimal::MAX_WIDTH_DECIMAL, arg.decimal_scale};
+    }
+    return ColumnType{TypeId::HUGEINT};
 }
 
 } // namespace
@@ -214,26 +227,15 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggre
     if (two_phase) {
         for (const auto &agg : aggs) {
             const std::string &f = agg.func_name;
-            if (agg.distinct || (f != "sum" && f != "count" && f != "count_star" && f != "min" && f != "max" && f != "avg")) {
+            if (agg.distinct || (f != "sum" && f != "sum_no_overflow" && f != "count" && f != "count_star" &&
+                                   f != "min" && f != "max" && f != "avg")) {
                 two_phase = false;
                 break;
             }
         }
     }
 
-    auto single_phase = [&]() {
-        // AVG on a DECIMAL requires a AverageDecimalBindData to descale its result. Since we always
-        // use a null bind_data we sidestep this issue by casting to a DOUBLE.
-        std::vector<exec::AggregateSpec> specs = aggs;
-        for (auto &spec : specs) {
-            if (spec.func_name == "avg" && spec.arguments.size() == 1 &&
-                spec.arguments[0].return_type.id == TypeId::DECIMAL) {
-                spec.arguments[0] =
-                    expr::ExprNode::Cast(std::move(spec.arguments[0]), ColumnType{TypeId::DOUBLE}, /*try_cast=*/false);
-            }
-        }
-        return std::make_shared<exec::AggregateTemplate>(std::move(specs), groups);
-    };
+    auto single_phase = [&]() { return std::make_shared<exec::AggregateTemplate>(aggs, groups); };
 
     // single-phase aggregate (no early-aggregation)
     if (!two_phase) {
@@ -292,12 +294,14 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggre
 
     for (auto &agg : aggs) {
         const std::string &f = agg.func_name;
-        if (f == "sum" || f == "min" || f == "max") {
+        if (f == "sum" || f == "sum_no_overflow" || f == "min" || f == "max") {
             // sum/min/max are self-combining and the combine preserves the type:
-            // sum(decimal(38,s))->decimal(38,s), sum(hugeint)->hugeint, etc.
+            // sum(decimal(38,s))->decimal(38,s), sum(hugeint)->hugeint, etc. 
+            // sum_no_overflow only takes INT32/INT64-backed input
             partials.push_back({f, agg.return_type, agg.arguments});
             uint32_t pi = pcol++;
-            combines.push_back({f, agg.return_type, {partial_ref(pi, agg.return_type)}});
+            const std::string combine = (f == "sum_no_overflow") ? "sum" : f;
+            combines.push_back({combine, agg.return_type, {partial_ref(pi, agg.return_type)}});
             uint32_t ci = ccol++;
             finals.push_back(partial_ref(ci, agg.return_type));
         } else if (f == "count" || f == "count_star") {
@@ -310,22 +314,24 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggre
             finals.push_back(expr::ExprNode::Cast(partial_ref(ci, kHugeint), agg.return_type, /*try_cast=*/false));
             need_projection = true;
         } else { 
-            // avg = sum / count. avg is floating, so sum the argument as DOUBLE
-            // (also sidesteps DuckDB's unbound decimal-sum return type).
-            ExprNode arg_as_double = expr::ExprNode::Cast(agg.arguments.at(0), kDouble, /*try_cast=*/false);
-            partials.push_back({"sum", kDouble, {std::move(arg_as_double)}});
+            // avg = sum / count. 
+            // Like DuckDB's avg, sum exactly and only divide as DOUBLE at the end.
+            const ColumnType sum_type = AvgSumType(agg.arguments.at(0).return_type);
+            partials.push_back({"sum", sum_type, agg.arguments});
             uint32_t pi_sum = pcol++;
             partials.push_back({"count", kInt64, agg.arguments});
             uint32_t pi_cnt = pcol++;
 
-            combines.push_back({"sum", kDouble, {partial_ref(pi_sum, kDouble)}});
+            combines.push_back({"sum", sum_type, {partial_ref(pi_sum, sum_type)}});
             uint32_t ci_sum = ccol++;
             combines.push_back({"sum", kHugeint, {partial_ref(pi_cnt, kInt64)}});
             uint32_t ci_cnt = ccol++;
 
+            ExprNode num = sum_type.id == TypeId::DOUBLE
+                               ? partial_ref(ci_sum, kDouble)
+                               : expr::ExprNode::Cast(partial_ref(ci_sum, sum_type), kDouble, false);
             ExprNode den = expr::ExprNode::Cast(partial_ref(ci_cnt, kHugeint), kDouble, false);
-            ExprNode quotient =
-                expr::ExprNode::Function("/", kDouble, {partial_ref(ci_sum, kDouble), std::move(den)});
+            ExprNode quotient = expr::ExprNode::Function("/", kDouble, {std::move(num), std::move(den)});
             finals.push_back(agg.return_type.id == TypeId::DOUBLE ? std::move(quotient)
                              : expr::ExprNode::Cast(std::move(quotient), agg.return_type, false));
             need_projection = true;

@@ -1,6 +1,7 @@
 #include "plume/parser/expression_translator.hpp"
 
 #include "plume/common/result.hpp"
+#include "plume/expression/function_registry.hpp"
 
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
@@ -137,17 +138,20 @@ Result<exec::AggregateSpec> TranslateAggregate(const duckdb::BoundAggregateExpre
         return Error("Ordered aggregates are not supported.", ErrorKind::NotImplemented);
     }
     exec::AggregateSpec spec;
-    // statistics_propagation can swap sum -> sum_no_overflow when it proves no
-    // overflow; Plume only registers plain sum (same result), so normalize back.
-    const auto &func_name = agg.Function().GetName().GetIdentifierName();
-    spec.func_name = (func_name == "sum_no_overflow") ? "sum" : func_name;
+    spec.func_name = agg.Function().GetName().GetIdentifierName();
     spec.return_type = FromLogicalType(agg.GetReturnType());
     spec.distinct = agg.IsDistinct();
     spec.arguments.reserve(agg.GetChildren().size());
+    std::vector<duckdb::LogicalType> arg_types;
+    arg_types.reserve(agg.GetChildren().size());
     for (auto &child : agg.GetChildren()) {
         TRY(auto arg, TranslateExpression(*child));
+        arg_types.push_back(ToLogicalType(arg.return_type));
         spec.arguments.push_back(std::move(arg));
     }
+
+    // Check and fail at compile time, not inside a stage.
+    TRYV(expr::ResolveAggregateFunction(spec.func_name, arg_types));
     return spec;
 }
 

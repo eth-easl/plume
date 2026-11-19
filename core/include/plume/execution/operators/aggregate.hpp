@@ -3,9 +3,9 @@
 #include "plume/common/result.hpp"
 #include "plume/execution/operator.hpp"
 #include "plume/expression/expression.hpp"
+#include "plume/expression/function_registry.hpp"
 #include "plume/memory/allocator.hpp"
 
-#include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/storage/arena_allocator.hpp"
 
 #include <cstdint>
@@ -39,23 +39,20 @@ struct AggregateTemplate : OperatorTemplate {
 };
 
 struct AggregateBuild {
-    AggregateBuild(std::string func_name_p, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments_p,
-                   duckdb::LogicalType return_type_p,
-                   std::unique_ptr<duckdb::AggregateFunction> function_p = nullptr, bool distinct_p = false)
-        : func_name(std::move(func_name_p)), arguments(std::move(arguments_p)),
-          return_type(std::move(return_type_p)), function(std::move(function_p)), distinct(distinct_p) {}
+    AggregateBuild(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments_p,
+                   duckdb::LogicalType return_type_p, expr::ResolvedAggregate aggregate_p, bool distinct_p = false)
+        : arguments(std::move(arguments_p)), return_type(std::move(return_type_p)),
+          aggregate(std::move(aggregate_p)), distinct(distinct_p) {}
 
-    // Move-only (arguments hold unique_ptrs); deleting copy forces std::vector to use the move 
-    // path on reallocation.
+    // Move-only (arguments hold unique_ptrs)
     AggregateBuild(AggregateBuild &&) = default;
     AggregateBuild &operator=(AggregateBuild &&) = default;
     AggregateBuild(const AggregateBuild &) = delete;
     AggregateBuild &operator=(const AggregateBuild &) = delete;
 
-    std::string func_name;
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments;
     duckdb::LogicalType return_type;
-    std::unique_ptr<duckdb::AggregateFunction> function; // resolved kernel; null for min/max
+    expr::ResolvedAggregate aggregate; // bound kernel + bind data
     bool distinct = false;
 };
 
