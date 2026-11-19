@@ -22,6 +22,8 @@ struct PlumeRemoteBindData : duckdb::FunctionData {
     bool Equals(const duckdb::FunctionData &other) const override;
 };
 
+duckdb::TableFunction GetPlumeRemoteTableFunction(duckdb::shared_ptr<PlumeRemoteInfo> registry);
+
 Result<std::string> ResolveAndRewriteSources(const std::string &sql, SourceCatalog &catalog, RemoteResolver &resolver);
 
 void RegisterPlumeRemote(duckdb::Connection &con, duckdb::shared_ptr<PlumeRemoteInfo> registry);

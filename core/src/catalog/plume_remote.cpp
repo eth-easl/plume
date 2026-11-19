@@ -264,6 +264,18 @@ duckdb::unique_ptr<duckdb::BaseStatistics> PlumeRemoteStatistics(duckdb::ClientC
 } // namespace
 
 
+duckdb::TableFunction GetPlumeRemoteTableFunction(duckdb::shared_ptr<PlumeRemoteInfo> registry) {
+	duckdb::TableFunction tf(kPlumeRemoteName, {duckdb::LogicalType::VARCHAR}, nullptr, PlumeRemoteBind);
+	tf.cardinality = PlumeRemoteCardinality;
+	tf.statistics_extended = PlumeRemoteStatistics;
+	tf.filter_pushdown = true;
+	tf.projection_pushdown = true;
+	tf.filter_prune = true;
+	tf.function_info = std::move(registry);
+
+	return tf;
+}
+
 void RegisterPlumeRemote(duckdb::Connection &con, duckdb::shared_ptr<PlumeRemoteInfo> registry) {
     duckdb::TableFunction tf(kPlumeRemoteName, {duckdb::LogicalType::VARCHAR}, nullptr, PlumeRemoteBind);
     tf.cardinality = PlumeRemoteCardinality;

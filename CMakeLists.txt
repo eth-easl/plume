@@ -42,6 +42,7 @@ option(PLUME_BUILD_CLIENT     "Build the plume client (client)"                O
 option(PLUME_BUILD_BENCHMARKS "Build the benchmark harness"                    OFF)
 option(PLUME_BUILD_UBENCH     "Build the ubench micro-benchmark tool"          OFF)
 option(PLUME_WITH_TESTS       "Build the test suites"                          OFF)
+option(PLUME_INCLUDES         "Include additional cmake files"                 OFF)
 
 # internals
 option(PLUME_RECYCLING_ALLOCATOR "Recycle small/short-lived allocations through a per-thread free-list pool instead of malloc/free" ON)
@@ -72,10 +73,12 @@ endif()
 # resolution. The archive was compiled with -ffunction-sections/-fdata-sections.
 add_link_options("-Wl,--gc-sections")
 
-include(${CMAKE_SOURCE_DIR}/cmake/DuckDB.cmake)
-include(${CMAKE_SOURCE_DIR}/cmake/Json.cmake)
-if(PLUME_WITH_COMPILE_LAYER)
-  include(${CMAKE_SOURCE_DIR}/cmake/Cpr.cmake)
+if(PLUME_INCLUDES)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/DuckDB.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Json.cmake)
+  if(PLUME_WITH_COMPILE_LAYER)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Cpr.cmake)
+  endif()
 endif()
 
 if(PLUME_WITH_TESTS)
