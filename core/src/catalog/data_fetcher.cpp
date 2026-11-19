@@ -1,7 +1,5 @@
 #include "plume/catalog/data_fetcher.hpp"
 
-#include "plume/catalog/catalog.hpp"
-
 #include <cpr/cpr.h>
 
 namespace plume::catalog {

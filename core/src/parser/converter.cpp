@@ -126,6 +126,7 @@ void RemapCombinedJoinRefs(expr::ExprNode &node, uint32_t duck_left_size, bool s
 
 Result<std::unique_ptr<PhysicalPlan>> Converter::Convert(duckdb::LogicalOperator &root) {
     TRY(auto root_node, Build(root));
+    PlanBuilder::CollapseEarlyAggregates(root_node);
     if (cfg_.dynamic_filter) {
         PlanDynamicFilters(builder_, root_node, dyn_filter_ctx_, cfg_);
     }
@@ -221,17 +222,22 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggre
         }
     }
 
-    // single-phase aggregate (no early-aggregation)
-    if (!two_phase) {
+    auto single_phase = [&]() {
         // AVG on a DECIMAL requires a AverageDecimalBindData to descale its result. Since we always
         // use a null bind_data we sidestep this issue by casting to a DOUBLE.
-        for (auto &spec : aggs) {
+        std::vector<exec::AggregateSpec> specs = aggs;
+        for (auto &spec : specs) {
             if (spec.func_name == "avg" && spec.arguments.size() == 1 &&
                 spec.arguments[0].return_type.id == TypeId::DECIMAL) {
                 spec.arguments[0] =
                     expr::ExprNode::Cast(std::move(spec.arguments[0]), ColumnType{TypeId::DOUBLE}, /*try_cast=*/false);
             }
         }
+        return std::make_shared<exec::AggregateTemplate>(std::move(specs), groups);
+    };
+
+    // single-phase aggregate (no early-aggregation)
+    if (!two_phase) {
         std::vector<uint32_t> split_keys;
         uint32_t partitions = 1;
         bool bare_columns = num_groups > 0;
@@ -255,12 +261,14 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggre
                 partitions = cfg_.max_splits;
             }
         }
-        auto t = std::make_shared<exec::AggregateTemplate>(std::move(aggs), std::move(groups));
+        auto t = single_phase();
         Schema out = exec::AggregateSchema(*t, prev->output_schema);
         return builder_.Shuffle(std::move(prev), std::move(t), std::move(out), std::move(split_keys), partitions);
     }
 
     // two-phase aggregation
+    auto early_agg = std::make_shared<PlanBuilder::EarlyAggregate>();
+    early_agg->single_phase = single_phase();
     exec::AggregateTemplate desired_templ(aggs, groups);
     Schema desired = exec::AggregateSchema(desired_templ, prev->output_schema);
 
@@ -329,6 +337,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggre
     auto partial = std::make_shared<exec::AggregateTemplate>(std::move(partials), std::move(groups));
     Schema partial_out = exec::AggregateSchema(*partial, prev->output_schema);
     PlanBuilder::SharedOpNode produced = builder_.After(std::move(prev), std::move(partial), partial_out);
+    early_agg->partial = produced;
 
     // final aggregation node
     std::vector<uint32_t> split_keys;
@@ -359,6 +368,9 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggre
             proj->projections.push_back(std::move(fe));
         }
         cur = builder_.After(std::move(cur), std::move(proj), desired);
+    }
+    if (num_groups > 0) {
+        cur->early_agg = std::move(early_agg);
     }
     return cur;
 }

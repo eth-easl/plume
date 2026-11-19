@@ -2,6 +2,7 @@
 
 #include "checksum.hpp"
 #include "config.hpp"
+#include "dandelion_trace.hpp"
 
 #include "plume/catalog/catalog.hpp"
 #include "plume/common/result.hpp"
@@ -32,13 +33,13 @@ class Runner {
     struct Invocation {
         std::string name;                     // display name (e.g. "q6" or "q6_sf1")
         dandelion::BinaryData body;           // dandelion invocation body
+        std::string composition_dsl;          // composition DSL the body was built from
         Schema out_schema;                    // schema of the result
         int64_t planning_ms = 0;              // CompileQuery wall time
         std::vector<int64_t> latencies_ms;    // per-invocation execution latency
-        std::vector<std::string> timestamps;  // per-invocation dandelion timestamps
         size_t num_invocations = 0;
 
-        // Indicates into latencies_ms/timestamps marking the start of each run after the first.
+        // Indices into latencies_ms marking the start of each run after the first.
         // Empty if everything belongs to a single run.
         std::vector<size_t> run_starts;
 
@@ -75,6 +76,7 @@ class Runner {
     std::vector<Invocation> invocations_;
     std::unordered_map<std::string, size_t> by_key_; // dedup key -> invocations_ index
     std::optional<ChecksumFile> checksum_file_;      // loaded from config_.checksum_path, if set
+    std::optional<DandelionTraceCollector> traces_;  // set if dandelion reported its timestamp names
 
     duckdb::DuckDB db_;
     duckdb::Connection con_;

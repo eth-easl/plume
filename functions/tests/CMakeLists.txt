@@ -65,6 +65,11 @@ plume_add_function_test(test_pq_stage
   ${FN_SRC}/util/output_split.cpp)
 target_link_libraries(test_pq_stage PRIVATE plume_snappy) # parquet_encode.hpp hand-encodes Snappy fixtures
 
+plume_add_function_test(test_df_combine
+  test_df_combine.cpp
+  ${FN_SRC}/functions/df_combine.cpp
+  ${FN_SRC}/util/dynamic_filter.cpp)
+
 # Decode microbenchmark (not a ctest; run manually against a parquet file).
 add_executable(bench_pq_decode bench_pq_decode.cpp)
 target_link_libraries(bench_pq_decode PRIVATE plume)

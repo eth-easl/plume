@@ -17,6 +17,7 @@
     "debugPrints": false,
     "maxSplits": 30,
     "targetRowsPerSplit": 131072,
+    "dynamicFilter": true,
 
     "benchmarkConfig": { "repetitions": 3 }
 }

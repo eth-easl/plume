@@ -22,7 +22,9 @@ set(MOCK_RUNTIME_FN_SRC
   ${FN_SRC}/functions/csv_stage.cpp
   # parquet source stages
   ${FN_SRC}/functions/pq_prepare.cpp
-  ${FN_SRC}/functions/pq_stage.cpp)
+  ${FN_SRC}/functions/pq_stage.cpp
+  # dynamic filter combination of parallel producers
+  ${FN_SRC}/functions/df_combine.cpp)
 
 if(TARGET plume_mock)
   add_executable(test_plan_e2e test_plan_e2e.cpp ${MOCK_RUNTIME_FN_SRC})

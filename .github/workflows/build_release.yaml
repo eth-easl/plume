@@ -49,6 +49,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v3
+    - run: sudo apt-get update && sudo apt-get install -y -o Acquire::Retries=5 libprotobuf-dev protobuf-compiler
     - run: ./scripts/build_client.sh
     - name: upload client binaries
       shell: bash

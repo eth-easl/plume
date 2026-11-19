@@ -54,6 +54,11 @@ plume_function(plume_pq_stage
   src/util/dynamic_filter.cpp
   src/util/output_split.cpp)
 
+plume_function(plume_df_combine
+  src/bin/plume_df_combine.cpp
+  src/functions/df_combine.cpp
+  src/util/dynamic_filter.cpp)
+
 # ---------------------------------------------------------------------------
 #  Tests
 # ---------------------------------------------------------------------------

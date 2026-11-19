@@ -58,4 +58,4 @@ python3 runner/scripts/generate_checksums.py tpch/config/local_single_sf10.json
 
 ## Output
 
-A per-query summary table on the console. With `resultsPrefix` set, also writes `planning.txt`, `timings.txt` (latencies, or per-rps runs for a throughput sweep), and `timestamps.txt` under that directory. Trace benchmarks further output a `trace_results.txt` file.
+A per-query summary table on the console. With `resultsPrefix` set, also writes `planning.txt`, `timings.txt` (latencies, or per-rps runs for a throughput sweep) under that directory, plus `traces.plmt.gz` (gzip-compressed binary Dandelion execution traces) if Dandelion returned traces. Trace benchmarks further output a `trace_results.txt` file.
