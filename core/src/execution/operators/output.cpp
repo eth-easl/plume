@@ -5,6 +5,7 @@
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -41,7 +42,7 @@ std::vector<uint32_t> RoutePartitionIds(DataChunk &chunk, const std::vector<uint
     for (size_t k = 1; k < key_columns.size(); k++) {
         VectorOperations::CombineHash(hashes, chunk.data[key_columns[k]], count);
     }
-    hashes.Flatten(count);
+    hashes.Flatten();
     auto *hd = duckdb::FlatVector::GetData<hash_t>(hashes);
     for (idx_t r = 0; r < count; r++) {
         pid[r] = static_cast<uint32_t>(hd[r] % n);
@@ -89,7 +90,7 @@ Result<void> SplitOutputOperator::Push(std::unique_ptr<DataChunk> chunk) {
         for (idx_t i = 0; i < chunk_size; i++) {
             selection->set_index(i, i);
         }
-        auto view = std::make_unique<SelectionVector>(selection->data());
+        auto view = std::make_unique<SelectionVector>(selection->data(), chunk_size);
         TRYV(sink_->Accept(0, shared_chunk, std::move(view), chunk_size, selection));
     }
 
@@ -98,7 +99,7 @@ Result<void> SplitOutputOperator::Push(std::unique_ptr<DataChunk> chunk) {
     for (size_t k = 1; k < key_columns_.size(); k++) {
         VectorOperations::CombineHash(hashes, shared_chunk->data[key_columns_[k]], chunk_size);
     }
-    hashes.Flatten(chunk_size);
+    hashes.Flatten();
     
     std::vector<uint32_t> partition_id(chunk_size, 0);
     std::vector<idx_t> offsets(partitions_, 0);
@@ -122,7 +123,7 @@ Result<void> SplitOutputOperator::Push(std::unique_ptr<DataChunk> chunk) {
         if (count == 0) {
             continue;
         }
-        auto view = std::make_unique<SelectionVector>(selection->data() + offsets[i]);
+        auto view = std::make_unique<SelectionVector>(selection->data() + offsets[i], count);
         TRYV(sink_->Accept(i, shared_chunk, std::move(view), count, selection));
     }
     return Ok();

@@ -128,7 +128,7 @@ TEST_CASE("response: sets, items, payload slicing and trace") {
     i1->set_identifier("out1");
     i1->set_payload_length(4);
     meta.add_sets(); // empty set
-    meta.set_timestamps("{\"ts\":[]}");
+    meta.set_trace("{\"ts\":[]}");
 
     std::string trace;
     auto sets = ParseResponseBody(Frame(meta, Bytes("abcdefg")), &trace).unwrap();

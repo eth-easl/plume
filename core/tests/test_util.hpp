@@ -1,5 +1,3 @@
-// Minimal stdlib-only test scaffolding (TASK.md: as few external deps as
-// possible). No GTest/Catch2 — just CHECK macros and a tiny runner.
 #pragma once
 
 #include <cstdio>

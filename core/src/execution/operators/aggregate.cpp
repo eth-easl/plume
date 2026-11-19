@@ -3,10 +3,15 @@
 #include "plume/expression/expression_builder.hpp"
 #include "plume/expression/function_registry.hpp"
 
+#include "duckdb/common/clustered_aggregate.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/aggregate_function.hpp"
+#include "duckdb/function/aggregate_state.hpp"
 
 #include <cstring>
 #include <unordered_set>
@@ -16,7 +21,9 @@ namespace plume::exec {
 using plume::memory::Allocator;
 using expr::BuildExpression;
 
+using duckdb::AggregateFinalizeInputData;
 using duckdb::AggregateInputData;
+using duckdb::AggregateStateInput;
 using duckdb::data_ptr_t;
 using duckdb::DataChunk;
 using duckdb::FlatVector;
@@ -103,7 +110,7 @@ struct AggregateOperator::AggImpl {
     AggStrategy strategy = AggStrategy::KERNEL;
 
     // KERNEL: resolved DuckDB function + per-group state pointers.
-    std::unique_ptr<duckdb::AggregateFunction> function;
+    std::unique_ptr<duckdb::BoundAggregateFunction> function;
     idx_t state_size = 0;
     std::vector<data_ptr_t> states;
 
@@ -144,7 +151,7 @@ AggregateOperator::AggregateOperator(duckdb::vector<duckdb::unique_ptr<duckdb::E
         group_executor_ = std::make_unique<duckdb::ExpressionExecutor>();
         for (auto &e : group_exprs_) {
             group_executor_->AddExpression(*e);
-            key_types_.push_back(e->return_type);
+            key_types_.push_back(e->GetReturnType());
         }
         key_chunk_.Initialize(alloc_.Get(), key_types_);
 
@@ -160,7 +167,7 @@ AggregateOperator::AggregateOperator(duckdb::vector<duckdb::unique_ptr<duckdb::E
             impl->executor = std::make_unique<duckdb::ExpressionExecutor>();
             for (auto &a : impl->args) {
                 impl->executor->AddExpression(*a);
-                impl->arg_types.push_back(a->return_type);
+                impl->arg_types.push_back(a->GetReturnType());
             }
             impl->arg_chunk.Initialize(alloc_.Get(), impl->arg_types);
         }
@@ -169,8 +176,9 @@ AggregateOperator::AggregateOperator(duckdb::vector<duckdb::unique_ptr<duckdb::E
             impl->strategy = (build.func_name == "min") ? AggStrategy::MIN : AggStrategy::MAX;
         } else {
             impl->strategy = AggStrategy::KERNEL;
-            impl->function = std::move(build.function);
-            impl->state_size = impl->function->state_size(*impl->function);
+            impl->function = std::make_unique<duckdb::BoundAggregateFunction>(*build.function);
+            AggregateStateInput state_input(*impl->function, nullptr);
+            impl->state_size = impl->function->GetStateSizeCallback()(state_input);
         }
         // MIN/MAX are already dedup-invariant so only KERNEL aggregates need the dedup pass.
         impl->distinct = build.distinct && impl->strategy == AggStrategy::KERNEL;
@@ -180,16 +188,18 @@ AggregateOperator::AggregateOperator(duckdb::vector<duckdb::unique_ptr<duckdb::E
 
 AggregateOperator::~AggregateOperator() {
     for (auto &agg : aggs_) {
-        if (agg->strategy != AggStrategy::KERNEL || !agg->function->destructor || agg->states.empty()) {
+        if (agg->strategy != AggStrategy::KERNEL || !agg->function->HasStateDestructorCallback() ||
+            agg->states.empty()) {
             continue;
         }
         Vector state_vec(LogicalType::POINTER, agg->states.size());
-        auto sptr = FlatVector::GetData<data_ptr_t>(state_vec);
+        auto sptr = FlatVector::GetDataMutable<data_ptr_t>(state_vec);
         for (size_t i = 0; i < agg->states.size(); i++) {
             sptr[i] = agg->states[i];
         }
-        AggregateInputData aggr_input(nullptr, arena_);
-        agg->function->destructor(state_vec, aggr_input, agg->states.size());
+        FlatVector::SetSize(state_vec, agg->states.size());
+        AggregateInputData aggr_input(*agg->function, nullptr, arena_);
+        agg->function->GetStateDestructorCallback()(state_vec, aggr_input, agg->states.size());
     }
 }
 
@@ -276,17 +286,22 @@ Result<void> AggregateOperator::Push(std::unique_ptr<DataChunk> chunk) {
         }
 
         if (agg->strategy == AggStrategy::KERNEL) {
-            AggregateInputData aggr_input(nullptr, arena_);
-            if (ungrouped_) {
-                agg->function->simple_update(inputs, aggr_input, n_args, agg->states[0], upd_count);
+            AggregateInputData aggr_input(*agg->function, nullptr, arena_);
+            const auto cluster_update = agg->function->GetStateClusterUpdateCallback();
+            if (ungrouped_ && cluster_update) {
+                duckdb::ClusteredAggr clustered;
+                clustered.SetSingleRun(agg->states[0], upd_count);
+                aggr_input.clustered = &clustered;
+                cluster_update(inputs, aggr_input, n_args, clustered, upd_count);
             } else {
                 Vector state_vec(LogicalType::POINTER);
-                auto sptr = FlatVector::GetData<data_ptr_t>(state_vec);
+                auto sptr = FlatVector::GetDataMutable<data_ptr_t>(state_vec);
                 for (idx_t i = 0; i < upd_count; i++) {
                     const idx_t r = distinct_sel ? distinct_sel->get_index(i) : i;
-                    sptr[i] = agg->states[group_of_row[r]];
+                    sptr[i] = agg->states[ungrouped_ ? 0 : group_of_row[r]];
                 }
-                agg->function->update(inputs, aggr_input, n_args, state_vec, upd_count);
+                FlatVector::SetSize(state_vec, upd_count);
+                agg->function->GetStateUpdateCallback()(inputs, aggr_input, n_args, state_vec, upd_count);
             }
         } else {
             // Native MIN/MAX over the (single) argument column.
@@ -316,7 +331,6 @@ Result<void> AggregateOperator::Finish() {
     const idx_t n_groups = group_key_values_.size();
     const idx_t n_key_cols = key_types_.size();
 
-    AggregateInputData aggr_input(nullptr, arena_);
     for (idx_t g0 = 0; g0 < n_groups; g0 += STANDARD_VECTOR_SIZE) {
         const idx_t batch = std::min<idx_t>(STANDARD_VECTOR_SIZE, n_groups - g0);
         auto result = std::make_unique<DataChunk>();
@@ -324,7 +338,7 @@ Result<void> AggregateOperator::Finish() {
 
         for (idx_t c = 0; c < n_key_cols; c++) {
             for (idx_t i = 0; i < batch; i++) {
-                result->SetValue(c, i, group_key_values_[g0 + i][c]);
+                result->data[c].SetValue(i, group_key_values_[g0 + i][c]);
             }
         }
         for (size_t j = 0; j < aggs_.size(); j++) {
@@ -332,18 +346,20 @@ Result<void> AggregateOperator::Finish() {
             Vector &col = result->data[n_key_cols + j];
             if (agg->strategy == AggStrategy::KERNEL) {
                 Vector state_vec(LogicalType::POINTER, batch);
-                auto sptr = FlatVector::GetData<data_ptr_t>(state_vec);
+                auto sptr = FlatVector::GetDataMutable<data_ptr_t>(state_vec);
                 for (idx_t i = 0; i < batch; i++) {
                     sptr[i] = agg->states[g0 + i];
                 }
-                agg->function->finalize(state_vec, aggr_input, col, batch, 0);
+                FlatVector::SetSize(state_vec, batch);
+                AggregateFinalizeInputData finalize_input(*agg->function, nullptr, arena_);
+                agg->function->GetStateFinalizeCallback()(state_vec, finalize_input, col, batch, 0);
             } else {
                 for (idx_t i = 0; i < batch; i++) {
-                    result->SetValue(n_key_cols + j, i, agg->values[g0 + i]);
+                    result->data[n_key_cols + j].SetValue(i, agg->values[g0 + i]);
                 }
             }
         }
-        result->SetCardinality(batch);
+        result->SetChildCardinality(batch);
         TRYV(next_->Push(std::move(result)));
     }
     return next_->Finish();
@@ -381,7 +397,8 @@ void AggregateOperator::AddGroupSlots() {
     for (auto &agg : aggs_) {
         if (agg->strategy == AggStrategy::KERNEL) {
             auto state = arena_.Allocate(agg->state_size);
-            agg->function->initialize(*agg->function, state);
+            AggregateStateInput state_input(*agg->function, nullptr);
+            agg->function->GetStateInitCallback()(state_input, &state, 1);
             agg->states.push_back(state);
         } else {
             agg->values.emplace_back(); // NULL until first non-null input
@@ -442,7 +459,7 @@ Result<std::unique_ptr<Operator>> BuildAggregateTemplate(std::shared_ptr<Aggrega
     duckdb::vector<LogicalType> out_types;
     for (auto &g : templ->group_keys) {
         TRY(auto built, BuildExpression(g));
-        out_types.push_back(built->return_type);
+        out_types.push_back(built->GetReturnType());
         group_exprs.push_back(std::move(built));
     }
     
@@ -453,7 +470,7 @@ Result<std::unique_ptr<Operator>> BuildAggregateTemplate(std::shared_ptr<Aggrega
         std::vector<LogicalType> arg_types;
         for (auto &a : spec.arguments) {
             TRY(auto built, BuildExpression(a));
-            arg_types.push_back(built->return_type);
+            arg_types.push_back(built->GetReturnType());
             args.push_back(std::move(built));
         }
         auto rettype = ToLogicalType(spec.return_type);

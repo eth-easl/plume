@@ -59,7 +59,7 @@ protected:
             while (done < part.count) {
                 if (!cur || fill == STANDARD_VECTOR_SIZE) {
                     if (cur) {
-                        cur->SetCardinality(fill);
+                        cur->SetChildCardinality(fill);
                         ptrs.push_back(cur.get());
                         mats.push_back(std::move(cur));
                     }
@@ -79,7 +79,7 @@ protected:
             }
         }
         if (cur && fill > 0) {
-            cur->SetCardinality(fill);
+            cur->SetChildCardinality(fill);
             ptrs.push_back(cur.get());
             mats.push_back(std::move(cur));
         }

@@ -1,8 +1,3 @@
-// Large-input test: a single host block may exceed one vector. ImportBlockChunks
-// must split it into zero-copy <= STANDARD_VECTOR_SIZE chunks (validity slices
-// stay word-aligned), and the pipeline must process them correctly across the
-// 2048-row boundaries.
-
 #include "exec_test_util.hpp"
 #include "test_util.hpp"
 
@@ -18,6 +13,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/validity_mask.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cstring>
 

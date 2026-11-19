@@ -158,6 +158,17 @@ Result<void> EnsureKernel(const std::string &name, ScalarFunction &func, const L
     return Ok();
 }
 
+std::vector<LogicalType> PositionalArguments(const duckdb::SimpleFunction &func) {
+    std::vector<LogicalType> out;
+    for (auto &param : func.GetSignature().GetParameters()) {
+        if (param.GetKind() == duckdb::FunctionParameterKind::POSITIONAL_ONLY ||
+            param.GetKind() == duckdb::FunctionParameterKind::STANDARD) {
+            out.push_back(param.GetType());
+        }
+    }
+    return out;
+}
+
 bool ArgumentsMatch(const std::vector<LogicalType> &have, const std::vector<LogicalType> &want) {
     if (have.size() != want.size()) {
         return false;
@@ -188,8 +199,8 @@ Result<ScalarFunction> ResolveScalarFunction(const std::string &name, const std:
     }
     ScalarFunctionSet set = it->second();
     for (auto &candidate : set.functions) {
-        if (ArgumentsMatch(candidate.arguments, arguments)) {
-            ScalarFunction func = candidate;
+        if (ArgumentsMatch(PositionalArguments(*candidate), arguments)) {
+            ScalarFunction func = *candidate;
             TRYV(EnsureKernel(name, func, return_type));
             return func;
         }
@@ -249,12 +260,12 @@ Result<duckdb::AggregateFunction> ResolveAggregateFunction(const std::string &na
 
     // First, try to get an exact match.
     for (auto &candidate : set.functions) {
-        if (!candidate.state_size) {
+        if (!candidate->GetCallbacks().HasStateSizeCallback()) {
             // overload requires a ClientContext bind step we cannot invoke
             continue;
         }
-        if (ArgumentsMatch(candidate.arguments, arguments)) {
-            return candidate;
+        if (ArgumentsMatch(PositionalArguments(*candidate), arguments)) {
+            return AggregateFunction(*candidate);
         }
     }
 
@@ -275,11 +286,11 @@ Result<duckdb::AggregateFunction> ResolveAggregateFunction(const std::string &na
             storage_args.push_back(arg.id() == duckdb::LogicalTypeId::DECIMAL ? DecimalStorageType(arg) : arg);
         }
         for (auto &candidate : set.functions) {
-            if (!candidate.state_size) {
+            if (!candidate->GetCallbacks().HasStateSizeCallback()) {
                 continue;
             }
-            if (ArgumentsMatch(candidate.arguments, storage_args)) {
-                return candidate;
+            if (ArgumentsMatch(PositionalArguments(*candidate), storage_args)) {
+                return AggregateFunction(*candidate);
             }
         }
     }

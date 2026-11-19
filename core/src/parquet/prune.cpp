@@ -126,7 +126,7 @@ std::optional<double> StatPosition(const Value &v, size_t string_prefix) {
     case duckdb::LogicalTypeId::DATE:
         return static_cast<double>(v.GetValue<duckdb::date_t>().days);
     case duckdb::LogicalTypeId::TIME:
-        return static_cast<double>(v.GetValue<duckdb::dtime_t>().micros);
+        return static_cast<double>(v.GetValue<duckdb::dtime_t>().value);
     case duckdb::LogicalTypeId::VARCHAR: {
         const auto &str = duckdb::StringValue::Get(v);
         double pos = 0;

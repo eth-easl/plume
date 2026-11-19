@@ -7,6 +7,10 @@
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
+
+#include <type_traits>
 
 #include <limits>
 #include <type_traits>
@@ -208,7 +212,7 @@ public:
 protected:
     idx_t SelectRows(Vector &keys, idx_t size, duckdb::SelectionVector &sel, idx_t count) override {
         UnifiedVectorFormat udata;
-        keys.ToUnifiedFormat(size, udata);
+        keys.ToUnifiedFormat(udata);
         auto data = UnifiedVectorFormat::GetData<T>(udata);
         idx_t passed = 0;
         for (idx_t i = 0; i < count; i++) {
@@ -382,10 +386,17 @@ void ReduceFlatAllValid(const T *__restrict data, idx_t count, bool &has_value, 
 // reinterpreted instead of surfacing as their plain integer representation.
 template <class T> Value MakeValue(const T &v, const LogicalType &key_type) {
     Value val = Value::CreateValue<T>(v);
-    if (val.type() != key_type) {
-        val.Reinterpret(key_type);
+    if (val.type() == key_type) {
+        return val;
     }
-    return val;
+    // Only integral physical types back a different logical type (DATE, DECIMAL, TIME, ...).
+    if constexpr (std::is_same_v<T, duckdb::hugeint_t>) {
+        return Value::Numeric(key_type, v);
+    } else if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool> && !std::is_same_v<T, uint64_t>) {
+        return Value::Numeric(key_type, static_cast<int64_t>(v));
+    } else {
+        throw duckdb::InternalException("Cannot represent physical key as %s", key_type.ToString());
+    }
 }
 
 template <class T>
@@ -407,11 +418,11 @@ public:
         T chunk_max {};
 
         if (mode_ == Mode::BOUNDS && vec.GetVectorType() == duckdb::VectorType::FLAT_VECTOR &&
-            duckdb::FlatVector::Validity(vec).AllValid()) {
+            duckdb::FlatVector::Validity(vec).CannotHaveNull()) {
             ReduceFlatAllValid<T>(duckdb::FlatVector::GetData<T>(vec), count, has_value, chunk_min, chunk_max);
         } else {
             UnifiedVectorFormat udata;
-            vec.ToUnifiedFormat(count, udata);
+            vec.ToUnifiedFormat(udata);
             auto data = UnifiedVectorFormat::GetData<T>(udata);
             for (idx_t i = 0; i < count; i++) {
                 const auto idx = udata.sel->get_index(i);

@@ -47,10 +47,10 @@ DataBuffer MakeBlock(Allocator &alloc, const std::vector<int32_t> &region, const
     DataChunk chunk;
     chunk.Initialize(alloc.Get(), {LogicalType::INTEGER, LogicalType::INTEGER});
     for (idx_t r = 0; r < region.size(); r++) {
-        chunk.SetValue(0, r, Value::INTEGER(region[r]));
-        chunk.SetValue(1, r, Value::INTEGER(amount[r]));
+        chunk.data[0].SetValue(r, Value::INTEGER(region[r]));
+        chunk.data[1].SetValue(r, Value::INTEGER(amount[r]));
     }
-    chunk.SetCardinality(region.size());
+    chunk.SetChildCardinality(region.size());
     auto block = ExportChunk(RegionAmount(), chunk, alloc).unwrap();
     auto buf = mock::MakeBuffer(block.data, block.size);
     alloc.Free(block.data, block.size);
@@ -123,10 +123,10 @@ ChunkList MakeChunks(Allocator &alloc, uint32_t n, int32_t region_val) {
         c->Initialize(alloc.Get(), {LogicalType::INTEGER, LogicalType::INTEGER});
         idx_t k = std::min<uint32_t>(STANDARD_VECTOR_SIZE, n - base);
         for (idx_t r = 0; r < k; r++) {
-            c->SetValue(0, r, Value::INTEGER(region_val));
-            c->SetValue(1, r, Value::INTEGER(static_cast<int32_t>(base + r)));
+            c->data[0].SetValue(r, Value::INTEGER(region_val));
+            c->data[1].SetValue(r, Value::INTEGER(static_cast<int32_t>(base + r)));
         }
-        c->SetCardinality(k);
+        c->SetChildCardinality(k);
         chunks.push_back(std::move(c));
     }
     return chunks;
@@ -206,11 +206,11 @@ TEST_CASE("SplitOutput: hash round-trip preserves rows and routes by key") {
         for (idx_t r = 0; r < k; r++) {
             int32_t region = static_cast<int32_t>((base + r) % 37);
             int32_t amount = static_cast<int32_t>(base + r);
-            c->SetValue(0, r, Value::INTEGER(region));
-            c->SetValue(1, r, Value::INTEGER(amount));
+            c->data[0].SetValue(r, Value::INTEGER(region));
+            c->data[1].SetValue(r, Value::INTEGER(amount));
             expected.insert({region, amount});
         }
-        c->SetCardinality(k);
+        c->SetChildCardinality(k);
         chunks.push_back(std::move(c));
     }
 
@@ -284,11 +284,11 @@ TEST_CASE("SplitOutput: varchar heap gather round-trips") {
         for (idx_t r = 0; r < k; r++) {
             int32_t region = static_cast<int32_t>((base + r) % 7);
             std::string s = mkstr(base + r);
-            c->SetValue(0, r, Value::INTEGER(region));
-            c->SetValue(1, r, Value(s));
+            c->data[0].SetValue(r, Value::INTEGER(region));
+            c->data[1].SetValue(r, Value(s));
             expected.insert({region, s});
         }
-        c->SetCardinality(k);
+        c->SetChildCardinality(k);
         chunks.push_back(std::move(c));
     }
 

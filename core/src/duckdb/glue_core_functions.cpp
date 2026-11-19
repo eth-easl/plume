@@ -1,13 +1,15 @@
-#include "duckdb.hpp"
+// Registers the statically linked core_functions extension (SUM/AVG/...) for
+// targets that open a DuckDB instance but do not need parquet.
 
-#include "duckdb/main/extension_helper.hpp"
+#include "duckdb_static_extension.h"
 
-#include "core_functions_extension.hpp"
+extern "C" int32_t duckdb_extension_core_functions_describe(duckdb_extension_descriptor *descriptor);
 
-namespace duckdb {
-
-void ExtensionHelper::LoadAllExtensions(DuckDB &db) {
-    db.LoadStaticExtension<CoreFunctionsExtension>();
-}
-
-} // namespace duckdb
+namespace {
+struct PlumeCoreFunctionsRegistration {
+    PlumeCoreFunctionsRegistration() {
+        duckdb_register_static_extension(duckdb_extension_core_functions_describe);
+    }
+};
+const PlumeCoreFunctionsRegistration plume_core_functions_registration;
+} // namespace

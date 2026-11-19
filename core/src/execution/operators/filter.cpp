@@ -21,8 +21,8 @@ using duckdb::unique_ptr;
 namespace {
 
 void CollectRefs(const duckdb::Expression &e, std::vector<uint32_t> &out) {
-    if (e.type == duckdb::ExpressionType::BOUND_REF) {
-        out.push_back(static_cast<uint32_t>(e.Cast<duckdb::BoundReferenceExpression>().index));
+    if (e.GetExpressionType() == duckdb::ExpressionType::BOUND_REF) {
+        out.push_back(static_cast<uint32_t>(e.Cast<duckdb::BoundReferenceExpression>().Index()));
     }
     duckdb::ExpressionIterator::EnumerateChildren(
         e, [&](const duckdb::Expression &child) { CollectRefs(child, out); });
