@@ -44,7 +44,7 @@ OwnedBlock MakeBlock(Allocator &alloc, const Schema &schema, const std::vector<s
     chunk.Initialize(alloc.Get(), types);
     for (size_t c = 0; c < cols.size(); c++) {
         for (idx_t r = 0; r < rows; r++) {
-            chunk.SetValue(c, r, Value::INTEGER(cols[c][r]));
+            chunk.data[c].SetValue(r, Value::INTEGER(cols[c][r]));
         }
     }
     chunk.SetChildCardinality(rows);
@@ -243,8 +243,8 @@ TEST_CASE("projection float division, instance-free bind shim") {
     std::vector<double> xs = {10.0, 9.0, 7.0, 1.0};
     std::vector<double> ys = {4.0, 3.0, 2.0, 8.0};
     for (idx_t r = 0; r < xs.size(); r++) {
-        chunk.SetValue(0, r, Value::DOUBLE(xs[r]));
-        chunk.SetValue(1, r, Value::DOUBLE(ys[r]));
+        chunk.data[0].SetValue(r, Value::DOUBLE(xs[r]));
+        chunk.data[1].SetValue(r, Value::DOUBLE(ys[r]));
     }
     chunk.SetChildCardinality(xs.size());
     auto b0 = ExportChunk(schema, chunk, alloc).unwrap();

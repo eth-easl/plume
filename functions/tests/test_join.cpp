@@ -39,8 +39,8 @@ DataBuffer Make2ColBlock(Allocator &alloc, const Schema &schema, const std::vect
     DataChunk chunk;
     chunk.Initialize(alloc.Get(), {LogicalType::INTEGER, LogicalType::INTEGER});
     for (idx_t r = 0; r < c0.size(); r++) {
-        chunk.SetValue(0, r, Value::INTEGER(c0[r]));
-        chunk.SetValue(1, r, Value::INTEGER(c1[r]));
+        chunk.data[0].SetValue(r, Value::INTEGER(c0[r]));
+        chunk.data[1].SetValue(r, Value::INTEGER(c1[r]));
     }
     chunk.SetChildCardinality(c0.size());
     auto block = ExportChunk(schema, chunk, alloc).unwrap();

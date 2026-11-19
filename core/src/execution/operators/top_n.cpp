@@ -165,7 +165,7 @@ Result<void> TopNOperator::Finish() {
         for (idx_t i = 0; i < batch; i++) {
             const HeapRow &r = heap_[base + i];
             for (idx_t c = 0; c < n_cols; c++) {
-                result->SetValue(c, i, r.row[c]);
+                result->data[c].SetValue(i, r.row[c]);
             }
         }
         result->SetChildCardinality(batch);

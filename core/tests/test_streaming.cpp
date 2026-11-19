@@ -46,8 +46,8 @@ std::unique_ptr<DataChunk> MakeChunk(Allocator &alloc, const std::vector<int32_t
     auto chunk = std::make_unique<DataChunk>();
     chunk->Initialize(alloc.Get(), {LogicalType::INTEGER, LogicalType::INTEGER});
     for (idx_t r = 0; r < a.size(); r++) {
-        chunk->SetValue(0, r, Value::INTEGER(a[r]));
-        chunk->SetValue(1, r, Value::INTEGER(b[r]));
+        chunk->data[0].SetValue(r, Value::INTEGER(a[r]));
+        chunk->data[1].SetValue(r, Value::INTEGER(b[r]));
     }
     chunk->SetChildCardinality(a.size());
     return chunk;

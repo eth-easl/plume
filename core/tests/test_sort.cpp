@@ -42,9 +42,9 @@ OwnedBlock MakeBlock(Allocator &alloc, const Schema &schema, const std::vector<i
         if (a[r] == INT32_MIN) {
             FlatVector::SetNull(chunk.data[0], r, true);
         } else {
-            chunk.SetValue(0, r, Value::INTEGER(a[r]));
+            chunk.data[0].SetValue(r, Value::INTEGER(a[r]));
         }
-        chunk.SetValue(1, r, Value::INTEGER(b[r]));
+        chunk.data[1].SetValue(r, Value::INTEGER(b[r]));
     }
     chunk.SetChildCardinality(a.size());
     return ExportChunk(schema, chunk, alloc).unwrap();

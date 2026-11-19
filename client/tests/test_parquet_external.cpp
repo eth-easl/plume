@@ -52,11 +52,11 @@ void CheckExternalRead(int32_t codec, const std::string &path) {
     const int n = 3;
     const char *labels[] = {"alpha", nullptr, "gamma"};
     for (int r = 0; r < n; r++) {
-        chunk.SetValue(0, r, Value::INTEGER(r + 1));
-        chunk.SetValue(1, r, labels[r] ? Value(std::string(labels[r])) : Value(LogicalType::VARCHAR));
-        chunk.SetValue(2, r, Value::BIGINT(int64_t(r + 1) * 1000000000));
-        chunk.SetValue(3, r, Value::DOUBLE(10.0 + r + 0.25).DefaultCastAs(LogicalType::DECIMAL(9, 2)));
-        chunk.SetValue(4, r, Value::DATE(duckdb::Date::FromDate(2021, 3, r + 1)));
+        chunk.data[0].SetValue(r, Value::INTEGER(r + 1));
+        chunk.data[1].SetValue(r, labels[r] ? Value(std::string(labels[r])) : Value(LogicalType::VARCHAR));
+        chunk.data[2].SetValue(r, Value::BIGINT(int64_t(r + 1) * 1000000000));
+        chunk.data[3].SetValue(r, Value::DOUBLE(10.0 + r + 0.25).DefaultCastAs(LogicalType::DECIMAL(9, 2)));
+        chunk.data[4].SetValue(r, Value::DATE(duckdb::Date::FromDate(2021, 3, r + 1)));
     }
     chunk.SetChildCardinality(n);
 

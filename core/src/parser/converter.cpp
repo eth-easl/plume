@@ -22,7 +22,6 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -493,10 +492,6 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
     
     std::vector<expr::ExprNode> filter_preds;                     // pipeline FILTER (scanned-position refs)
     std::shared_ptr<expr::ExprNode> pushed_filter_pred = nullptr; // reader pruning (storage-index refs)
-    // Since DuckDB v2, table filters are keyed by projection index (position in
-    // column_ids, not table column index). Multi-column filters are only pushed
-    // partially, i.e. the predicate also stays in a LogicalFilter above the scan,
-    // so they are ignored here.
     if (get.table_filters.HasFilters()) {
         std::vector<expr::ExprNode> pushed_filter_preds;
         for (auto &entry : get.table_filters) {
@@ -616,10 +611,10 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildChunkGet(duckdb::LogicalColumn
     std::string cols_ddl;
     for (size_t c = 0; c < num_cols; c++) {
         if (c) cols_ddl += ", ";
-        cols_ddl += duckdb::KeywordHelper::WriteQuoted(schema.columns[c].name, '"') + " " +
+        cols_ddl += duckdb::SQLQuotedIdentifier::ToString(schema.columns[c].name) + " " +
                     get.chunk_types[c].ToString();
     }
-    auto create = con_.Query("CREATE TABLE " + duckdb::KeywordHelper::WriteQuoted(table_name, '"') +
+    auto create = con_.Query("CREATE TABLE " + duckdb::SQLQuotedIdentifier::ToString(table_name) +
                              " (" + cols_ddl + ")");
     if (create->HasError()) {
         return Error("Failed to materialize CHUNK_GET table: " + create->GetError(), ErrorKind::RuntimeError);
@@ -629,7 +624,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildChunkGet(duckdb::LogicalColumn
     if (num_rows > 0) {
         auto rows = collection.GetRows();
         std::string insert =
-            "INSERT INTO " + duckdb::KeywordHelper::WriteQuoted(table_name, '"') + " VALUES ";
+            "INSERT INTO " + duckdb::SQLQuotedIdentifier::ToString(table_name) + " VALUES ";
         for (duckdb::idx_t r = 0; r < num_rows; r++) {
             if (r) insert += ", ";
             insert += "(";
@@ -661,7 +656,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildEmptyResult(duckdb::LogicalEmp
         col.type = FromLogicalType(empty.return_types[c]);
         col.nullable = true;
         if (c) cols_ddl += ", ";
-        cols_ddl += duckdb::KeywordHelper::WriteQuoted(col.name, '"') + " " + empty.return_types[c].ToString();
+        cols_ddl += duckdb::SQLQuotedIdentifier::ToString(col.name) + " " + empty.return_types[c].ToString();
         schema.columns.push_back(std::move(col));
     }
     if (schema.columns.empty()) {
@@ -669,7 +664,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildEmptyResult(duckdb::LogicalEmp
     }
 
     const std::string table_name = "__empty_result_" + std::to_string(num_empty_results_++);
-    auto create = con_.Query("CREATE OR REPLACE TABLE " + duckdb::KeywordHelper::WriteQuoted(table_name, '"') +
+    auto create = con_.Query("CREATE OR REPLACE TABLE " + duckdb::SQLQuotedIdentifier::ToString(table_name) +
                              " (" + cols_ddl + ")");
     if (create->HasError()) {
         return Error("Failed to materialize EMPTY_RESULT table: " + create->GetError(), ErrorKind::RuntimeError);

@@ -338,7 +338,7 @@ Result<void> AggregateOperator::Finish() {
 
         for (idx_t c = 0; c < n_key_cols; c++) {
             for (idx_t i = 0; i < batch; i++) {
-                result->SetValue(c, i, group_key_values_[g0 + i][c]);
+                result->data[c].SetValue(i, group_key_values_[g0 + i][c]);
             }
         }
         for (size_t j = 0; j < aggs_.size(); j++) {
@@ -355,7 +355,7 @@ Result<void> AggregateOperator::Finish() {
                 agg->function->GetStateFinalizeCallback()(state_vec, finalize_input, col, batch, 0);
             } else {
                 for (idx_t i = 0; i < batch; i++) {
-                    result->SetValue(n_key_cols + j, i, agg->values[g0 + i]);
+                    result->data[n_key_cols + j].SetValue(i, agg->values[g0 + i]);
                 }
             }
         }

@@ -46,7 +46,7 @@ duckdb::Vector &HashableColumn(duckdb::DataChunk &chunk, duckdb::idx_t c, duckdb
     if (id != duckdb::LogicalTypeId::DOUBLE && id != duckdb::LogicalTypeId::FLOAT) {
         return src;
     }
-    src.Flatten(count);
+    src.Flatten();
     auto canon = duckdb::make_uniq<duckdb::Vector>(src.GetType(), count);
     duckdb::FlatVector::SetValidity(*canon, duckdb::FlatVector::Validity(src));
     if (id == duckdb::LogicalTypeId::DOUBLE) {
@@ -62,7 +62,7 @@ duckdb::Vector &HashableColumn(duckdb::DataChunk &chunk, duckdb::idx_t c, duckdb
             ddata[r] = static_cast<float>(CanonicalizeDouble(sdata[r]));
         }
     }
-    duckdb::FlatVector::SetSize(*canon, count); // v2 vectors carry their own size
+    duckdb::FlatVector::SetSize(*canon, count);
     duckdb::Vector &ref = *canon;
     storage.push_back(std::move(canon));
     return ref;
@@ -132,7 +132,7 @@ Result<ChecksumEntry> ComputeChecksum(const dandelion::DataSetVec &sets) {
                         duckdb::VectorOperations::CombineHash(hashes, HashableColumn(*chunk, c, count, storage),
                                                               count);
                     }
-                    hashes.Flatten(count);
+                    hashes.Flatten();
                     auto *data = duckdb::FlatVector::GetData<duckdb::hash_t>(hashes);
                     for (duckdb::idx_t r = 0; r < count; r++) {
                         result.hash_sum += data[r];

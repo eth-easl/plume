@@ -71,9 +71,9 @@ OwnedBlock MakeBlock(Allocator &alloc, const Schema &schema, const std::vector<s
     for (size_t c = 0; c < cols.size(); c++) {
         for (idx_t r = 0; r < rows; r++) {
             if (cols[c][r] == null_sentinel) {
-                chunk.SetValue(c, r, Value(LogicalType::INTEGER));
+                chunk.data[c].SetValue(r, Value(LogicalType::INTEGER));
             } else {
-                chunk.SetValue(c, r, Value::INTEGER(cols[c][r]));
+                chunk.data[c].SetValue(r, Value::INTEGER(cols[c][r]));
             }
         }
     }
@@ -97,9 +97,9 @@ OwnedBlock MakeVarcharBlock(Allocator &alloc, const Schema &schema,
     chunk.Initialize(alloc.Get(), types);
     for (idx_t r = 0; r < rows; r++) {
         if (vals[r].has_value()) {
-            chunk.SetValue(0, r, Value(*vals[r]));
+            chunk.data[0].SetValue(r, Value(*vals[r]));
         } else {
-            chunk.SetValue(0, r, Value(LogicalType::VARCHAR));
+            chunk.data[0].SetValue(r, Value(LogicalType::VARCHAR));
         }
     }
     chunk.SetChildCardinality(rows);
@@ -440,7 +440,7 @@ OwnedBlock MakeValueBlock(Allocator &alloc, const Schema &schema, const std::vec
     DataChunk chunk;
     chunk.Initialize(alloc.Get(), types);
     for (idx_t r = 0; r < vals.size(); r++) {
-        chunk.SetValue(0, r, vals[r].DefaultCastAs(types[0]));
+        chunk.data[0].SetValue(r, vals[r].DefaultCastAs(types[0]));
     }
     chunk.SetChildCardinality(vals.size());
     return ExportChunk(schema, chunk, alloc).unwrap();

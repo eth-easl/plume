@@ -37,7 +37,7 @@ using parser::Stage;
 namespace {
 
 std::string Quote(const std::string &identifier) {
-    return duckdb::KeywordHelper::WriteQuoted(identifier, '"');
+    return duckdb::SQLQuotedIdentifier::ToString(identifier);
 }
 
 std::vector<uint8_t> CopyBytes(const DataBuffer &buf) {

@@ -158,8 +158,6 @@ Result<void> EnsureKernel(const std::string &name, ScalarFunction &func, const L
     return Ok();
 }
 
-// Types of the positional parameters (the pre-v2 `arguments` vector; varargs and
-// keyword parameters are not included).
 std::vector<LogicalType> PositionalArguments(const duckdb::SimpleFunction &func) {
     std::vector<LogicalType> out;
     for (auto &param : func.GetSignature().GetParameters()) {

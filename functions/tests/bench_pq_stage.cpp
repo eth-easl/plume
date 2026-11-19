@@ -103,7 +103,7 @@ struct OldBuilder {
                     pending_heap += s.size();
                 }
             }
-            dst.SetValue(col, cur, std::move(v));
+            dst.data[col].SetValue(cur, std::move(v));
         }
         dst.SetChildCardinality(++cur);
         pending_rows++;

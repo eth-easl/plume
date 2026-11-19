@@ -301,7 +301,7 @@ Result<void> ParseCSVChunk(const uint8_t *data, size_t size, const CSVRegionInfo
         // Default every output column to NULL; present + projected fields overwrite
         // below (handles short rows and unprojected source fields uniformly).
         for (uint32_t c = 0; c < schema.size(); c++) {
-            dst.SetValue(c, cur, Value(types[c]));
+            dst.data[c].SetValue(cur, Value(types[c]));
         }
         uint32_t sfi = 0; // physical source field index
         auto set_field = [&](size_t a, size_t e) {
@@ -318,7 +318,7 @@ Result<void> ParseCSVChunk(const uint8_t *data, size_t size, const CSVRegionInfo
                         v = Value(types[col]);
                     }
                 }
-                dst.SetValue(col, cur, v);
+                dst.data[col].SetValue(cur, v);
             }
             sfi++;
         };

@@ -129,7 +129,7 @@ Result<void> EncodeColumnValues(const ColumnType &type, bool nullable,
         }
         const idx_t rows = chunk->size();
         auto &vec = chunk->data[col];
-        vec.Flatten(rows);
+        vec.Flatten();
         auto &validity = duckdb::FlatVector::Validity(vec);
         for (idx_t r = 0; r < rows; r++) {
             const bool valid = nullable ? validity.RowIsValid(r) : true;

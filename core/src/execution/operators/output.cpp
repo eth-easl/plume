@@ -42,7 +42,7 @@ std::vector<uint32_t> RoutePartitionIds(DataChunk &chunk, const std::vector<uint
     for (size_t k = 1; k < key_columns.size(); k++) {
         VectorOperations::CombineHash(hashes, chunk.data[key_columns[k]], count);
     }
-    hashes.Flatten(count);
+    hashes.Flatten();
     auto *hd = duckdb::FlatVector::GetData<hash_t>(hashes);
     for (idx_t r = 0; r < count; r++) {
         pid[r] = static_cast<uint32_t>(hd[r] % n);
@@ -99,7 +99,7 @@ Result<void> SplitOutputOperator::Push(std::unique_ptr<DataChunk> chunk) {
     for (size_t k = 1; k < key_columns_.size(); k++) {
         VectorOperations::CombineHash(hashes, shared_chunk->data[key_columns_[k]], chunk_size);
     }
-    hashes.Flatten(chunk_size);
+    hashes.Flatten();
     
     std::vector<uint32_t> partition_id(chunk_size, 0);
     std::vector<idx_t> offsets(partitions_, 0);

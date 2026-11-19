@@ -32,7 +32,7 @@ OwnedBlock MakeBlock(Allocator &alloc, const std::vector<int32_t> &a) {
     DataChunk chunk;
     chunk.Initialize(alloc.Get(), {LogicalType::INTEGER});
     for (idx_t r = 0; r < a.size(); r++) {
-        chunk.SetValue(0, r, Value::INTEGER(a[r]));
+        chunk.data[0].SetValue(r, Value::INTEGER(a[r]));
     }
     chunk.SetChildCardinality(a.size());
     return plume::memory::ExportChunk(OneCol(), chunk, alloc).unwrap();

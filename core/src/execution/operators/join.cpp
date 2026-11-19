@@ -143,22 +143,22 @@ struct OutputBuilder {
 
     void PutLeft(DataChunk &dst, const DataChunk &left, idx_t lr, idx_t n_left) {
         for (idx_t c = 0; c < n_left; c++) {
-            dst.SetValue(c, cur, const_cast<DataChunk &>(left).GetValue(c, lr));
+            dst.data[c].SetValue(cur, const_cast<DataChunk &>(left).GetValue(c, lr));
         }
     }
     void PutNullLeft(DataChunk &dst, idx_t n_left) {
         for (idx_t c = 0; c < n_left; c++) {
-            dst.SetValue(c, cur, duckdb::Value((*types)[c]));
+            dst.data[c].SetValue(cur, duckdb::Value((*types)[c]));
         }
     }
     void PutRight(DataChunk &dst, idx_t off, const DataChunk &right, idx_t rr, idx_t n_right) {
         for (idx_t c = 0; c < n_right; c++) {
-            dst.SetValue(off + c, cur, const_cast<DataChunk &>(right).GetValue(c, rr));
+            dst.data[off + c].SetValue(cur, const_cast<DataChunk &>(right).GetValue(c, rr));
         }
     }
     void PutNullRight(DataChunk &dst, idx_t off, idx_t n_right) {
         for (idx_t c = 0; c < n_right; c++) {
-            dst.SetValue(off + c, cur, duckdb::Value((*types)[off + c]));
+            dst.data[off + c].SetValue(cur, duckdb::Value((*types)[off + c]));
         }
     }
 
@@ -199,7 +199,7 @@ struct OutputBuilder {
     Result<void> EmitMark(const DataChunk &l, idx_t lr, idx_t nl, duckdb::Value marker) {
         auto &dst = Row();
         PutLeft(dst, l, lr, nl);
-        dst.SetValue(nl, cur, std::move(marker));
+        dst.data[nl].SetValue(cur, std::move(marker));
         return Advance();
     }
 };
@@ -236,10 +236,10 @@ bool JoinOperator::ResidualMatches(const DataChunk &lchunk, idx_t lr, const Data
     const idx_t n_left = left_types_.size();
     const idx_t n_right = right_types_.size();
     for (idx_t c = 0; c < n_left; c++) {
-        residual_scratch_->SetValue(c, 0, const_cast<DataChunk &>(lchunk).GetValue(c, lr));
+        residual_scratch_->data[c].SetValue(0, const_cast<DataChunk &>(lchunk).GetValue(c, lr));
     }
     for (idx_t c = 0; c < n_right; c++) {
-        residual_scratch_->SetValue(n_left + c, 0, const_cast<DataChunk &>(rchunk).GetValue(c, rr));
+        residual_scratch_->data[n_left + c].SetValue(0, const_cast<DataChunk &>(rchunk).GetValue(c, rr));
     }
     duckdb::SelectionVector sel(1);
     return residual_executor_.SelectExpression(*residual_scratch_, sel) > 0;

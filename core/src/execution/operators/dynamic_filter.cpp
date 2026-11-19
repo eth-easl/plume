@@ -212,7 +212,7 @@ public:
 protected:
     idx_t SelectRows(Vector &keys, idx_t size, duckdb::SelectionVector &sel, idx_t count) override {
         UnifiedVectorFormat udata;
-        keys.ToUnifiedFormat(size, udata);
+        keys.ToUnifiedFormat(udata);
         auto data = UnifiedVectorFormat::GetData<T>(udata);
         idx_t passed = 0;
         for (idx_t i = 0; i < count; i++) {
@@ -418,11 +418,11 @@ public:
         T chunk_max {};
 
         if (mode_ == Mode::BOUNDS && vec.GetVectorType() == duckdb::VectorType::FLAT_VECTOR &&
-            duckdb::FlatVector::Validity(vec).AllValid()) {
+            duckdb::FlatVector::Validity(vec).CannotHaveNull()) {
             ReduceFlatAllValid<T>(duckdb::FlatVector::GetData<T>(vec), count, has_value, chunk_min, chunk_max);
         } else {
             UnifiedVectorFormat udata;
-            vec.ToUnifiedFormat(count, udata);
+            vec.ToUnifiedFormat(udata);
             auto data = UnifiedVectorFormat::GetData<T>(udata);
             for (idx_t i = 0; i < count; i++) {
                 const auto idx = udata.sel->get_index(i);

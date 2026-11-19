@@ -65,9 +65,9 @@ DataBuffer MakeBlock(Allocator &alloc, const std::vector<int32_t> &region, const
     DataChunk chunk;
     chunk.Initialize(alloc.Get(), MixedTypes());
     for (idx_t r = 0; r < region.size(); r++) {
-        chunk.SetValue(0, r, Value::INTEGER(region[r]));
-        chunk.SetValue(1, r, name[r].empty() ? Value(LogicalType::VARCHAR) : Value(name[r]));
-        chunk.SetValue(2, r, amount[r] == INT32_MIN ? Value(LogicalType::INTEGER) : Value::INTEGER(amount[r]));
+        chunk.data[0].SetValue(r, Value::INTEGER(region[r]));
+        chunk.data[1].SetValue(r, name[r].empty() ? Value(LogicalType::VARCHAR) : Value(name[r]));
+        chunk.data[2].SetValue(r, amount[r] == INT32_MIN ? Value(LogicalType::INTEGER) : Value::INTEGER(amount[r]));
     }
     chunk.SetChildCardinality(region.size());
     auto block = ExportChunk(MixedSchema(), chunk, alloc).unwrap();

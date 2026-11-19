@@ -166,7 +166,7 @@ Result<void> SortOperator::Finish() {
         for (idx_t i = 0; i < batch; i++) {
             const RowRef &ref = rows[perm[base + i]];
             for (idx_t c = 0; c < n_cols; c++) {
-                result->SetValue(c, i, ref.chunk->GetValue(c, ref.row));
+                result->data[c].SetValue(i, ref.chunk->GetValue(c, ref.row));
             }
         }
         result->SetChildCardinality(batch);

@@ -61,24 +61,24 @@ void FillChunk(DataChunk &chunk, Allocator &alloc) {
                            "exactly12chr",                     // 12 bytes (inlined boundary)
                            "thirteen_chars"};                  // 14 bytes non-inlined
     for (idx_t r = 0; r < n; r++) {
-        chunk.SetValue(0, r, (r % 2 == 0) ? Value::BOOLEAN(true) : Value::BOOLEAN(false));
-        chunk.SetValue(1, r, Value::INTEGER(int32_t(r) * 100 - 250));
-        chunk.SetValue(2, r, Value::BIGINT(int64_t(r) * 1'000'000'000LL));
-        chunk.SetValue(3, r, Value::FLOAT(float(r) + 0.5f));
-        chunk.SetValue(4, r, Value::DOUBLE(double(r) * 3.14159));
+        chunk.data[0].SetValue(r, (r % 2 == 0) ? Value::BOOLEAN(true) : Value::BOOLEAN(false));
+        chunk.data[1].SetValue(r, Value::INTEGER(int32_t(r) * 100 - 250));
+        chunk.data[2].SetValue(r, Value::BIGINT(int64_t(r) * 1'000'000'000LL));
+        chunk.data[3].SetValue(r, Value::FLOAT(float(r) + 0.5f));
+        chunk.data[4].SetValue(r, Value::DOUBLE(double(r) * 3.14159));
         if (strs[r]) {
-            chunk.SetValue(5, r, Value(std::string(strs[r])));
+            chunk.data[5].SetValue(r, Value(std::string(strs[r])));
         } else {
             FlatVector::SetNull(chunk.data[5], r, true);
         }
-        chunk.SetValue(6, r, Value::DECIMAL(int32_t(r) * 125, uint8_t(9), uint8_t(2)));
-        chunk.SetValue(7, r, Value::DATE(date_t(int32_t(19000 + r))));
-        chunk.SetValue(8, r, Value::TIME(dtime_t(int64_t(r) * 3'600'000'000LL)));
+        chunk.data[6].SetValue(r, Value::DECIMAL(int32_t(r) * 125, uint8_t(9), uint8_t(2)));
+        chunk.data[7].SetValue(r, Value::DATE(date_t(int32_t(19000 + r))));
+        chunk.data[8].SetValue(r, Value::TIME(dtime_t(int64_t(r) * 3'600'000'000LL)));
         // A value wider than 64 bits to exercise the full INT128 layout.
-        chunk.SetValue(9, r, Value::HUGEINT(hugeint_t(int64_t(r) + 1) * hugeint_t(1'000'000'000'000'000'000LL) *
+        chunk.data[9].SetValue(r, Value::HUGEINT(hugeint_t(int64_t(r) + 1) * hugeint_t(1'000'000'000'000'000'000LL) *
                                             hugeint_t(100)));
-        chunk.SetValue(10, r, Value::TINYINT(int8_t(int32_t(r) * 20 - 60)));  // c_i8
-        chunk.SetValue(11, r, Value::SMALLINT(int16_t(int32_t(r) * 5000 - 15000))); // c_i16
+        chunk.data[10].SetValue(r, Value::TINYINT(int8_t(int32_t(r) * 20 - 60)));  // c_i8
+        chunk.data[11].SetValue(r, Value::SMALLINT(int16_t(int32_t(r) * 5000 - 15000))); // c_i16
     }
     // Inject nulls into nullable fixed-width columns too.
     FlatVector::SetNull(chunk.data[0], 1, true); // c_bool
@@ -175,7 +175,7 @@ TEST_CASE("all-valid non-nullable columns store no validity mask") {
     DataChunk c;
     c.Initialize(alloc.Get(), types);
     for (idx_t r = 0; r < 4; r++) {
-        c.SetValue(0, r, Value::INTEGER(int32_t(r)));
+        c.data[0].SetValue(r, Value::INTEGER(int32_t(r)));
     }
     c.SetChildCardinality(4);
 

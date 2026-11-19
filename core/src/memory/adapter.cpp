@@ -310,12 +310,11 @@ auto BuildBlock(const Schema &schema, const std::vector<ChunkSelection> &parts, 
     for (size_t p = 0; p < parts.size(); p++) {
         auto *chunk = parts[p].chunk;
         uf[p].resize(ncol);
-        const idx_t chunk_rows = chunk->size();
         const auto *psel = parts[p].sel;
         const idx_t count = parts[p].count;
         rows += count;
         for (uint32_t c = 0; c < ncol; c++) {
-            chunk->data[c].ToUnifiedFormat(chunk_rows, uf[p][c]);
+            chunk->data[c].ToUnifiedFormat(uf[p][c]);
             if (schema.columns[c].type.id != TypeId::VARCHAR) {
                 continue;
             }
