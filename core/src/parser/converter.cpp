@@ -1053,7 +1053,7 @@ void NameOutputColumns(duckdb::LogicalOperator &root, Schema &schema) {
         }
     }
     for (size_t i = 0; i < node->expressions.size() && i < schema.columns.size(); i++) {
-        const auto &name = node->expressions[i]->GetName().GetIdentifierName();
+        const std::string name = node->expressions[i]->GetName().GetIdentifierName();
         if (!name.empty())
             schema.columns[i].name = name;
     }

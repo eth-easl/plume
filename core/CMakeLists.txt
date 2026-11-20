@@ -22,6 +22,7 @@ set(PLUME_CORE_ENGINE_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/sort.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operators/top_n.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/executor.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/group_table.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/operator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/pipeline.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/execution/sink.cpp

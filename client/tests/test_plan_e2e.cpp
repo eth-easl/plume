@@ -1880,4 +1880,34 @@ TEST_CASE("e2e: remote parquet stats enable sum_no_overflow") {
     fs::remove_all(dir);
 }
 
+// Grouping by wide, mixed keys (long and short strings, NULLs, decimals, dates, -0.0 vs 0.0) into
+// more groups than one output chunk holds, single- and two-phase, with and without splits.
+TEST_CASE("e2e: group by wide mixed keys, many groups") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE w AS SELECT i, "
+              "CASE WHEN i % 11 = 0 THEN NULL ELSE i % 3001 END AS k1, "
+              "CASE WHEN i % 13 = 0 THEN NULL ELSE 'customer#' || lpad((i % 3001)::VARCHAR, 9, '0') || "
+              "  repeat('x', (i % 3001) % 40) END AS name, "
+              "CASE WHEN i % 3 = 0 THEN 'ab' ELSE 'cd' END AS short, "
+              "((i % 3001) * 1.25)::DECIMAL(15,2) AS bal, DATE '2020-01-01' + (i % 7)::INTEGER AS dt, "
+              "CASE WHEN i % 2 = 0 THEN 0.0::DOUBLE ELSE -0.0::DOUBLE END AS z, "
+              "(i * 0.5)::DECIMAL(12,2) AS v FROM range(30000) t(i)");
+    for (const char *sql : {"SELECT k1, name, short, bal, dt, z, sum(v), count(*), min(name) FROM w "
+                            "GROUP BY k1, name, short, bal, dt, z",
+                            "SELECT name, count(*), max(v) FROM w GROUP BY name",
+                            "SELECT short, k1 IS NULL AS n, avg(v) FROM w GROUP BY short, n",
+                            // DISTINCT dedup over long/NULL strings, many values, per group and global
+                            "SELECT short, count(DISTINCT name), count(DISTINCT k1), sum(DISTINCT bal), count(*) "
+                            "FROM w GROUP BY short",
+                            "SELECT dt, count(DISTINCT z), count(DISTINCT name), sum(DISTINCT v) FROM w GROUP BY dt",
+                            "SELECT count(DISTINCT name), count(DISTINCT i), sum(DISTINCT bal) FROM w"}) {
+        for (bool pa : {true, false}) {
+            for (uint32_t splits : {1u, 4u}) {
+                ExpectMatch(con, sql, /*ordered=*/false, {}, pa, splits, /*target_rows_per_split=*/1 << 12);
+            }
+        }
+    }
+}
+
 int main() { return plume_test::RunAll(); }
