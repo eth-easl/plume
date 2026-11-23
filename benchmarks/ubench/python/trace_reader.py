@@ -27,7 +27,9 @@ OP_TYPE_NAMES = {
     0xFF: "OUTPUT",
 }
 
-PHASE_NAMES = {0: "SETUP", 1: "DESERIALIZE", 2: "PUSH", 3: "FINISH"}
+PHASE_NAMES = {0: "SETUP", 1: "DESERIALIZE", 2: "PUSH", 3: "FINISH", 4: "MEMORY_PEAK", 5: "INPUT_BYTES"}
+# Phases whose total_ns carries bytes, not time (only present with `track_memory`).
+BYTE_PHASES = {"MEMORY_PEAK", "INPUT_BYTES"}
 
 STAGE_OP = -1  # trace::kStageOp: op_index sentinel for stage-level phases
 
@@ -136,12 +138,44 @@ def aggregate(trace: Trace) -> List[Segment]:
     """Sum hits/total_ns for every event sharing a (stage, op_index, phase) key."""
     acc: Dict[Tuple[int, int, str], List[int]] = {}
     for e in trace.events:
+        if e.phase in BYTE_PHASES:
+            continue
         slot = acc.setdefault((e.stage_id, e.op_index, e.phase), [0, 0])
         slot[0] += e.hits
         slot[1] += e.total_ns
     return [
         Segment(stage_id=k[0], op_index=k[1], phase=k[2], hits=v[0], total_ns=v[1]) for k, v in acc.items()
     ]
+
+
+@dataclass
+class StageMemory:
+    """Per-invocation memory of one stage (max over its invocations)."""
+
+    stage_id: int
+    invocations: int
+    max_peak: int  # heap bytes the invocation allocated at peak, beyond its inputs
+    max_input: int  # bytes of the invocation's input items
+    max_total: int  # max over invocations of input + peak
+    sum_peak: int
+
+
+def stage_memory(trace: Trace) -> Dict[int, StageMemory]:
+    """Memory per stage from MEMORY_PEAK/INPUT_BYTES events; empty if the run didn't track memory."""
+    per_inv: Dict[Tuple[int, int], List[int]] = {}
+    for e in trace.events:
+        if e.phase in BYTE_PHASES:
+            slot = per_inv.setdefault((e.stage_id, e.invocation), [0, 0])
+            slot[0 if e.phase == "MEMORY_PEAK" else 1] += e.total_ns
+    out: Dict[int, StageMemory] = {}
+    for (stage_id, _inv), (peak, inp) in per_inv.items():
+        m = out.setdefault(stage_id, StageMemory(stage_id, 0, 0, 0, 0, 0))
+        m.invocations += 1
+        m.max_peak = max(m.max_peak, peak)
+        m.max_input = max(m.max_input, inp)
+        m.max_total = max(m.max_total, peak + inp)
+        m.sum_peak += peak
+    return out
 
 
 def invocation_count(trace: Trace, stage_id: int) -> int:

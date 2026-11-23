@@ -62,6 +62,7 @@ add_executable(ubench_run
   src/runner/trace_writer.cpp
   src/runner/abi_ubench.cpp
   src/runner/config.cpp
+  src/runner/mem_tracker.cpp
   src/format/plan.cpp)
 target_include_directories(ubench_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ubench_run PRIVATE ubench_engine nlohmann_json::nlohmann_json Threads::Threads)

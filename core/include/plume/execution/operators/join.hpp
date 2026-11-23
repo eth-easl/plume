@@ -1,5 +1,6 @@
 #pragma once
 
+#include "plume/execution/group_table.hpp"
 #include "plume/execution/operator.hpp"
 #include "plume/expression/expression.hpp"
 #include "plume/memory/allocator.hpp"
@@ -9,8 +10,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -45,6 +44,8 @@ struct JoinTemplate : OperatorTemplate {
     std::vector<uint32_t> right_keys; // key column indices into the right input
     Schema right_schema;              // left schema is the pipeline input_schema
     JoinKind kind = JoinKind::INNER;
+    // Per key: whether NULL matches NULL (IS NOT DISTINCT FROM). Empty = no key does.
+    std::vector<bool> keys_match_null;
     // An extra predicate checked per (probe, candidate build) row pair once the
     // hash keys already match — for join conditions with both an equi part (the
     // hash keys above) and a non-equi part (e.g. a self-join's `a.x = b.x AND
@@ -71,15 +72,20 @@ public:
     JoinOperator(std::vector<uint32_t> left_keys, std::vector<uint32_t> right_keys,
                  duckdb::vector<duckdb::LogicalType> left_types, duckdb::vector<duckdb::LogicalType> right_types,
                  memory::Allocator &alloc, JoinKind kind = JoinKind::INNER,
-                 duckdb::unique_ptr<duckdb::Expression> residual_predicate = nullptr);
-    // Builds the build (right) side. The pushed chunks are retained (the table indexes into them) 
-    // until the join is destroyed.
-    void PushBuild(std::unique_ptr<duckdb::DataChunk> chunk);
-    
+                 duckdb::unique_ptr<duckdb::Expression> residual_predicate = nullptr,
+                 std::vector<bool> keys_match_null = {});
+
+    // Sizes the build structures for `rows` build rows.
+    void ReserveBuild(duckdb::idx_t rows);
+
+    // Adds a chunk of the build (right) side and retains it (no copy).
+    // NOTE: chunk data must stay alive and unchanged throughout join execution
+    Result<void> PushBuild(std::unique_ptr<duckdb::DataChunk> chunk);
+
     // Finishes the build side.
     void FinishBuild();
 
-    // Probes the chunk against the hash table. Joined rows are emitted downstream. 
+    // Probes the chunk against the hash table. Joined rows are emitted downstream.
     // Requires FinishBuild() to have run.
     Result<void> Push(std::unique_ptr<duckdb::DataChunk> chunk) override;
 
@@ -87,31 +93,49 @@ public:
     Result<void> Finish() override;
 
 private:
+    static constexpr uint32_t kNoRow = UINT32_MAX;
+
+    struct BuildData;
+
+    duckdb::idx_t FilterNullKeys(duckdb::DataChunk &keys, duckdb::idx_t count, duckdb::SelectionVector &valid,
+                                 bool &all_valid);
+    void BuildColumn(duckdb::idx_t col, const duckdb::SelectionVector &rsel, duckdb::idx_t count,
+                     duckdb::Vector &out);
+    void LocateBuildRows(const duckdb::SelectionVector &rsel, duckdb::idx_t count);
+    Result<void> EmitRows(duckdb::DataChunk *left, const duckdb::SelectionVector *lsel,
+                          const duckdb::SelectionVector *rsel, duckdb::idx_t count, bool with_left,
+                          bool with_right);
+
     std::vector<uint32_t> left_keys_;
     std::vector<uint32_t> right_keys_;
     duckdb::vector<duckdb::LogicalType> left_types_;
     duckdb::vector<duckdb::LogicalType> right_types_;
+    std::vector<bool> match_null_; // per key
     JoinKind kind_;
     memory::Allocator alloc_;
 
-    // Build state (retained for the join's lifetime; probe rows reference it).
-    ChunkList build_chunks_;
-    std::unordered_map<std::string, std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>>> table_; // key -> (chunk, row)
+    // Build state.
+    std::shared_ptr<BuildData> build_;
+    duckdb::idx_t build_count_ = 0;
+    std::unique_ptr<GroupTable> table_; // build key -> first build row id with it (uint32_t)
+    std::vector<uint32_t> chain_next_;  // build row id -> next row id with the same key
     bool build_finished_ = false;
-    bool build_has_null_ = false;              // any build key NULL (NULL-aware MARK)
-    bool track_build_ = false;                 // RIGHT/OUTER/RIGHT_SEMI/RIGHT_ANTI need matched flags
-    std::vector<std::vector<char>> matched_;   // per build (chunk, row) match flag
+    bool build_has_null_ = false;       // a build row was dropped for a NULL key (NULL-aware MARK)
+    bool track_build_ = false;          // RIGHT/OUTER/RIGHT_SEMI/RIGHT_ANTI need matched flags
+    std::vector<uint8_t> matched_;      // per build row id
 
-    // The residual predicate (see JoinTemplate::residual), plus the scratch state
-    // used to evaluate it one (probe, build) row pair at a time.
+    // The residual predicate (see JoinTemplate::residual), evaluated on (probe, build) pair batches
+    // in the natural (left++right) layout.
     duckdb::unique_ptr<duckdb::Expression> residual_predicate_;
     duckdb::ExpressionExecutor residual_executor_;
-    std::unique_ptr<duckdb::DataChunk> residual_scratch_; // one row, natural (left++right) layout
 
-    // True if there's no residual predicate (an unconditional match) or it holds
-    // for this specific (probe, build) row pair.
-    bool ResidualMatches(const duckdb::DataChunk &lchunk, duckdb::idx_t lr, const duckdb::DataChunk &rchunk,
-                         duckdb::idx_t rr);
+    // Per-chunk scratch.
+    duckdb::DataChunk key_chunk_;
+    std::vector<duckdb::data_ptr_t> payloads_;
+    duckdb::SelectionVector new_groups_;
+    std::vector<uint32_t> heads_, cur_;         // per probe row: chain head / current build row
+    std::vector<uint8_t> found_;                // per probe row: matched at least once
+    std::vector<uint32_t> loc_chunk_, loc_row_; // LocateBuildRows output
 };
 
 Result<std::unique_ptr<JoinOperator>> BuildJoinTemplate(std::shared_ptr<JoinTemplate> templ,

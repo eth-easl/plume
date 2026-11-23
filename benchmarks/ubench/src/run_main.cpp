@@ -4,6 +4,7 @@
 #include "format/plan.hpp"
 #include "runner/config.hpp"
 #include "runner/fetch.hpp"
+#include "runner/mem_tracker.hpp"
 #include "runner/stage_runner.hpp"
 #include "runner/thread_pool.hpp"
 #include "runner/trace_writer.hpp"
@@ -102,6 +103,13 @@ int main(int argc, char **argv) {
 
     if (threads == 0) {
         threads = 1;
+    }
+    if (cfg.track_memory) {
+        if (threads != 1) {
+            std::cerr << "ubench_run: track_memory with " << threads
+                      << " threads: per-invocation peaks overlap and are not accurate\n";
+        }
+        mem::SetEnabled(true);
     }
     LocalFetcher fetch(rewrites);
     ThreadPool pool(threads, core_offset);

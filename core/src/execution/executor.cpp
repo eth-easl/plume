@@ -140,17 +140,27 @@ Result<void> Executor::PushJoinBuild(std::unique_ptr<DataChunk> chunk) {
     if (!join_) {
         return Error("PushJoinBuild requires a leading join", ErrorKind::InvalidInput);
     }
-    join_->PushBuild(std::move(chunk));
-    return Ok();
+    return join_->PushBuild(std::move(chunk));
 }
 
 Result<void> Executor::PushJoinBuildBlocks(const std::vector<InputBlock> &blocks) {
+    if (!join_) {
+        return Error("PushJoinBuildBlocks requires a leading join", ErrorKind::InvalidInput);
+    }
+    
+    std::vector<std::unique_ptr<DataChunk>> chunks;
+    chunks.reserve(blocks.size());
+    duckdb::idx_t rows = 0;
     for (const auto &block : blocks) {
         Schema in_schema;
-        TRY(auto chunks, ImportBlockChunks(block.data, block.size, in_schema));
-        for (auto &chunk : chunks) {
-            TRYV(PushJoinBuild(std::move(chunk)));
-        }
+        auto chunk = std::make_unique<DataChunk>();
+        TRYV(memory::ImportBlock(block.data, block.size, *chunk, in_schema));
+        rows += chunk->size();
+        chunks.push_back(std::move(chunk));
+    }
+    join_->ReserveBuild(rows);
+    for (auto &chunk : chunks) {
+        TRYV(join_->PushBuild(std::move(chunk)));
     }
     return Ok();
 }

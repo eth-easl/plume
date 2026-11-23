@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from trace_reader import StageBreakdown, Trace, all_stage_breakdowns, invocation_count, load
+from trace_reader import StageBreakdown, Trace, all_stage_breakdowns, invocation_count, load, stage_memory
 
 UNIT_NS = {"ns": 1, "us": 1_000, "ms": 1_000_000}
 
@@ -29,6 +29,26 @@ def fmt_time(ns: int, unit: str) -> str:
 
 def pct(part: int, whole: int) -> str:
     return f"{100.0 * part / whole:5.1f}%" if whole else "    -%"
+
+
+def fmt_bytes(n: int) -> str:
+    for unit, scale in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if n >= scale:
+            return f"{n / scale:,.1f} {unit}"
+    return f"{n} B"
+
+
+def print_memory(trace: Trace) -> None:
+    mem = stage_memory(trace)
+    if not mem:
+        return
+    print("\nPer-stage memory (per invocation, max over invocations; needs threads = 1 to be exact):")
+    print(f"  {'stage':>5}  {'inv':>4}  {'input':>11}  {'working peak':>12}  {'input+peak':>11}")
+    for m in sorted(mem.values(), key=lambda m: m.max_total, reverse=True):
+        print(
+            f"  {m.stage_id:>5}  {m.invocations:>4}  {fmt_bytes(m.max_input):>11}  "
+            f"{fmt_bytes(m.max_peak):>12}  {fmt_bytes(m.max_total):>11}"
+        )
 
 
 def print_summary(trace: Trace, breakdowns: list[StageBreakdown], top_n: int, unit: str) -> None:
@@ -240,6 +260,7 @@ def main() -> int:
 
     breakdowns = all_stage_breakdowns(trace)
     print_summary(trace, breakdowns, args.top, args.unit)
+    print_memory(trace)
 
     if args.plot:
         render_plot(trace, breakdowns, args.plot)

@@ -1910,4 +1910,50 @@ TEST_CASE("e2e: group by wide mixed keys, many groups") {
     }
 }
 
+TEST_CASE("e2e: hash join kinds over duplicate, NULL and long string keys") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    // b: key 0 has a chain longer than a vector (3000 rows), NULL keys, long string payloads/keys.
+    con.Query("CREATE TABLE b AS SELECT CASE WHEN i < 3000 THEN 0 WHEN i % 17 = 0 THEN NULL ELSE i % 700 END AS k, "
+              "'build-row-' || lpad(i::VARCHAR, 6, '0') || repeat('y', i % 30) AS s, i AS v, "
+              "CASE WHEN i % 5 = 0 THEN NULL ELSE 'key-' || (i % 50)::VARCHAR || repeat('z', 20) END AS sk "
+              "FROM range(6000) t(i)");
+    con.Query("CREATE TABLE p AS SELECT CASE WHEN i % 13 = 0 THEN NULL WHEN i < 3 THEN 0 ELSE i % 900 END AS k, "
+              "i * 3 AS v, CASE WHEN i % 7 = 0 THEN NULL ELSE 'key-' || (i % 60)::VARCHAR || repeat('z', 20) END AS sk "
+              "FROM range(5000) t(i)");
+    for (const char *sql : {
+             "SELECT p.k, p.v, b.s, b.v FROM p JOIN b ON p.k = b.k",
+             "SELECT p.k, p.v, b.s FROM p LEFT JOIN b ON p.k = b.k",
+             "SELECT p.k, p.v, b.s FROM p FULL OUTER JOIN b ON p.k = b.k",
+             "SELECT p.v, b.v FROM b RIGHT JOIN p ON p.k = b.k",
+             "SELECT p.v FROM p WHERE p.k IN (SELECT k FROM b)",
+             "SELECT p.v FROM p WHERE p.k NOT IN (SELECT k FROM b)",
+             "SELECT p.v FROM p WHERE p.k NOT IN (SELECT k FROM b WHERE k IS NOT NULL)",
+             "SELECT p.v FROM p WHERE p.k NOT IN (SELECT k FROM b WHERE v < 0)",       // empty build side
+             "SELECT p.v, p.k IN (SELECT k FROM b WHERE k IS NULL) FROM p",            // only NULL build keys
+             "SELECT p.v FROM p WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = p.k)",
+             "SELECT b.v FROM b WHERE EXISTS (SELECT 1 FROM p WHERE p.k = b.k)",
+             "SELECT b.v FROM b WHERE NOT EXISTS (SELECT 1 FROM p WHERE p.k = b.k)",
+             // residuals
+             "SELECT p.v, b.v FROM p JOIN b ON p.k = b.k AND b.v > p.v + 2000",
+             "SELECT p.v, b.v FROM p LEFT JOIN b ON p.k = b.k AND b.v < p.v",
+             "SELECT p.v, b.v FROM p FULL OUTER JOIN b ON p.k = b.k AND b.v < p.v",
+             "SELECT p.v FROM p WHERE EXISTS (SELECT 1 FROM b WHERE b.k = p.k AND b.v > p.v)",
+             "SELECT p.v FROM p WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = p.k AND b.v > p.v)",
+             // composite and string keys, NULL-matching keys
+             "SELECT p.v, b.v FROM p JOIN b ON p.sk = b.sk AND p.k = b.k",
+             "SELECT p.v, b.s FROM p LEFT JOIN b ON p.sk = b.sk",
+             "SELECT p.v, b.v FROM p JOIN b ON p.sk IS NOT DISTINCT FROM b.sk AND p.k = b.k",
+             // correlated subqueries (DELIM joins, NOT DISTINCT FROM on the correlated column)
+             "SELECT p.k, p.v, (SELECT count(*) FROM b WHERE b.k = p.k) FROM p",
+             "SELECT p.sk, (SELECT max(b.v) FROM b WHERE b.sk = p.sk) FROM p",
+             "SELECT p.v FROM p WHERE p.v > (SELECT avg(b.v) FROM b WHERE b.k = p.k)",
+         }) {
+        for (uint32_t splits : {1u, 4u}) {
+            ExpectMatch(con, sql, /*ordered=*/false, {}, /*pre_aggregate=*/true, splits,
+                        /*target_rows_per_split=*/1 << 11);
+        }
+    }
+}
+
 int main() { return plume_test::RunAll(); }

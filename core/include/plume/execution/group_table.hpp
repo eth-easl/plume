@@ -23,7 +23,7 @@ namespace plume::exec {
 class GroupTable {
 public:
     GroupTable(const duckdb::vector<duckdb::LogicalType> &key_types, duckdb::idx_t payload_size,
-               memory::Allocator &alloc);
+               memory::Allocator &alloc, bool copy_strings = true);
     ~GroupTable();
 
     GroupTable(const GroupTable &) = delete;
@@ -31,6 +31,9 @@ public:
 
     // Whether keys of this type are supported (fixed-width physical types and VARCHAR).
     static bool SupportsType(const duckdb::LogicalType &type);
+
+    // Sizes the slot table for `groups` more groups, so creating them never rehashes.
+    void Reserve(duckdb::idx_t groups);
 
     // Hashes the first `count` rows of `keys` into `hashes` (a HASH vector).
     void Hash(duckdb::DataChunk &keys, duckdb::Vector &hashes, duckdb::idx_t count);
@@ -52,7 +55,7 @@ public:
 
     // Writes the keys of groups [offset, offset + count) into `out`'s first key columns (rows
     // 0..count-1) and their payloads into `payloads`. VARCHAR results reference the table's string
-    // arena, which the output vectors keep alive.
+    // arena, which the output vectors keep alive (or, without copy_strings, the caller's key data).
     void ScanKeys(duckdb::idx_t offset, duckdb::idx_t count, duckdb::DataChunk &out,
                   duckdb::data_ptr_t *payloads) const;
 
@@ -83,6 +86,7 @@ private:
     memory::Allocator alloc_;
     duckdb::ArenaAllocator row_arena_;
     std::shared_ptr<StringArena> strings_; // referenced by ScanKeys' VARCHAR output
+    bool copy_strings_;
 
     std::vector<uint64_t> slots_; // 0 = empty, else (salt << 48) | row pointer
     uint64_t mask_ = 0;

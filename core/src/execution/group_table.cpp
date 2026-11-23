@@ -136,8 +136,10 @@ bool GroupTable::SupportsType(const LogicalType &type) {
     return GetMatchFunction(type.InternalType()) != nullptr;
 }
 
-GroupTable::GroupTable(const duckdb::vector<LogicalType> &key_types, idx_t payload_size, memory::Allocator &alloc)
-    : alloc_(alloc), row_arena_(alloc_.Get()), strings_(std::make_shared<StringArena>(alloc_)) {
+GroupTable::GroupTable(const duckdb::vector<LogicalType> &key_types, idx_t payload_size, memory::Allocator &alloc,
+                       bool copy_strings)
+    : alloc_(alloc), row_arena_(alloc_.Get()), strings_(std::make_shared<StringArena>(alloc_))
+    , copy_strings_(copy_strings) {
     idx_t offset = kFlagsOffset + key_types.size();
     columns_.resize(key_types.size());
     for (idx_t c = 0; c < key_types.size(); c++) {
@@ -183,6 +185,10 @@ void GroupTable::InsertEntry(uint64_t entry, uint64_t hash) {
     slots_[pos] = entry;
 }
 
+void GroupTable::Reserve(idx_t groups) {
+    Grow(groups);
+}
+
 void GroupTable::Grow(idx_t needed) {
     // Keep the load factor at or below 1/2 so probe sequences stay short.
     const idx_t target = (rows_.size() + needed) * 2;
@@ -219,7 +225,7 @@ data_ptr_t GroupTable::CreateRow(uint64_t hash, idx_t r) {
         row[col.null_offset] = 0;
         if (col.type == PhysicalType::VARCHAR) {
             string_t value = UnifiedVectorFormat::GetDataUnsafe<string_t>(format)[idx];
-            if (!value.IsInlined()) {
+            if (copy_strings_ && !value.IsInlined()) {
                 auto copy = strings_->arena.Allocate(value.GetSize());
                 std::memcpy(copy, value.GetData(), value.GetSize());
                 value = string_t(reinterpret_cast<const char *>(copy), static_cast<uint32_t>(value.GetSize()));

@@ -745,6 +745,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
 
     // build template
     auto t = std::make_shared<exec::JoinTemplate>(left_keys, right_keys, right->output_schema, kind);
+    t->keys_match_null = keys_match_null; // the broadcast key (if any) defaults to false
     const uint32_t left_size = static_cast<uint32_t>(left->output_schema.columns.size());
     const uint32_t right_size = static_cast<uint32_t>(right->output_schema.columns.size());
     if (!residual_conditions.empty()) {
@@ -781,6 +782,12 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
         build_partitions = 1;
         probe_split_columns.resize(left_size_orig);
         std::iota(probe_split_columns.begin(), probe_split_columns.end(), 0);
+    } else if (kind == exec::JoinKind::MARK) {
+        // NULL-aware: every instance must see whether the build side holds a NULL key, so the build
+        // side is not split (each probe partition gets all of it).
+        probe_partitions = SplitCount(left_card);
+        build_partitions = 1;
+        probe_split_columns = left_keys;
     } else {
         probe_partitions = SplitCount(std::max(left_card, right_card));
         build_partitions = probe_partitions;
