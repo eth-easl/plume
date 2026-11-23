@@ -4,6 +4,7 @@
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/validity_mask.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cstring>
 
@@ -76,6 +77,10 @@ Result<Schema> ParseSchema(const_data_ptr_t base, size_t size) {
     return schema;
 }
 
+static void ReferenceBlockData(Vector &vec, data_ptr_t data, idx_t count) {
+    vec.Reference(Vector(vec.GetType(), data, count));
+}
+
 Result<void> ImportBlock(data_ptr_t base, size_t size, DataChunk &out_chunk, Schema &out_schema) {
     TRY(const BlockHeader &h, Header(base, size));
     TRY(out_schema, ParseSchema(base, size));
@@ -94,7 +99,7 @@ Result<void> ImportBlock(data_ptr_t base, size_t size, DataChunk &out_chunk, Sch
         const auto &d = descs[c];
         Vector &vec = out_chunk.data[c];
         // Fixed-width / string_t array: reference the in-block region (zero-copy).
-        FlatVector::SetData(vec, base + d.data_offset);
+        ReferenceBlockData(vec, base + d.data_offset, rows);
         // Validity: point at the in-block bitmask (validity_offset 0 => all valid).
         if (d.validity_offset != 0) {
             ValidityMask mask(reinterpret_cast<validity_t *>(base + d.validity_offset), rows);
@@ -105,7 +110,7 @@ Result<void> ImportBlock(data_ptr_t base, size_t size, DataChunk &out_chunk, Sch
             SwizzleVarchar(base, d, rows);
         }
     }
-    out_chunk.SetCardinality(rows);
+    out_chunk.SetChildCardinality(rows);
     return Ok();
 }
 
@@ -137,7 +142,7 @@ Result<std::vector<std::unique_ptr<DataChunk>>> ImportBlockChunks(data_ptr_t bas
             const auto &d = descs[c];
             Vector &vec = chunk->data[c];
             // Fixed-width / string_t slice: reference the in-block sub-array.
-            FlatVector::SetData(vec, base + d.data_offset + uint64_t(start) * width[c]);
+            ReferenceBlockData(vec, base + d.data_offset + uint64_t(start) * width[c], n);
             if (d.validity_offset != 0) {
                 // NOTE: `start` is a multiple of STANDARD_VECTOR_SIZE (a multiple of 64), so the 
                 //       slice begins on a validity-word boundary.
@@ -147,7 +152,7 @@ Result<std::vector<std::unique_ptr<DataChunk>>> ImportBlockChunks(data_ptr_t bas
                 FlatVector::SetValidity(vec, mask);
             }
         }
-        chunk->SetCardinality(n);
+        chunk->SetChildCardinality(n);
         chunks.push_back(std::move(chunk));
     }
     return chunks;
@@ -305,12 +310,11 @@ auto BuildBlock(const Schema &schema, const std::vector<ChunkSelection> &parts, 
     for (size_t p = 0; p < parts.size(); p++) {
         auto *chunk = parts[p].chunk;
         uf[p].resize(ncol);
-        const idx_t chunk_rows = chunk->size();
         const auto *psel = parts[p].sel;
         const idx_t count = parts[p].count;
         rows += count;
         for (uint32_t c = 0; c < ncol; c++) {
-            chunk->data[c].ToUnifiedFormat(chunk_rows, uf[p][c]);
+            chunk->data[c].ToUnifiedFormat(uf[p][c]);
             if (schema.columns[c].type.id != TypeId::VARCHAR) {
                 continue;
             }

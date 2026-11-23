@@ -23,14 +23,15 @@ endif()
 
 function(plume_function name)
   add_executable(${name} ${ARGN} ${PLUME_ABI_BACKEND})
-  target_link_libraries(${name} PRIVATE plume ${DUCKDB_DUMMY_EXTENSION_LOADER_LIB})
+  target_link_libraries(${name} PRIVATE plume)
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 endfunction()
 
 plume_function(plume_stage
   src/bin/plume_stage.cpp
   src/functions/stage.cpp
-  src/functions/output_split.cpp)
+  src/util/dynamic_filter.cpp
+  src/util/output_split.cpp)
 
 plume_function(plume_csv_prepare
   src/bin/plume_csv_prepare.cpp
@@ -39,16 +40,24 @@ plume_function(plume_csv_prepare
 plume_function(plume_csv_stage
   src/bin/plume_csv_stage.cpp
   src/functions/csv_stage.cpp
-  src/functions/output_split.cpp)
+  src/util/dynamic_filter.cpp
+  src/util/output_split.cpp)
 
 plume_function(plume_pq_prepare
   src/bin/plume_pq_prepare.cpp
-  src/functions/pq_prepare.cpp)
+  src/functions/pq_prepare.cpp
+  src/util/dynamic_filter.cpp)
 
 plume_function(plume_pq_stage
   src/bin/plume_pq_stage.cpp
   src/functions/pq_stage.cpp
-  src/functions/output_split.cpp)
+  src/util/dynamic_filter.cpp
+  src/util/output_split.cpp)
+
+plume_function(plume_df_combine
+  src/bin/plume_df_combine.cpp
+  src/functions/df_combine.cpp
+  src/util/dynamic_filter.cpp)
 
 # ---------------------------------------------------------------------------
 #  Tests

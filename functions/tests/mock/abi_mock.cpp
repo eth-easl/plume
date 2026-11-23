@@ -3,6 +3,7 @@
 #include "plume/abi/abi.hpp"
 
 #include <map>
+#include <optional>
 
 namespace {
 
@@ -77,6 +78,32 @@ Result<InputItem> GetInputItem(size_t set_idx, size_t item_idx) {
                      + std::to_string(item_idx) + ".", ErrorKind::OutOfRange);
     }
     return View(it->second[item_idx]);
+}
+
+std::optional<std::vector<InputItem>> GetOptionalInputSet(size_t set_idx) {
+    auto it = g_inputs.find(set_idx);
+    if (it == g_inputs.end()) {
+        return std::nullopt;
+    }
+    std::vector<InputItem> out;
+    out.reserve(it->second.size());
+    for (auto &item : it->second) {
+        out.push_back(View(item));
+    }
+    return std::make_optional(std::move(out));
+}
+
+Result<std::optional<InputItem>> GetOptionalInputSingleton(size_t set_idx) {
+    auto it = g_inputs.find(set_idx);
+    if (it == g_inputs.end()) {
+        return std::nullopt;
+    }
+    if (it->second.size() == 0) {
+        return std::nullopt;
+    } else if (it->second.size() > 1) {
+        return Error("Set with index " + std::to_string(set_idx) + " contains more than a single item.");
+    }
+    return std::make_optional(View(it->second[0]));
 }
 
 void AddOutput(const std::string &ident, size_t set_idx, DataBuffer buffer, size_t key) {

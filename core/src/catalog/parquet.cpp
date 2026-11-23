@@ -2,6 +2,7 @@
 
 #include "plume/catalog/catalog.hpp"
 #include "plume/catalog/remote_resolver.hpp"
+#include "plume/common/serial.hpp"
 #include "plume/dandelion/api.hpp"
 #include "plume/dandelion/s3.hpp"
 #include "plume/parquet/metadata.hpp"
@@ -10,7 +11,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <numeric>
 #include <string>
 
 namespace plume::catalog {
@@ -18,6 +21,7 @@ namespace plume::catalog {
 namespace {
 
 constexpr int64_t kFooterProbe = 256 << 10; // 256 KiB
+constexpr int64_t kMaxPageIndexBytes = 16 << 20; // fetch no more of a file's page indexes
 
 int64_t LE(const uint8_t *p, size_t n) {
     uint64_t v = 0;
@@ -78,27 +82,32 @@ bool DecodeNumeric(const ColumnType &t, const std::vector<uint8_t> &b, double &k
 RemoteColumnStats AggregateColumnStats(const ColumnType &type,
                                        const std::vector<const parquet::ColumnStats *> &chunks) {
     RemoteColumnStats out;
-    double min_key = 0, max_key = 0;
+    bool min_known = !chunks.empty();
+    bool max_known = !chunks.empty();
     uint64_t null_sum = 0;
     bool all_have_null_count = !chunks.empty();
     for (const auto *cs : chunks) {
-        if (cs->has_min) {
-            double k;
-            duckdb::Value v;
-            if (DecodeNumeric(type, cs->min_value, k, v) && (!out.has_min || k < min_key)) {
+        if (!cs) {
+            min_known = max_known = all_have_null_count = false;
+            continue;
+        }
+        double k;
+        duckdb::Value v;
+        if (min_known && cs->has_min && DecodeNumeric(type, cs->min_value, k, v)) {
+            if (!out.has_min || v < out.min_value) {
                 out.has_min = true;
-                min_key = k;
                 out.min_value = std::move(v);
             }
+        } else {
+            min_known = false;
         }
-        if (cs->has_max) {
-            double k;
-            duckdb::Value v;
-            if (DecodeNumeric(type, cs->max_value, k, v) && (!out.has_max || k > max_key)) {
+        if (max_known && cs->has_max && DecodeNumeric(type, cs->max_value, k, v)) {
+            if (!out.has_max || out.max_value < v) {
                 out.has_max = true;
-                max_key = k;
                 out.max_value = std::move(v);
             }
+        } else {
+            max_known = false;
         }
         if (cs->has_distinct_count) {
             out.has_distinct = true;
@@ -110,6 +119,8 @@ RemoteColumnStats AggregateColumnStats(const ColumnType &type,
             all_have_null_count = false;
         }
     }
+    out.has_min = out.has_min && min_known;
+    out.has_max = out.has_max && max_known;
     out.not_null = all_have_null_count && null_sum == 0;
     return out;
 }
@@ -117,10 +128,12 @@ RemoteColumnStats AggregateColumnStats(const ColumnType &type,
 } // namespace
 
 Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
-    // schema acts to check if this data source has already been resolved.
-    if (schema.has_value()) return Ok();
+    if (schema.has_value() || !BeginResolve()) {
+        return Ok();
+    }
 
     metadata.assign(paths.size(), parquet::FileMeta());
+    footer_bytes.assign(paths.size(), {});
     cardinalities.assign(paths.size(), 0);
     cardinality_total = 0;
 
@@ -143,6 +156,14 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
                     TRY(tail, fetch.range(url, -need, need));
                     parsed = parquet::ParseFooter(tail.data(), tail.size());
                 }
+            } else if (parsed.is_ok()) {
+                // Trim the probe buffer down to exactly the footer (length + metadata + magic).
+                uint32_t meta_len = 0;
+                std::memcpy(&meta_len, tail.data() + tail.size() - 8, 4);
+                const size_t footer_start = tail.size() - 8 - static_cast<size_t>(meta_len);
+                if (footer_start > 0) {
+                    tail.erase(tail.begin(), tail.begin() + static_cast<std::ptrdiff_t>(footer_start));
+                }
             }
 
             TRY(auto meta, std::move(parsed));
@@ -152,44 +173,55 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
             for (size_t c = 0; c < meta.schema.columns.size(); c++) {
                 std::vector<const parquet::ColumnStats *> chunks;
                 for (const auto &rg : meta.row_groups) {
-                    if (c < rg.columns.size()) {
-                        chunks.push_back(&rg.columns[c].stats);
-                    }
+                    chunks.push_back(c < rg.columns.size() ? &rg.columns[c].stats : nullptr);
                 }
                 stats[c] = AggregateColumnStats(meta.schema.columns[c].type, chunks);
             }
 
             const uint64_t rows = static_cast<uint64_t>(std::max<int64_t>(meta.num_rows, 0));
             {
-                static std::mutex mu; // guards the fields shared across this source's path jobs
-                std::lock_guard<std::mutex> lock(mu);
+                std::lock_guard<std::mutex> lock(resolve_mu_);
                 
                 if (!schema) {
                     schema = meta.schema;
                 }
+                const size_t merged_cols = col_stats.size();
                 if (col_stats.size() < stats.size()) {
                     col_stats.resize(stats.size());
                 }
                 cardinality_total += rows;
 
                 for (size_t c = 0; c < stats.size(); c++) {
-                    if (stats[c].has_min && (!col_stats[c].has_min || stats[c].min_value < col_stats[c].min_value)) {
-                        col_stats[c].has_min = true;
-                        col_stats[c].min_value = std::move(stats[c].min_value);
+                    auto &merged = col_stats[c];
+                    if (c >= merged_cols) {
+                        merged = std::move(stats[c]);
+                        continue;
                     }
-                    if (stats[c].has_max && (!col_stats[c].has_max || stats[c].max_value < col_stats[c].max_value)) {
-                        col_stats[c].has_max = true;
-                        col_stats[c].max_value = std::move(stats[c].max_value);
+                    // A bound holds for the source only if it holds for every file.
+                    if (merged.has_min && stats[c].has_min) {
+                        if (stats[c].min_value < merged.min_value) {
+                            merged.min_value = std::move(stats[c].min_value);
+                        }
+                    } else {
+                        merged.has_min = false;
+                    }
+                    if (merged.has_max && stats[c].has_max) {
+                        if (merged.max_value < stats[c].max_value) {
+                            merged.max_value = std::move(stats[c].max_value);
+                        }
+                    } else {
+                        merged.has_max = false;
                     }
                     if (stats[c].has_distinct) {
-                        col_stats[c].has_distinct = true;
-                        col_stats[c].distinct_count = std::max(col_stats[c].distinct_count, stats[c].distinct_count);
+                        merged.has_distinct = true;
+                        merged.distinct_count = std::max(merged.distinct_count, stats[c].distinct_count);
                     }
-                    col_stats[c].not_null = col_stats[c].not_null && stats[c].not_null;
+                    merged.not_null = merged.not_null && stats[c].not_null;
                 }
             }
             cardinalities[i] = rows;
             metadata[i] = std::move(meta);
+            footer_bytes[i] = std::move(tail);
             return Ok();
         });
     }
@@ -197,11 +229,138 @@ Result<void> RemoteParquetDataSource::Resolve(const RemoteResolver &resolver) {
     return Ok();
 }
 
+void RemoteParquetDataSource::ResolvePageIndexes(const RemoteResolver &resolver,
+        const std::vector<uint32_t> &key_cols, const std::vector<uint32_t> &read_cols_in) {
+    if (key_cols.empty()) {
+        return;
+    }
+
+    page_index_offsets.resize(metadata.size(), 0);
+    page_index_bytes.resize(metadata.size());
+    for (size_t i = 0; i < metadata.size() && i < paths.size(); i++) {
+        const parquet::FileMeta &meta = metadata[i];
+        if (std::any_of(key_cols.begin(), key_cols.end(),
+                        [&](uint32_t k) { return k >= meta.schema.columns.size(); })) {
+            continue;
+        }
+
+        std::vector<uint32_t> read_cols = read_cols_in;
+        if (read_cols.empty()) {
+            read_cols.resize(meta.schema.columns.size());
+            std::iota(read_cols.begin(), read_cols.end(), 0u);
+        }
+        
+        // The page indexes are stored together, between the row groups and the footer: fetch the
+        // byte range spanning the ones needed.
+        int64_t begin = std::numeric_limits<int64_t>::max();
+        int64_t end = 0;
+        bool complete = true;
+        auto span = [&](int64_t offset, int32_t length) {
+            if (offset < 0 || length <= 0) {
+                complete = false;
+                return;
+            }
+            begin = std::min(begin, offset);
+            end = std::max(end, offset + length);
+        };
+        for (const auto &rg : meta.row_groups) {
+            for (uint32_t key_col : key_cols) {
+                if (key_col >= rg.columns.size()) {
+                    complete = false;
+                    break;
+                }
+                span(rg.columns[key_col].column_index_offset, rg.columns[key_col].column_index_length);
+                span(rg.columns[key_col].offset_index_offset, rg.columns[key_col].offset_index_length);
+            }
+            if (!complete) {
+                break;
+            }
+            for (uint32_t c : read_cols) {
+                if (c < rg.columns.size()) {
+                    span(rg.columns[c].offset_index_offset, rg.columns[c].offset_index_length);
+                }
+            }
+        }
+        if (!complete || end <= begin || end - begin > kMaxPageIndexBytes) {
+            continue;
+        }
+        const auto have_begin = page_index_offsets[i];
+        const auto have_end = have_begin + static_cast<int64_t>(page_index_bytes[i].size());
+        if (!page_index_bytes[i].empty()) {
+            if (have_begin <= begin && end <= have_end) {
+                continue; // already fetched for another scan of the source
+            }
+            begin = std::min(begin, have_begin);
+            end = std::max(end, have_end);
+        }
+        resolver.Add([this, &resolver, i, begin, end]() -> Result<void> {
+            TRY(auto bytes, resolver.fetcher().range(paths[i], begin, end - begin));
+            if (static_cast<int64_t>(bytes.size()) != end - begin) {
+                return Ok(); // short read: go without the page index
+            }
+            page_index_offsets[i] = begin;
+            page_index_bytes[i] = std::move(bytes);
+            return Ok();
+        });
+    }
+}
+
 std::shared_ptr<DataSource> CreateRemoteParquetSource(std::string name, std::vector<std::string> urls) {
     auto pq_src = std::make_shared<RemoteParquetDataSource>();
     pq_src->name = std::move(name);
     pq_src->paths = std::move(urls);
     return pq_src;
+}
+
+ParquetPrepareInputs BuildParquetPrepareInputs(const RemoteParquetDataSource &src,
+        std::vector<uint32_t> projection, const ExprNode *pushed_filter,
+        std::vector<exec::DynamicFilterProbeSpec> dyn_filters, uint32_t num_splits, uint64_t coalesce_distance, uint64_t max_region_bytes) {
+    const bool has_dyn_filters = !dyn_filters.empty();
+    
+    parquet::ParquetConfig cfg;
+    cfg.num_splits = num_splits;
+    cfg.coalesce_distance = coalesce_distance;
+    cfg.max_region_size = max_region_bytes;
+    cfg.projection = std::move(projection);
+    if (pushed_filter) {
+        cfg.has_pushed_filter = true;
+        cfg.pushed_filter = *pushed_filter;
+    }
+    cfg.dynamic_filters = std::move(dyn_filters);
+    uint64_t rg_offset = 0;
+    for (const auto &meta : src.metadata) {
+        cfg.file_row_group_offsets.push_back(rg_offset);
+        rg_offset += meta.row_groups.size();
+    }
+
+    // A file's page index bytes go in front of its footer.
+    const bool page_index = has_dyn_filters &&
+        std::any_of(src.page_index_bytes.begin(), src.page_index_bytes.end(), [](const auto &b) { return !b.empty(); });
+    if (page_index) {
+        cfg.page_index_offsets.assign(src.footer_bytes.size(), 0);
+        cfg.page_index_sizes.assign(src.footer_bytes.size(), 0);
+    }
+
+    ParquetPrepareInputs out;
+    for (uint64_t i = 0; i < src.footer_bytes.size(); i++) {
+        const auto &footer = src.footer_bytes[i];
+        dandelion::BinaryData item;
+        if (page_index && i < src.page_index_bytes.size()) {
+            const auto &pi = src.page_index_bytes[i];
+            cfg.page_index_offsets[i] = src.page_index_offsets[i];
+            cfg.page_index_sizes[i] = pi.size();
+            item.assign(pi.begin(), pi.end());
+        }
+        item.insert(item.end(), footer.begin(), footer.end());
+        out.footers.push_back({i, "footer", std::move(item)});
+        const std::string &url = src.paths[i];
+        out.urls.push_back({i, "url", dandelion::BinaryData(url.begin(), url.end())});
+    }
+
+    auto cfg_buf = SerializeToBuffer(cfg);
+    out.cfg.push_back({0, "config", dandelion::BinaryData(cfg_buf.data(), cfg_buf.data() + cfg_buf.size())});
+
+    return out;
 }
 
 Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource &src,
@@ -214,12 +373,7 @@ Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource
         return Error("Parquet source has no resolved footer for every file.", ErrorKind::InvalidInput);
     }
 
-    // TODO: apply filter pushdown first, then split according to remaining row groups per file
-    uint32_t total = num_splits == 0 ? 1 : num_splits;
     const uint32_t num_files = static_cast<uint32_t>(src.metadata.size());
-    total = std::max<uint32_t>(num_files, total);
-    const uint32_t base_splits = total / num_files;
-    const uint32_t rounding_files = total - base_splits * num_files;
 
     ParquetStageInputs out;
     uint64_t region_key = 0;
@@ -240,10 +394,11 @@ Result<ParquetStageInputs> BuildParquetStageInputs(const RemoteParquetDataSource
             }
         }
 
-        const uint32_t region_splits = i < rounding_files ? base_splits + 1: base_splits;
+        const size_t kept_rgs = pushed_filter ? keep_row_groups.size() : meta.row_groups.size();
+        const uint32_t region_splits = parquet::FileSplitCount(num_splits, num_files, static_cast<uint32_t>(i),
+                                                               kept_rgs, meta.row_groups.size());
         auto regions = parquet::DefineRegions(meta, region_splits, coalesce_distance, projection, keep_row_groups, max_region_bytes);
 
-        
         for (size_t r = 0; r < regions.size(); r++) {
             const uint64_t key = region_key++;
             auto region_buf = regions[r].Serialize();

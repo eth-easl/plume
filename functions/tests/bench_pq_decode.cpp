@@ -48,7 +48,7 @@ struct MappedFile {
 // format (no forced materialization). Returns a checksum to defeat DCE.
 uint64_t Consume(Vector &vec, size_t n, const ColumnType &type) {
     UnifiedVectorFormat uf;
-    vec.ToUnifiedFormat(n, uf);
+    vec.ToUnifiedFormat(uf);
     uint64_t acc = 0;
     if (type.id == TypeId::VARCHAR) {
         auto *strs = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(uf);

@@ -64,7 +64,7 @@ size_t PartitionSink::RunHeap(DataChunk &chunk, const SelectionVector *sel, idx_
     size_t heap = 0;
     for (uint32_t c : factors_.varchar_cols) {
         UnifiedVectorFormat u;
-        chunk.data[c].ToUnifiedFormat(chunk.size(), u);
+        chunk.data[c].ToUnifiedFormat(u);
         auto *strs = UnifiedVectorFormat::GetData<duckdb::string_t>(u);
         for (idx_t i = 0; i < count; i++) {
             const idx_t phys = u.sel->get_index(sel ? sel->get_index(i) : i);

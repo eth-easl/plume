@@ -1,7 +1,3 @@
-// Milestone-5 aggregation tests (no DuckDB instance): ungrouped SUM/COUNT/MIN/
-// MAX/AVG and grouped aggregation, reusing DuckDB aggregate kernels with a
-// Plume-owned hash map.
-
 #include "exec_test_util.hpp"
 #include "test_util.hpp"
 
@@ -48,11 +44,11 @@ OwnedBlock MakeBlock(Allocator &alloc, const Schema &schema,
     chunk.Initialize(alloc.Get(), types);
     idx_t n = g.size();
     for (idx_t r = 0; r < n; r++) {
-        chunk.SetValue(0, r, Value::INTEGER(g[r]));
-        chunk.SetValue(1, r, Value::INTEGER(a[r]));
-        chunk.SetValue(2, r, Value::DOUBLE(c[r]));
+        chunk.data[0].SetValue(r, Value::INTEGER(g[r]));
+        chunk.data[1].SetValue(r, Value::INTEGER(a[r]));
+        chunk.data[2].SetValue(r, Value::DOUBLE(c[r]));
     }
-    chunk.SetCardinality(n);
+    chunk.SetChildCardinality(n);
     return ExportChunk(schema, chunk, alloc).unwrap();
 }
 

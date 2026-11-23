@@ -16,9 +16,6 @@ namespace plume::parser {
 struct CompiledComposition {
     std::shared_ptr<PhysicalPlan> plan;
     dandelion::DandelionComposition composition;
-    dandelion::DataSetVec table_blocks;
-    dandelion::DataSetVec remote_info;
-    dandelion::DataSetVec remote_requests;
 };
 
 Result<CompiledComposition> CompileQuery(duckdb::Connection &con, catalog::SourceCatalog &catalog, const std::string &sql,

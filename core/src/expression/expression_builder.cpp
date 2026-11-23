@@ -31,7 +31,7 @@ Result<unique_ptr<Expression>> BuildFunction(const ExprNode &node) {
     arg_types.reserve(node.children.size());
     for (auto &child : node.children) {
         TRY(auto built, BuildExpression(child));
-        arg_types.push_back(built->return_type);
+        arg_types.push_back(built->GetReturnType());
         args.push_back(std::move(built));
     }
 
@@ -39,8 +39,9 @@ Result<unique_ptr<Expression>> BuildFunction(const ExprNode &node) {
     // so bind_info stays null.
     TRY(ScalarFunction function, ResolveScalarFunction(node.func_name, arg_types, ToLogicalType(node.return_type)));
 
+    function.SetReturnType(ToLogicalType(node.return_type));
     return duckdb::make_uniq<duckdb::BoundFunctionExpression>(
-        ToLogicalType(node.return_type), std::move(function), std::move(args), nullptr, /*is_operator=*/true);
+        duckdb::BoundScalarFunction(function), std::move(args), nullptr, /*is_operator=*/true);
 }
 
 } // namespace
@@ -60,8 +61,10 @@ Result<unique_ptr<Expression>> BuildExpression(const ExprNode &node) {
         }
         TRY(auto lhs, BuildExpression(node.children[0]));
         TRY(auto rhs, BuildExpression(node.children[1]));
-        return unique_ptr<Expression>(duckdb::make_uniq<duckdb::BoundComparisonExpression>(
-            ToExprType(node.expr_type), std::move(lhs), std::move(rhs)));
+        return TryCatch([&] {
+            return duckdb::BoundComparisonExpression::Create(ToExprType(node.expr_type), std::move(lhs),
+                                                             std::move(rhs));
+        });
     }
     case ExprKind::CONJUNCTION: {
         unique_ptr<Expression> result = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
@@ -69,7 +72,7 @@ Result<unique_ptr<Expression>> BuildExpression(const ExprNode &node) {
         auto &conj = result->Cast<duckdb::BoundConjunctionExpression>();
         for (auto &child : node.children) {
             TRY(auto built, BuildExpression(child));
-            conj.children.push_back(std::move(built));
+            conj.GetChildrenMutable().push_back(std::move(built));
         }
         return result;
     }
@@ -79,7 +82,7 @@ Result<unique_ptr<Expression>> BuildExpression(const ExprNode &node) {
         auto &op = result->Cast<duckdb::BoundOperatorExpression>();
         for (auto &child : node.children) {
             TRY(auto built, BuildExpression(child));
-            op.children.push_back(std::move(built));
+            op.GetChildrenMutable().push_back(std::move(built));
         }
         return result;
     }
@@ -106,9 +109,9 @@ Result<unique_ptr<Expression>> BuildExpression(const ExprNode &node) {
             duckdb::BoundCaseCheck check;
             TRY(check.when_expr, BuildExpression(node.children[i]));
             TRY(check.then_expr, BuildExpression(node.children[i + 1]));
-            case_expr.case_checks.push_back(std::move(check));
+            case_expr.CaseChecksMutable().push_back(std::move(check));
         }
-        TRY(case_expr.else_expr, BuildExpression(node.children[n - 1]));
+        TRY(case_expr.ElseMutable(), BuildExpression(node.children[n - 1]));
         return result;
     }
     case ExprKind::AGGREGATE:

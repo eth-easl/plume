@@ -36,7 +36,8 @@ set(UBENCH_FUNCTION_SOURCES
   ${CMAKE_SOURCE_DIR}/functions/src/functions/stage.cpp
   ${CMAKE_SOURCE_DIR}/functions/src/functions/csv_stage.cpp
   ${CMAKE_SOURCE_DIR}/functions/src/functions/pq_stage.cpp
-  ${CMAKE_SOURCE_DIR}/functions/src/functions/output_split.cpp)
+  ${CMAKE_SOURCE_DIR}/functions/src/util/dynamic_filter.cpp
+  ${CMAKE_SOURCE_DIR}/functions/src/util/output_split.cpp)
 
 # An OBJECT library so every object is linked unconditionally (the fn <-> abi
 # back-references never hit archive-ordering issues).
@@ -75,7 +76,7 @@ target_link_libraries(ubench_run PRIVATE ubench_engine nlohmann_json::nlohmann_j
 # PLUME_WITH_COMPILE_LAYER is on (see core/CMakeLists.txt), so skip this target
 # entirely otherwise rather than fail to link cpr::cpr/catalog symbols.
 if(PLUME_WITH_COMPILE_LAYER)
-  set(UBENCH_PARQUET_EXT_LIB "${CMAKE_SOURCE_DIR}/build/duckdb/extension/parquet/libparquet_extension.a")
+  set(UBENCH_PARQUET_EXT_LIB "${DUCKDB_BUILD_DIR}/extension/parquet/libparquet_extension.a")
   if(NOT EXISTS "${UBENCH_PARQUET_EXT_LIB}")
     message(FATAL_ERROR "Missing parquet extension archive:\n  ${UBENCH_PARQUET_EXT_LIB}\n"
                         "Build it with: ninja -C build/duckdb parquet_extension")
@@ -88,9 +89,9 @@ if(PLUME_WITH_COMPILE_LAYER)
   target_include_directories(ubench_export PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/functions/include
-    ${CMAKE_SOURCE_DIR}/external/duckdb/extension/parquet/include
-    ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/parquet
-    ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/thrift)
+    ${DUCKDB_DIR}/extension/parquet/include
+    ${DUCKDB_DIR}/third_party/parquet
+    ${DUCKDB_DIR}/third_party/thrift)
   target_link_libraries(ubench_export PRIVATE
     plume
     nlohmann_json::nlohmann_json

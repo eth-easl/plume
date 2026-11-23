@@ -1,4 +1,5 @@
 #include "duckdb.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -25,7 +26,7 @@ int main(int argc, char **argv) {
     idx_t total_rows = 0;
     for (int rep = 0; rep < reps; rep++) {
         auto t0 = std::chrono::steady_clock::now();
-        auto result = con.SendQuery(sql); // streaming
+        auto result = duckdb::make_uniq<duckdb::QueryResultStream<>>(con.Submit(sql)); // streaming
         if (result->HasError()) {
             std::fprintf(stderr, "duckdb error: %s\n", result->GetError().c_str());
             return 1;

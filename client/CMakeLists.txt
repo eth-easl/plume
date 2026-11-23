@@ -6,17 +6,17 @@
 # ---------------------------------------------------------------------------
 
 # The DuckDB parquet extension — linked + registered ONLY by the client.
-set(PLUME_PARQUET_EXT_LIB "${CMAKE_SOURCE_DIR}/build/duckdb/extension/parquet/libparquet_extension.a")
+set(PLUME_PARQUET_EXT_LIB "${DUCKDB_BUILD_DIR}/extension/parquet/libparquet_extension.a")
 if(NOT EXISTS "${PLUME_PARQUET_EXT_LIB}")
   message(FATAL_ERROR "Missing parquet extension archive:\n  ${PLUME_PARQUET_EXT_LIB}\n"
                       "Build it with: ninja -C build/duckdb parquet_extension")
 endif()
 set(PLUME_PARQUET_INCLUDES
-  ${CMAKE_SOURCE_DIR}/external/duckdb/extension/parquet/include
-  ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/parquet
-  ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/thrift)
+  ${DUCKDB_DIR}/extension/parquet/include
+  ${DUCKDB_DIR}/third_party/parquet
+  ${DUCKDB_DIR}/third_party/thrift)
 
-# Path to the duckdb_glue.cpp that provides ExtensionHelper::LoadAllExtensions.
+# Path to the duckdb_glue.cpp that registers the core_functions + parquet extensions.
 set(PLUME_DUCKDB_GLUE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/duckdb/duckdb_glue.cpp")
 
 # Apply to a client target that needs a DuckDB instance: adds duckdb_glue.cpp

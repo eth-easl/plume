@@ -49,4 +49,13 @@ ExprNode ExprNode::Deserialize(duckdb::Deserializer &d) {
     return n;
 }
 
+void OffsetReferences(expr::ExprNode &node, uint32_t delta) {
+    if (node.kind == expr::ExprKind::REFERENCE) {
+        node.ref_index += delta;
+    }
+    for (auto &child : node.children) {
+        OffsetReferences(child, delta);
+    }
+}
+
 } // namespace plume::expr

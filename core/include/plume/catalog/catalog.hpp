@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <string>
@@ -54,9 +55,27 @@ struct DataSource {
     std::vector<RemoteColumnStats> col_stats = {};
 
     DataSource(DataSourceType type) : type(type) {}
+    DataSource(const DataSource &) = delete;
+    DataSource &operator=(const DataSource &) = delete;
     virtual ~DataSource() = default;
     virtual Result<void> Resolve(const RemoteResolver &resolver) = 0;
     bool IsRemote() const { return type == DataSourceType::REMOTE_PARQUET || type == DataSourceType::REMOTE_CSV; }
+
+protected:
+    // Marks the source as queued for resolving; false if an earlier call already queued it (a
+    // source referenced several times in one query must not queue its path jobs twice).
+    bool BeginResolve() {
+        if (resolve_queued_) {
+            return false;
+        }
+        resolve_queued_ = true;
+        return true;
+    }
+    // Guards the fields the path jobs of one Resolve merge into.
+    std::mutex resolve_mu_;
+
+private:
+    bool resolve_queued_ = false;
 };
 
 class SourceCatalog {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "plume/common/buffer.hpp"
+#include "plume/execution/pipeline.hpp"
 #include "plume/expression/expression.hpp"
 
 #include <cstdint>
@@ -13,11 +14,11 @@ class Deserializer;
 
 namespace plume::parquet {
 
-// Parquet reading configuration. The information used by csv_prepare.
+// Parquet reading configuration. The information used by pq_prepare.
 struct ParquetConfig {
     uint32_t num_splits = 1;
     uint64_t coalesce_distance = 1 << 20; // merge column chunks within this gap into one request
-    uint64_t max_region_size = 0;         // cap on the compressed bytes each region processes (0 ⇒ unlimited)
+    uint64_t max_region_size = 0;         // cap on the compressed bytes each region processes (0 => unlimited)
 
     // Projection pushdown: the column indices to be read, empty -> no projection.
     std::vector<uint32_t> projection;
@@ -26,8 +27,40 @@ struct ParquetConfig {
     bool has_pushed_filter = false;
     expr::ExprNode pushed_filter;
 
+    // The prune-mode dynamic filters.
+    std::vector<exec::DynamicFilterProbeSpec> dynamic_filters;
+
+    // Per-file prefix sums of the source's row group counts (one entry per file, indexed by the
+    // footer item's key). Empty -> single-file source.
+    std::vector<uint64_t> file_row_group_offsets;
+
+    // Per file (indexed by the footer item's key): the footer item starts with
+    // page_index_sizes[i] bytes of the file from page_index_offsets[i] on, which hold the page
+    // indexes the dynamic filters need. Empty or a size of 0 -> no page index.
+    std::vector<int64_t> page_index_offsets;
+    std::vector<uint64_t> page_index_sizes;
+
     void Serialize(duckdb::Serializer &s) const;
     static ParquetConfig Deserialize(duckdb::Deserializer &d);
+};
+
+// A run of consecutive data pages of a column chunk.
+struct PageRun {
+    // The offset in the original file.
+    int64_t offset;
+    // The size of the run in bytes.
+    int64_t size;
+    // The rows [first_row, first_row + num_rows) of the row group the run holds.
+    uint64_t first_row;
+    uint64_t num_rows;
+    // Index of the request loading this run in the Region requests vector.
+    uint64_t req_idx;
+    // Offset in the request loading this run in the Region requests vector.
+    uint64_t req_offset;
+
+    inline uint64_t end() const {
+        return offset + size;
+    }
 };
 
 // Represents a Parquet ColumnChunk.
@@ -46,6 +79,9 @@ struct DataChunk {
     uint64_t req_offset;
     // The parquet CompressionCodec.
     int32_t codec = 0;
+    // Only these data pages are read if not empty; the chunk's own byte range then only covers
+    // its dictionary page (size 0 -> none).
+    std::vector<PageRun> pages;
 
     inline uint64_t end() const {
         return offset + size;
@@ -81,5 +117,8 @@ struct Region {
     DataBuffer Serialize() const;
     static Region Deserialize(DataBuffer& buf);
 };
+
+// Returns the index of the file column in the scan schema.
+int32_t ScanColumnIndex(const std::vector<uint32_t> &projection, int32_t file_col);
 
 } // namespace plume::parquet

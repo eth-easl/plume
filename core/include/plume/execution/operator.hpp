@@ -27,6 +27,7 @@ enum class OpType : uint8_t {
     ORDER_BY = 5,
     JOIN = 6,
     TOP_N = 7, // fused ORDER BY + LIMIT
+    DYNAMIC_FILTER_BUILD = 8,
 };
 
 // Parent class, inherited by all specific operator templates.

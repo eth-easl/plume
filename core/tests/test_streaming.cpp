@@ -1,15 +1,9 @@
-// Push-based execution (Executor::Push / Finish): push the source one chunk at a
-// time and verify results match batch execution across chunk boundaries. Covers a
-// reducing filter, cross-chunk aggregation, limit/offset spanning chunks, and a
-// blocking sort (buffers its input in Push, orders + emits in Finish).
-
 #include "test_util.hpp"
 
 #include "plume/execution/executor.hpp"
 #include "plume/execution/operators/aggregate.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/operators/limit.hpp"
-#include "plume/execution/operators/output.hpp"
 #include "plume/execution/operators/sort.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/expression/expression.hpp"
@@ -19,7 +13,6 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 
-#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
@@ -53,10 +46,10 @@ std::unique_ptr<DataChunk> MakeChunk(Allocator &alloc, const std::vector<int32_t
     auto chunk = std::make_unique<DataChunk>();
     chunk->Initialize(alloc.Get(), {LogicalType::INTEGER, LogicalType::INTEGER});
     for (idx_t r = 0; r < a.size(); r++) {
-        chunk->SetValue(0, r, Value::INTEGER(a[r]));
-        chunk->SetValue(1, r, Value::INTEGER(b[r]));
+        chunk->data[0].SetValue(r, Value::INTEGER(a[r]));
+        chunk->data[1].SetValue(r, Value::INTEGER(b[r]));
     }
-    chunk->SetCardinality(a.size());
+    chunk->SetChildCardinality(a.size());
     return chunk;
 }
 

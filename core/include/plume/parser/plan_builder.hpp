@@ -8,6 +8,15 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace plume::exec {
+struct AggregateTemplate;
+} // namespace plume::exec
 
 namespace plume::parser {
 
@@ -16,6 +25,16 @@ constexpr size_t kUnmaterialized = std::numeric_limits<std::size_t>::max();
 class PlanBuilder {
 public:
     PlanBuilder(bool optimize_remote_fetching) : optimize_remote_fetching_(optimize_remote_fetching) {}
+
+    struct OperatorNode;
+
+    // A grouped two-phase aggregate recorded so we can easily collapse it back into a single phase.
+    struct EarlyAggregate {
+        // The node computing the partial (early) aggregate.
+        std::shared_ptr<OperatorNode> partial;
+        // The equivalent single-phase aggregate over the partial's input.
+        std::shared_ptr<exec::AggregateTemplate> single_phase;
+    };
 
     // Intermediate struct representing an operator in the query plan.
     struct OperatorNode {
@@ -37,6 +56,14 @@ public:
         
         // Stage index of the stage this node is materialized in or -1 if not yet materialized.
         size_t stage_idx = kUnmaterialized;
+        // Whether Export() has visited the node (emitted its operator and dynamic filter taps).
+        bool materialized = false;
+
+        // Indices into `dynamic_filter_taps_` built over this node's output.
+        std::vector<uint32_t> dynamic_filter_builds = {};
+
+        // Set on the last node of a grouped two-phase aggregate.
+        std::shared_ptr<EarlyAggregate> early_agg = nullptr;
 
         bool CanSplit() { return consumers.size() == 0 && num_splits == 0; }
         bool IsSameSplit(const std::vector<uint32_t> &other_key_cols, uint32_t other_num_splits) {
@@ -53,6 +80,32 @@ public:
     };
     using SharedOpNode = std::shared_ptr<OperatorNode>;
 
+    // A dynamic filter where the `build_column` keys filter the `target_column`.
+    struct DynamicFilterEdge {
+        // Build of the dynamic filter.
+        SharedOpNode build;
+        uint32_t build_column;
+
+        // Target of the dynamic filter (a leaf node).
+        SharedOpNode target;
+        uint32_t target_column;      // in the scan schema (pq_stage probe)
+        uint32_t target_file_column; // in the file schema (pq_prepare pruning)
+
+        ColumnType key_type;  // type keys are cast to before collecting/hashing
+        uint32_t max_values;  // exact key set limit (0 -> none)
+        uint64_t bloom_bits;  // Bloom filter size (0 -> none)
+        bool prune;           // remote parquet leaf: also prune in pq_prepare
+    };
+
+    // The edges sharing build node, column and parameters (becomes a DynamicFilterBuildTemplate).
+    struct DynamicFilterTap {
+        uint32_t build_column;
+        ColumnType key_type;
+        uint32_t max_values;
+        uint64_t bloom_bits;
+        std::vector<uint32_t> edges; // indices into dynamic_filters_ of the edges it feeds
+    };
+
     SharedOpNode Scan(std::shared_ptr<catalog::DataSource> data_src, Schema schema, 
         std::shared_ptr<std::vector<uint32_t>> pushed_projection, 
         std::shared_ptr<expr::ExprNode> pushed_filter);
@@ -68,11 +121,48 @@ public:
     Stage *StageAt(size_t idx);
     LeafStage *LeafStageAt(size_t idx);
 
+    std::pair<SharedOpNode, uint32_t> AppendColumn(SharedOpNode node, expr::ExprNode value, ColumnType type);
+
+    struct ColumnSource {
+        size_t src_idx;
+        uint32_t column;
+    };
+    
+    static std::optional<ColumnSource> TraceColumnStep(const OperatorNode &node, uint32_t col_idx);
+
+    struct LeafColumn {
+        SharedOpNode node; // the leaf node
+        LeafStage *leaf;   // its stage
+        uint32_t scan_column;
+        uint32_t file_column;
+    };
+
+    // Traces a column back to the leaf it is read from (TraceColumnStep until a leaf).
+    std::optional<LeafColumn> TraceLeafColumn(const SharedOpNode &node, uint32_t col_idx);
+
+    // Checks whether a two-phase aggregate is unnecessary. If so it returns the single-phase
+    // aggregate to replace the two-phase one, otherwise returns nullptr
+    static SharedOpNode FindCoPartitioning(const SharedOpNode &partial);
+
+    // Replaces the two-phase aggregate ending in `last` by its single-phase aggregate.
+    static void UndoEarlyAggregate(const SharedOpNode &last, const SharedOpNode &new_source);
+
+    // Walks the graph (inputs first) and collapses every early aggregate whose input is already
+    // partitioned by its group keys.
+    static void CollapseEarlyAggregates(const SharedOpNode &root);
+
+    void AddDynamicFilter(DynamicFilterEdge edge);
+    void AttachDynamicFilters();
+    
+    const std::vector<DynamicFilterEdge> &DynamicFilters() const { return dynamic_filters_; }
+
     std::unique_ptr<PhysicalPlan> Export(SharedOpNode root);
 
 private:
     size_t NewStage(Schema input_schema);
     size_t NewLeafStage(std::shared_ptr<catalog::DataSource> data_src, Schema input_schema);
+    
+    void EmitDynamicFilterTaps(const OperatorNode &node, size_t stage_idx);
     size_t MaterializeNode(SharedOpNode node);
 
     Result<void> RemoteRegistryAdd(SharedOpNode node);
@@ -83,6 +173,9 @@ private:
 
     bool optimize_remote_fetching_ = true;
     std::unordered_multimap<std::string, SharedOpNode> remote_registry_;
+
+    std::vector<DynamicFilterEdge> dynamic_filters_;
+    std::vector<DynamicFilterTap> dynamic_filter_taps_;
 };
 
 } // namespace plume::parser

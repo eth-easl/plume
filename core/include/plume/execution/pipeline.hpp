@@ -39,11 +39,21 @@ struct OutputSink {
     static OutputSink Deserialize(duckdb::Deserializer &d);
 };
 
+struct DynamicFilterProbeSpec {
+    uint32_t filter_id = 0;
+    uint32_t column = 0;
+
+    bool operator==(const DynamicFilterProbeSpec &o) const { return filter_id == o.filter_id && column == o.column; }
+    void Serialize(duckdb::Serializer &s) const;
+    static DynamicFilterProbeSpec Deserialize(duckdb::Deserializer &d);
+};
+
 struct PipelineTemplate {
     Schema input_schema;
     std::vector<std::shared_ptr<OperatorTemplate>> operators;
     OutputSplit output_split;
     OutputSink output_sink;
+    std::vector<DynamicFilterProbeSpec> dynamic_filter_probes;
 
     void Serialize(duckdb::Serializer &s) const;
     static PipelineTemplate Deserialize(duckdb::Deserializer &d);

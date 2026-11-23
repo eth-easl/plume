@@ -118,6 +118,47 @@ Result<InputItem> GetInputItem(size_t set_idx, size_t item_idx) {
     return InputItem{std::move(buffer), std::move(ident), itm_buf->key};
 }
 
+std::optional<std::vector<InputItem>> GetOptionalInputSet(size_t set_idx) {
+    if (set_idx >= dandelion_input_set_count()) {
+        return std::nullopt;
+    }
+    size_t num_itms = dandelion_input_buffer_count(set_idx);
+
+    std::vector<InputItem> out;
+    out.reserve(num_itms);
+    for (size_t itm_idx = 0; itm_idx < num_itms; itm_idx++) {
+        IoBuffer* itm_buf = dandelion_get_input(set_idx, itm_idx);
+        uint8_t* data_ptr = static_cast<uint8_t*>(itm_buf->data);
+        size_t data_len = itm_buf->data_len;
+        RemoveHTTPResponse(&data_ptr, &data_len);
+        DataBuffer buffer(data_ptr, data_len, /*owns_data=*/false);
+        std::string ident(itm_buf->ident, itm_buf->ident_len);
+        out.push_back(InputItem{std::move(buffer), std::move(ident), itm_buf->key});
+    }
+
+    return std::make_optional(std::move(out));
+}
+
+Result<std::optional<InputItem>> GetOptionalInputSingleton(size_t set_idx) {
+    if (set_idx >= dandelion_input_set_count()) {
+        return std::nullopt;
+    }
+    size_t num_itms = dandelion_input_buffer_count(set_idx);
+    if (num_itms == 0) {
+        return std::nullopt;
+    } else if (num_itms > 1) {
+        return Error("Set with index " + std::to_string(set_idx) + " contains more than a single item.");
+    }
+
+    IoBuffer* itm_buf = dandelion_get_input(set_idx, 0);
+    uint8_t* data_ptr = static_cast<uint8_t*>(itm_buf->data);
+    size_t data_len = itm_buf->data_len;
+    RemoveHTTPResponse(&data_ptr, &data_len);
+    DataBuffer buffer(data_ptr, data_len, /*owns_data=*/false);
+    std::string ident(itm_buf->ident, itm_buf->ident_len);
+    return std::make_optional(InputItem{std::move(buffer), std::move(ident), itm_buf->key});
+}
+
 void AddOutput(const std::string &ident, size_t set_idx, DataBuffer buffer, size_t key) {
     IoBuffer out_buf;
     out_buf.data = (void*)buffer.data();

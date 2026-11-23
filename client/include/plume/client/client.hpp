@@ -24,10 +24,7 @@ struct QueryResponse {
     
 struct CompiledQuery {
     dandelion::DandelionComposition composition;
-    dandelion::DataSetVec table_blocks;
-    dandelion::DataSetVec remote_info;
-    dandelion::DataSetVec remote_requests;
-    Schema output_schema;
+    std::shared_ptr<parser::PhysicalPlan> plan;
 
     Result<dandelion::BinaryData> Request();
     std::string ResultToString(const dandelion::BinaryData& data);
@@ -49,10 +46,6 @@ public:
 private:
     duckdb::DuckDB db_;
     duckdb::Connection con_;
-    // Shared (not owned solely by Client) because the plume_remote table function
-    // registered on con_ holds its own reference, resolved at bind time (i.e. while
-    // DuckDB is parsing/binding a query, after ResolveAndRewriteSources has already
-    // populated it for that query).
     std::shared_ptr<catalog::SourceCatalog> catalog_;
 
     parser::ConverterConfig converter_cfg_;

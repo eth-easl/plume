@@ -35,6 +35,12 @@ Plain `.sql` files under `tpch/queries/`, referencing tables as `[table]` placeh
 | `resultsPrefix` | Output directory for result files (empty => console only). |
 | `preAggregate`, `projectionPushdown`, `filterPushdown` | `CompileQuery` converter toggles (default on). |
 | `maxSplits`, `targetRowsPerSplit`, `maxRegionSize` | `CompileQuery` converter split tuning. |
+| `coalesceDistance` | Maximum byte gap between parquet range requests that are merged into one. |
+| `dynamicFilter` | Enables dynamic filters (default on). |
+| `dynamicFilterMaxMatchFraction`, `dynamicFilterSelectivityThreshold` | Estimated selectivity a transfer must reach (share of the key's distinct values / of the target's rows). |
+| `dynamicFilterMaxRowgroupCoverage` | Mean row-group key-range coverage up to which a filter prunes in `pq_prepare` (prune mode). |
+| `dynamicFilterMaxValues`, `dynamicFilterBloomBitsPerKey`, `dynamicFilterMaxBloomBytes` | Filter sizing: exact key set limit, Bloom bits per key, Bloom size cap. |
+| `dynamicFilterMaxChainDepth` | Maximum length of a chain of dynamic filters. |
 | `scaleFactor` | Scale-factor label used to look up expected checksums (trace mode uses its own column). |
 | `checksumFile` | Path to checksum file for correctness checking (empty => no checks, see Correctness Checking below). |
 | `benchmarkConfig` | Type-specific settings (see Benchmark types). |
@@ -52,4 +58,4 @@ python3 runner/scripts/generate_checksums.py tpch/config/local_single_sf10.json
 
 ## Output
 
-A per-query summary table on the console. With `resultsPrefix` set, also writes `planning.txt`, `timings.txt` (latencies, or per-rps runs for a throughput sweep), and `timestamps.txt` under that directory. Trace benchmarks further output a `trace_results.txt` file.
+A per-query summary table on the console. With `resultsPrefix` set, also writes `planning.txt`, `timings.txt` (latencies, or per-rps runs for a throughput sweep) under that directory, plus `traces.plmt.gz` (gzip-compressed binary Dandelion execution traces) if Dandelion returned traces. Trace benchmarks further output a `trace_results.txt` file.

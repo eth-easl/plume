@@ -22,9 +22,11 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -32,6 +34,7 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
@@ -39,9 +42,12 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <utility>
 
 namespace plume::parser {
 
@@ -55,111 +61,75 @@ using catalog::SourceCatalog;
 
 namespace {
 
-Result<expr::ExprNode> CombinePredicates(const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &predicates) {
-    if (predicates.size() == 1) {
-        return TranslateExpression(*predicates[0]);
-    }
-    std::vector<expr::ExprNode> children;
-    children.reserve(predicates.size());
-    for (auto &p : predicates) {
-        TRY(auto child, TranslateExpression(*p));
-        children.push_back(std::move(child));
-    }
-    return expr::ExprNode::Conjunction(duckdb::ExpressionType::CONJUNCTION_AND, std::move(children));
+bool IsRuntimeTableFilter(const duckdb::Expression &e) {
+    return e.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+           e.Cast<duckdb::BoundFunctionExpression>().Function().GetName().GetIdentifierName().rfind(
+               "__internal_tablefilter_", 0) == 0;
 }
 
-Result<exec::AggregateSpec> TranslateAggregate(const duckdb::Expression &expr) {
-    auto &agg = expr.Cast<duckdb::BoundAggregateExpression>();
-    if (agg.filter) {
-        return Error("Aggregate FILTER clause is not supported.", ErrorKind::NotImplemented);
+bool ContainsRuntimeTableFilter(const duckdb::Expression &e) {
+    if (IsRuntimeTableFilter(e)) {
+        return true;
     }
-    if (agg.order_bys) {
-        return Error("Ordered aggregates are not supported.", ErrorKind::NotImplemented);
-    }
-    exec::AggregateSpec spec;
-    // statistics_propagation can swap sum -> sum_no_overflow when it proves no
-    // overflow; Plume only registers plain sum (same result), so normalize back.
-    spec.func_name = (agg.function.name == "sum_no_overflow") ? "sum" : agg.function.name;
-    spec.return_type = FromLogicalType(agg.return_type);
-    spec.distinct = agg.IsDistinct();
-    spec.arguments.reserve(agg.children.size());
-    for (auto &child : agg.children) {
-        TRY(auto arg, TranslateExpression(*child));
-        spec.arguments.push_back(std::move(arg));
-    }
-    return spec;
+    bool found = false;
+    duckdb::ExpressionIterator::EnumerateChildren(
+        e, [&](const duckdb::Expression &child) { found = found || ContainsRuntimeTableFilter(child); });
+    return found;
 }
 
-Result<exec::JoinKind> JoinKindFromType(duckdb::JoinType type) {
-    switch (type) {
-    case duckdb::JoinType::INNER:
-        return exec::JoinKind::INNER;
-    case duckdb::JoinType::LEFT:
-        return exec::JoinKind::LEFT;
-    case duckdb::JoinType::RIGHT:
-        return exec::JoinKind::RIGHT;
-    case duckdb::JoinType::OUTER:
-        return exec::JoinKind::OUTER;
-    case duckdb::JoinType::SEMI:
-        return exec::JoinKind::SEMI;
-    case duckdb::JoinType::ANTI:
-        return exec::JoinKind::ANTI;
-    case duckdb::JoinType::SINGLE:
-        return exec::JoinKind::SINGLE;
-    case duckdb::JoinType::MARK:
-        return exec::JoinKind::MARK;
-    case duckdb::JoinType::RIGHT_SEMI:
-        return exec::JoinKind::RIGHT_SEMI;
-    case duckdb::JoinType::RIGHT_ANTI:
-        return exec::JoinKind::RIGHT_ANTI;
-    default:
-        return Error("Unsupported join type.", ErrorKind::NotImplemented);
+// Drops runtime filters from the top-level AND chain. Returns nullptr if nothing required is left.
+Result<duckdb::unique_ptr<duckdb::Expression>> StripRuntimeTableFilters(duckdb::unique_ptr<duckdb::Expression> e) {
+    if (IsRuntimeTableFilter(*e)) {
+        return duckdb::unique_ptr<duckdb::Expression>();
     }
-}
-
-Result<uint32_t> JoinKeyIndex(const duckdb::Expression &side) {
-    if (side.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
-        return Error("Join keys must be plain columns (expression join keys not supported).",
+    if (e->GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
+        auto &children = e->Cast<duckdb::BoundConjunctionExpression>().GetChildrenMutable();
+        duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> kept;
+        for (auto &child : children) {
+            TRY(auto stripped, StripRuntimeTableFilters(std::move(child)));
+            if (stripped) {
+                kept.push_back(std::move(stripped));
+            }
+        }
+        if (kept.empty()) {
+            return duckdb::unique_ptr<duckdb::Expression>();
+        }
+        if (kept.size() == 1) {
+            return std::move(kept[0]);
+        }
+        children = std::move(kept);
+        return e;
+    }
+    if (ContainsRuntimeTableFilter(*e)) {
+        return Error("Runtime table filter nested below a non-AND expression is not supported.",
                      ErrorKind::NotImplemented);
     }
-    return static_cast<uint32_t>(side.Cast<duckdb::BoundReferenceExpression>().index);
+    return e;
 }
 
-bool IsEquiCondition(const duckdb::JoinCondition &cond) {
-    return cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-           cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
-}
-
-void OffsetReferences(expr::ExprNode &node, uint32_t delta) {
+void RemapCombinedJoinRefs(expr::ExprNode &node, uint32_t duck_left_size, bool swapped, uint32_t left_size) {
     if (node.kind == expr::ExprKind::REFERENCE) {
-        node.ref_index += delta;
+        const bool from_duck_left = node.ref_index < duck_left_size;
+        if (!swapped) {
+            node.ref_index = from_duck_left ? node.ref_index : node.ref_index - duck_left_size + left_size;
+        } else {
+            node.ref_index = from_duck_left ? node.ref_index + left_size : node.ref_index - duck_left_size;
+        }
     }
     for (auto &child : node.children) {
-        OffsetReferences(child, delta);
+        RemapCombinedJoinRefs(child, duck_left_size, swapped, left_size);
     }
-}
-
-std::pair<PlanBuilder::SharedOpNode, uint32_t> AppendColumn(PlanBuilder &builder, PlanBuilder::SharedOpNode node,
-        expr::ExprNode value, ColumnType type) {
-    auto t = std::make_shared<exec::ProjectionTemplate>();
-    Schema out = node->output_schema;
-    for (uint32_t i = 0; i < out.columns.size(); i++) {
-        t->projections.push_back(expr::ExprNode::Reference(i, out.columns[i].type));
-    }
-    const uint32_t new_idx = static_cast<uint32_t>(out.columns.size());
-    t->projections.push_back(std::move(value));
-    out.columns.push_back({"__key" + std::to_string(new_idx), type, /*nullable=*/true});
-    return std::make_pair(builder.After(std::move(node), std::move(t), std::move(out)), new_idx);
 }
 
 } // namespace
 
 Result<std::unique_ptr<PhysicalPlan>> Converter::Convert(duckdb::LogicalOperator &root) {
     TRY(auto root_node, Build(root));
-    std::unique_ptr<PhysicalPlan> plan = builder_.Export(root_node);
-    return plan;
-
-    // TODO: Refactor projections pruning unused columns.
+    PlanBuilder::CollapseEarlyAggregates(root_node);
+    if (cfg_.dynamic_filter) {
+        PlanDynamicFilters(builder_, root_node, dyn_filter_ctx_, cfg_);
+    }
+    return builder_.Export(root_node);
 }
 
 uint32_t Converter::SplitCount(uint64_t estimated_rows) const {
@@ -176,11 +146,309 @@ uint32_t Converter::SplitCount(uint64_t estimated_rows) const {
     return static_cast<uint32_t>(n);
 }
 
+Result<PlanBuilder::SharedOpNode> Converter::BuildProjection(duckdb::LogicalOperator &op) {
+    TRY(auto prev, Build(*op.children[0]));
+
+    auto t = std::make_shared<exec::ProjectionTemplate>();
+    t->projections.reserve(op.expressions.size());
+    for (auto &e : op.expressions) {
+        TRY(auto proj, TranslateExpression(*e));
+        t->projections.push_back(std::move(proj));
+    }
+
+    Schema out = exec::ProjectionSchema(t->projections, prev->output_schema);
+    return builder_.After(std::move(prev), std::move(t), std::move(out));
+}
+
+Result<PlanBuilder::SharedOpNode> Converter::BuildFilter(duckdb::LogicalFilter &filter) {
+    TRY(auto prev, Build(*filter.children[0]));
+
+    TRY(auto filter_expr, CombinePredicates(filter.expressions));
+    auto t = std::make_shared<exec::FilterTemplate>(filter_expr);
+    Schema out = prev->output_schema; // filter preserves schema
+    PlanBuilder::SharedOpNode cur = builder_.After(std::move(prev), std::move(t), std::move(out));
+
+    if (!filter.projection_map.empty()) {
+        auto proj_templ = std::make_shared<exec::ProjectionTemplate>();
+        Schema proj_schema;
+        for (auto idx : filter.projection_map) {
+            const Column &col = cur->output_schema.columns[idx];
+            proj_templ->projections.push_back(expr::ExprNode::Reference(static_cast<uint32_t>(idx), col.type));
+            proj_schema.columns.push_back(col);
+        }
+        cur = builder_.After(std::move(cur), std::move(proj_templ), std::move(proj_schema));
+    }
+    return cur;
+}
+
+Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggregate &agg) {
+    if (agg.grouping_sets.size() > 1) {
+        return Error("GROUPING SETS / ROLLUP / CUBE not supported.", ErrorKind::NotImplemented);
+    }
+    
+    TRY(auto prev, Build(*agg.children[0]));
+
+    std::vector<ExprNode> groups;
+    groups.reserve(agg.groups.size());
+    for (auto &g : agg.groups) {
+        TRY(auto key, TranslateExpression(*g));
+        groups.push_back(std::move(key));
+    }
+    std::vector<exec::AggregateSpec> aggs;
+    aggs.reserve(agg.expressions.size());
+    for (auto &e : agg.expressions) {
+        auto &agg = e->Cast<duckdb::BoundAggregateExpression>();
+        TRY(auto spec, TranslateAggregate(agg));
+        aggs.push_back(std::move(spec));
+    }
+
+    const uint32_t num_groups = static_cast<uint32_t>(groups.size());
+    bool two_phase = cfg_.early_aggregation;
+    bool has_distinct = false;
+    for (const auto &spec : aggs) {
+        if (spec.distinct) {
+            has_distinct = true;
+            break;
+        }
+    }
+    if (two_phase) {
+        for (const auto &agg : aggs) {
+            const std::string &f = agg.func_name;
+            if (agg.distinct || (f != "sum" && f != "count" && f != "count_star" && f != "min" && f != "max" && f != "avg")) {
+                two_phase = false;
+                break;
+            }
+        }
+    }
+
+    auto single_phase = [&]() {
+        // AVG on a DECIMAL requires a AverageDecimalBindData to descale its result. Since we always
+        // use a null bind_data we sidestep this issue by casting to a DOUBLE.
+        std::vector<exec::AggregateSpec> specs = aggs;
+        for (auto &spec : specs) {
+            if (spec.func_name == "avg" && spec.arguments.size() == 1 &&
+                spec.arguments[0].return_type.id == TypeId::DECIMAL) {
+                spec.arguments[0] =
+                    expr::ExprNode::Cast(std::move(spec.arguments[0]), ColumnType{TypeId::DOUBLE}, /*try_cast=*/false);
+            }
+        }
+        return std::make_shared<exec::AggregateTemplate>(std::move(specs), groups);
+    };
+
+    // single-phase aggregate (no early-aggregation)
+    if (!two_phase) {
+        std::vector<uint32_t> split_keys;
+        uint32_t partitions = 1;
+        bool bare_columns = num_groups > 0;
+        for (const auto &g : groups) {
+            if (g.kind != expr::ExprKind::REFERENCE) {
+                bare_columns = false;
+                break;
+            }
+        }
+        if (bare_columns) {
+            split_keys.reserve(num_groups);
+            for (const auto &g : groups) {
+                split_keys.push_back(g.ref_index);
+            }
+            if (has_distinct && agg.children[0]->has_estimated_cardinality) {
+                // FIXME: this *8 factor is a bit arbitrary -> come up with a better solution
+                partitions = SplitCount(agg.children[0]->estimated_cardinality * 8);
+            } else if (!has_distinct && agg.has_estimated_cardinality) {
+                partitions = SplitCount(agg.estimated_cardinality);
+            } else {
+                partitions = cfg_.max_splits;
+            }
+        }
+        auto t = single_phase();
+        Schema out = exec::AggregateSchema(*t, prev->output_schema);
+        return builder_.Shuffle(std::move(prev), std::move(t), std::move(out), std::move(split_keys), partitions);
+    }
+
+    // two-phase aggregation
+    auto early_agg = std::make_shared<PlanBuilder::EarlyAggregate>();
+    early_agg->single_phase = single_phase();
+    exec::AggregateTemplate desired_templ(aggs, groups);
+    Schema desired = exec::AggregateSchema(desired_templ, prev->output_schema);
+
+    std::vector<ColumnType> key_types;
+    key_types.reserve(num_groups);
+    for (const auto &g : groups) {
+        key_types.push_back(g.return_type);
+    }
+
+    std::vector<exec::AggregateSpec> partials;
+    std::vector<exec::AggregateSpec> combines;
+    std::vector<ExprNode> finals;
+    uint32_t pcol = num_groups; // next partial output column
+    uint32_t ccol = num_groups; // next combine output column
+    bool need_projection = false;
+
+    const ColumnType kHugeint{TypeId::HUGEINT}; // sum over an integral partial
+    const ColumnType kInt64{TypeId::INT64};     // count's result
+    const ColumnType kDouble{TypeId::DOUBLE};
+
+    auto partial_ref = [&](uint32_t idx, ColumnType type) { return expr::ExprNode::Reference(idx, type); };
+
+    for (auto &agg : aggs) {
+        const std::string &f = agg.func_name;
+        if (f == "sum" || f == "min" || f == "max") {
+            // sum/min/max are self-combining and the combine preserves the type:
+            // sum(decimal(38,s))->decimal(38,s), sum(hugeint)->hugeint, etc.
+            partials.push_back({f, agg.return_type, agg.arguments});
+            uint32_t pi = pcol++;
+            combines.push_back({f, agg.return_type, {partial_ref(pi, agg.return_type)}});
+            uint32_t ci = ccol++;
+            finals.push_back(partial_ref(ci, agg.return_type));
+        } else if (f == "count" || f == "count_star") {
+            // count partial -> sum of counts; the sum widens (BIGINT->HUGEINT), so
+            // cast back to the original count type in the post-projection.
+            partials.push_back({f, agg.return_type, agg.arguments});
+            uint32_t pi = pcol++;
+            combines.push_back({"sum", kHugeint, {partial_ref(pi, agg.return_type)}});
+            uint32_t ci = ccol++;
+            finals.push_back(expr::ExprNode::Cast(partial_ref(ci, kHugeint), agg.return_type, /*try_cast=*/false));
+            need_projection = true;
+        } else { 
+            // avg = sum / count. avg is floating, so sum the argument as DOUBLE
+            // (also sidesteps DuckDB's unbound decimal-sum return type).
+            ExprNode arg_as_double = expr::ExprNode::Cast(agg.arguments.at(0), kDouble, /*try_cast=*/false);
+            partials.push_back({"sum", kDouble, {std::move(arg_as_double)}});
+            uint32_t pi_sum = pcol++;
+            partials.push_back({"count", kInt64, agg.arguments});
+            uint32_t pi_cnt = pcol++;
+
+            combines.push_back({"sum", kDouble, {partial_ref(pi_sum, kDouble)}});
+            uint32_t ci_sum = ccol++;
+            combines.push_back({"sum", kHugeint, {partial_ref(pi_cnt, kInt64)}});
+            uint32_t ci_cnt = ccol++;
+
+            ExprNode den = expr::ExprNode::Cast(partial_ref(ci_cnt, kHugeint), kDouble, false);
+            ExprNode quotient =
+                expr::ExprNode::Function("/", kDouble, {partial_ref(ci_sum, kDouble), std::move(den)});
+            finals.push_back(agg.return_type.id == TypeId::DOUBLE ? std::move(quotient)
+                             : expr::ExprNode::Cast(std::move(quotient), agg.return_type, false));
+            need_projection = true;
+        }
+    }
+
+    // early aggregation node
+    auto partial = std::make_shared<exec::AggregateTemplate>(std::move(partials), std::move(groups));
+    Schema partial_out = exec::AggregateSchema(*partial, prev->output_schema);
+    PlanBuilder::SharedOpNode produced = builder_.After(std::move(prev), std::move(partial), partial_out);
+    early_agg->partial = produced;
+
+    // final aggregation node
+    std::vector<uint32_t> split_keys;
+    uint32_t partitions = 1;
+    if (num_groups > 0) {
+        split_keys.reserve(num_groups);
+        for (uint32_t i = 0; i < num_groups; i++) {
+            split_keys.push_back(i);
+        }
+        partitions = agg.has_estimated_cardinality ? SplitCount(agg.estimated_cardinality) : cfg_.max_splits;
+    }
+    std::vector<expr::ExprNode> final_group_keys;
+    final_group_keys.reserve(num_groups);
+    for (uint32_t i = 0; i < num_groups; i++) {
+        final_group_keys.push_back(expr::ExprNode::Reference(i, key_types[i]));
+    }
+    auto final_agg = std::make_shared<exec::AggregateTemplate>(std::move(combines), std::move(final_group_keys));
+    Schema final_out = exec::AggregateSchema(*final_agg, partial_out);
+    PlanBuilder::SharedOpNode cur = builder_.Shuffle(
+        std::move(produced), std::move(final_agg), final_out, std::move(split_keys), partitions);
+
+    if (need_projection) {
+        auto proj = std::make_shared<exec::ProjectionTemplate>();
+        for (uint32_t i = 0; i < num_groups; i++) {
+            proj->projections.push_back(expr::ExprNode::Reference(i, key_types[i]));
+        }
+        for (auto &fe : finals) {
+            proj->projections.push_back(std::move(fe));
+        }
+        cur = builder_.After(std::move(cur), std::move(proj), desired);
+    }
+    if (num_groups > 0) {
+        cur->early_agg = std::move(early_agg);
+    }
+    return cur;
+}
+
+Result<PlanBuilder::SharedOpNode> Converter::BuildLimit(duckdb::LogicalLimit &limit) {
+    TRY(auto prev, Build(*limit.children[0]));
+    
+    auto t = std::make_shared<exec::LimitTemplate>();
+    if (limit.limit_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
+        t->has_limit = true;
+        t->limit = limit.limit_val.GetConstantValue();
+    } else if (limit.limit_val.Type() != duckdb::LimitNodeType::UNSET) {
+        return Error("Only constant LIMIT is supported.", ErrorKind::NotImplemented);
+    }
+    if (limit.offset_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
+        t->offset = limit.offset_val.GetConstantValue();
+    } else if (limit.offset_val.Type() != duckdb::LimitNodeType::UNSET) {
+        return Error("Only constant OFFSET is supported.", ErrorKind::NotImplemented);
+    }
+
+    Schema out = prev->output_schema; // limit preserves schema
+    // FIXME: We do not yet parallelize a global limit. As a result, this needs to gather all rows here.
+    return builder_.Shuffle(std::move(prev), std::move(t), std::move(out), {}, 1);
+}
+
+Result<PlanBuilder::SharedOpNode> Converter::BuildOrder(duckdb::LogicalOrder &order) {
+    if (!order.projection_map.empty()) {
+        return Error("Order projection_map is not supported.", ErrorKind::NotImplemented);
+    }
+
+    TRY(auto prev, Build(*order.children[0]));
+
+    std::vector<exec::SortKey> sort_keys;
+    sort_keys.reserve(order.orders.size());
+    for (auto &o : order.orders) {
+        exec::SortKey key;
+        TRY(key.expr, TranslateExpression(*o.expression));
+        key.order = (o.type == duckdb::OrderType::DESCENDING) ? exec::SortOrder::DESCENDING
+                                                                : exec::SortOrder::ASCENDING;
+        key.null_order = (o.null_order == duckdb::OrderByNullType::NULLS_FIRST)
+                                ? exec::NullOrder::NULLS_FIRST
+                                : exec::NullOrder::NULLS_LAST;
+        sort_keys.push_back(std::move(key));
+    }
+    auto t = std::make_shared<exec::SortTemplate>(std::move(sort_keys));
+
+    Schema out = prev->output_schema; // sort preserves schema
+    // FIXME: We have not yet implemented parallel sorting. As a result, we need to gather all rows here.
+    return builder_.Shuffle(std::move(prev), std::move(t), std::move(out), {}, 1);
+}
+
+Result<PlanBuilder::SharedOpNode> Converter::BuildTopN(duckdb::LogicalTopN &top) {
+    TRY(auto prev, Build(*top.children[0]));
+    
+    auto t = std::make_shared<exec::TopNTemplate>();
+    t->sort_keys.reserve(top.orders.size());
+    for (auto &o : top.orders) {
+        exec::SortKey key;
+        TRY(key.expr, TranslateExpression(*o.expression));
+        key.order = (o.type == duckdb::OrderType::DESCENDING) ? exec::SortOrder::DESCENDING
+                                                                : exec::SortOrder::ASCENDING;
+        key.null_order = (o.null_order == duckdb::OrderByNullType::NULLS_FIRST)
+                                ? exec::NullOrder::NULLS_FIRST
+                                : exec::NullOrder::NULLS_LAST;
+        t->sort_keys.push_back(std::move(key));
+    }
+    t->limit = top.limit;
+    t->offset = top.offset;
+
+    Schema schema = prev->output_schema; // top-n preserves schema
+    // FIXME: We have not yet implemented a parallel top-n. As a result, this needs to gather all rows here.
+    return builder_.Shuffle(std::move(prev), std::move(t), std::move(schema), {}, 1);
+}
+
 Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
     auto table = get.GetTable();
     std::shared_ptr<DataSource> data_source = nullptr;
     bool is_remote = false;
-    if (!table && get.function.name == kPlumeRemoteName && get.bind_data) {
+    if (!table && get.function.GetName().GetIdentifierName() == kPlumeRemoteName && get.bind_data) {
         data_source = get.bind_data->Cast<PlumeRemoteBindData>().info;
         if (!data_source->schema) {
             return Error("Remote data source should have been resolved by now.", ErrorKind::RuntimeError);
@@ -195,7 +463,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
             if (constraint->type != duckdb::ConstraintType::NOT_NULL) {
                 continue;
             }
-            idx_t col_idx = constraint->Cast<duckdb::NotNullConstraint>().index.index;
+            duckdb::idx_t col_idx = constraint->Cast<duckdb::NotNullConstraint>().index.index;
             if (col_idx < not_null_cols.size()) {
                 not_null_cols[col_idx] = true;
             }
@@ -208,9 +476,9 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
         if (cid.IsVirtualColumn()) {
             return Error("Virtual/row-id columns are not supported.", ErrorKind::NotImplemented);
         }
-        const idx_t idx = cid.GetPrimaryIndex();
+        const duckdb::idx_t idx = cid.GetPrimaryIndex();
         Column col;
-        col.name = get.names[idx];
+        col.name = get.names[idx].GetIdentifierName();
         col.type = FromLogicalType(get.returned_types[idx]);
         if (data_source && idx < data_source->schema->columns.size()) {
             col.nullable = data_source->schema->columns[idx].nullable;
@@ -224,48 +492,33 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
     
     std::vector<expr::ExprNode> filter_preds;                     // pipeline FILTER (scanned-position refs)
     std::shared_ptr<expr::ExprNode> pushed_filter_pred = nullptr; // reader pruning (storage-index refs)
-    if (!get.table_filters.filters.empty()) {
-        std::vector<duckdb::idx_t> keys;
-        for (auto &kv : get.table_filters.filters) {
-            keys.push_back(kv.first);
-        }
-
+    if (get.table_filters.HasFilters()) {
         std::vector<expr::ExprNode> pushed_filter_preds;
-        for (auto storage_idx : keys) {
-            const auto &filter = *get.table_filters.filters.at(storage_idx);
-            
-            // TODO: Skipping runtime/accelerator filters as they are not required for correctness
-            //       for now. Implement a version that fits Plume later.
-            switch (filter.filter_type) {
-            case duckdb::TableFilterType::OPTIONAL_FILTER:
-            case duckdb::TableFilterType::DYNAMIC_FILTER:
-            case duckdb::TableFilterType::BLOOM_FILTER:
-                continue;
-            default:
-                break;
+        for (auto &entry : get.table_filters) {
+            const auto pos = static_cast<uint32_t>(entry.GetIndex().GetIndex());
+            if (pos >= column_ids.size()) {
+                return Error("Pushed-down filter on a non-scanned column.", ErrorKind::RuntimeError);
             }
+            const duckdb::idx_t storage_idx = column_ids[pos].GetPrimaryIndex();
+            const auto &filter = entry.Filter();
 
             // reconstruct filter
             // TODO: is this necessary for materialized tables?
-            uint32_t pos = 0;
-            for (; pos < column_ids.size(); pos++) {
-                if (column_ids[pos].GetPrimaryIndex() == storage_idx) {
-                    break;
-                }
-            }
-            if (pos == column_ids.size()) {
-                return Error("Pushed-down filter on a non-scanned column.", ErrorKind::RuntimeError);
-            }
             auto colref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(get.returned_types[storage_idx], pos);
             TRY(auto reconstructed, TryCatch([&] { return filter.ToExpression(*colref); }));
+            TRY(reconstructed, StripRuntimeTableFilters(std::move(reconstructed)));
+            if (!reconstructed) {
+                continue; // only runtime/accelerator filters, which Plume handles differently
+            }
             TRY(auto filter_pred, TranslateExpression(*reconstructed));
             filter_preds.push_back(std::move(filter_pred));
 
             // filter pushed into stage preparation
             if (is_remote && cfg_.filter_pushdown) {
-                auto sref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
-                    get.returned_types[storage_idx], static_cast<duckdb::idx_t>(storage_idx));
+                auto sref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(get.returned_types[storage_idx],
+                                                                                storage_idx);
                 TRY(auto sreconstructed, TryCatch([&] { return filter.ToExpression(*sref); }));
+                TRY(sreconstructed, StripRuntimeTableFilters(std::move(sreconstructed)));
                 TRY(auto spred, TranslateExpression(*sreconstructed));
                 pushed_filter_preds.push_back(std::move(spred));
             }
@@ -283,7 +536,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildGet(duckdb::LogicalGet &get) {
 
     PlanBuilder::SharedOpNode cur;
     if (table) {
-        data_source = CreateTableSource(table->name, schema_scanned);
+        data_source = CreateTableSource(table->name.GetIdentifierName(), schema_scanned);
         // TODO: do we need to push a projection if not all columns are to be read here?
         cur = builder_.Scan(data_source, schema_scanned, nullptr, nullptr);
     } else if (data_source) {
@@ -353,15 +606,15 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildChunkGet(duckdb::LogicalColumn
         schema.columns.push_back(std::move(col));
     }
 
-    const std::string table_name = "__chunk_get_" + std::to_string(get.table_index);
+    const std::string table_name = "__chunk_get_" + std::to_string(get.table_index.index);
 
     std::string cols_ddl;
     for (size_t c = 0; c < num_cols; c++) {
         if (c) cols_ddl += ", ";
-        cols_ddl += duckdb::KeywordHelper::WriteQuoted(schema.columns[c].name, '"') + " " +
+        cols_ddl += duckdb::SQLQuotedIdentifier::ToString(schema.columns[c].name) + " " +
                     get.chunk_types[c].ToString();
     }
-    auto create = con_.Query("CREATE TABLE " + duckdb::KeywordHelper::WriteQuoted(table_name, '"') +
+    auto create = con_.Query("CREATE TABLE " + duckdb::SQLQuotedIdentifier::ToString(table_name) +
                              " (" + cols_ddl + ")");
     if (create->HasError()) {
         return Error("Failed to materialize CHUNK_GET table: " + create->GetError(), ErrorKind::RuntimeError);
@@ -371,7 +624,7 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildChunkGet(duckdb::LogicalColumn
     if (num_rows > 0) {
         auto rows = collection.GetRows();
         std::string insert =
-            "INSERT INTO " + duckdb::KeywordHelper::WriteQuoted(table_name, '"') + " VALUES ";
+            "INSERT INTO " + duckdb::SQLQuotedIdentifier::ToString(table_name) + " VALUES ";
         for (duckdb::idx_t r = 0; r < num_rows; r++) {
             if (r) insert += ", ";
             insert += "(";
@@ -392,201 +645,34 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildChunkGet(duckdb::LogicalColumn
     return builder_.Scan(std::move(blocks_source), schema, nullptr, nullptr);
 }
 
-Result<PlanBuilder::SharedOpNode> Converter::BuildAggregate(duckdb::LogicalAggregate &agg, 
-        PlanBuilder::SharedOpNode prev) {
-    std::vector<ExprNode> groups;
-    groups.reserve(agg.groups.size());
-    for (auto &g : agg.groups) {
-        TRY(auto key, TranslateExpression(*g));
-        groups.push_back(std::move(key));
+Result<PlanBuilder::SharedOpNode> Converter::BuildEmptyResult(duckdb::LogicalEmptyResult &empty) {
+    // DuckDB replaces subtrees it proves empty (e.g. by the sources' statistics) with an empty
+    // result: scan an empty table of its types instead.
+    Schema schema;
+    std::string cols_ddl;
+    for (size_t c = 0; c < empty.return_types.size(); c++) {
+        Column col;
+        col.name = "col" + std::to_string(c);
+        col.type = FromLogicalType(empty.return_types[c]);
+        col.nullable = true;
+        if (c) cols_ddl += ", ";
+        cols_ddl += duckdb::SQLQuotedIdentifier::ToString(col.name) + " " + empty.return_types[c].ToString();
+        schema.columns.push_back(std::move(col));
     }
-    std::vector<exec::AggregateSpec> aggs;
-    aggs.reserve(agg.expressions.size());
-    for (auto &e : agg.expressions) {
-        TRY(auto spec, TranslateAggregate(*e));
-        aggs.push_back(std::move(spec));
-    }
-
-    const uint32_t num_groups = static_cast<uint32_t>(groups.size());
-    bool two_phase = cfg_.early_aggregation;
-    bool has_distinct = false;
-    for (const auto &spec : aggs) {
-        if (spec.distinct) {
-            has_distinct = true;
-            break;
-        }
-    }
-    if (two_phase) {
-        for (const auto &agg : aggs) {
-            const std::string &f = agg.func_name;
-            if (agg.distinct || (f != "sum" && f != "count" && f != "count_star" && f != "min" && f != "max" && f != "avg")) {
-                two_phase = false;
-                break;
-            }
-        }
+    if (schema.columns.empty()) {
+        return Error("EMPTY_RESULT without columns.", ErrorKind::NotImplemented);
     }
 
-    // single-phase aggregate (no early-aggregation)
-    if (!two_phase) {
-        // AVG on a DECIMAL requires a AverageDecimalBindData to descale its result. Since we always
-        // use a null bind_data we sidestep this issue by casting to a DOUBLE.
-        for (auto &spec : aggs) {
-            if (spec.func_name == "avg" && spec.arguments.size() == 1 &&
-                spec.arguments[0].return_type.id == TypeId::DECIMAL) {
-                spec.arguments[0] =
-                    expr::ExprNode::Cast(std::move(spec.arguments[0]), ColumnType{TypeId::DOUBLE}, /*try_cast=*/false);
-            }
-        }
-        std::vector<uint32_t> split_keys;
-        uint32_t partitions = 1;
-        bool bare_columns = num_groups > 0;
-        for (const auto &g : groups) {
-            if (g.kind != expr::ExprKind::REFERENCE) {
-                bare_columns = false;
-                break;
-            }
-        }
-        if (bare_columns) {
-            split_keys.reserve(num_groups);
-            for (const auto &g : groups) {
-                split_keys.push_back(g.ref_index);
-            }
-            if (has_distinct && agg.children[0]->has_estimated_cardinality) {
-                // FIXME: this *8 factor is a bit arbitrary -> come up with a better solution
-                partitions = SplitCount(agg.children[0]->estimated_cardinality * 8);
-            } else if (!has_distinct && agg.has_estimated_cardinality) {
-                partitions = SplitCount(agg.estimated_cardinality);
-            } else {
-                partitions = cfg_.max_splits;
-            }
-        }
-        auto t = std::make_shared<exec::AggregateTemplate>(std::move(aggs), std::move(groups));
-        Schema out = exec::AggregateSchema(*t, prev->output_schema);
-        return builder_.Shuffle(std::move(prev), std::move(t), std::move(out), std::move(split_keys), partitions);
+    const std::string table_name = "__empty_result_" + std::to_string(num_empty_results_++);
+    auto create = con_.Query("CREATE OR REPLACE TABLE " + duckdb::SQLQuotedIdentifier::ToString(table_name) +
+                             " (" + cols_ddl + ")");
+    if (create->HasError()) {
+        return Error("Failed to materialize EMPTY_RESULT table: " + create->GetError(), ErrorKind::RuntimeError);
     }
 
-    // two-phase aggregation
-    exec::AggregateTemplate desired_templ(aggs, groups);
-    Schema desired = exec::AggregateSchema(desired_templ, prev->output_schema);
-
-    std::vector<ColumnType> key_types;
-    key_types.reserve(num_groups);
-    for (const auto &g : groups) {
-        key_types.push_back(g.return_type);
-    }
-
-    std::vector<exec::AggregateSpec> partials;
-    std::vector<exec::AggregateSpec> combines;
-    std::vector<ExprNode> finals;
-    uint32_t pcol = num_groups; // next partial output column
-    uint32_t ccol = num_groups; // next combine output column
-    bool need_projection = false;
-
-    const ColumnType kHugeint{TypeId::HUGEINT}; // sum over an integral partial
-    const ColumnType kInt64{TypeId::INT64};     // count's result
-    const ColumnType kDouble{TypeId::DOUBLE};
-
-    auto partial_ref = [&](uint32_t idx, ColumnType type) { return expr::ExprNode::Reference(idx, type); };
-
-    for (auto &agg : aggs) {
-        const std::string &f = agg.func_name;
-        if (f == "sum" || f == "min" || f == "max") {
-            // sum/min/max are self-combining and the combine preserves the type:
-            // sum(decimal(38,s))->decimal(38,s), sum(hugeint)->hugeint, etc.
-            partials.push_back({f, agg.return_type, agg.arguments});
-            uint32_t pi = pcol++;
-            combines.push_back({f, agg.return_type, {partial_ref(pi, agg.return_type)}});
-            uint32_t ci = ccol++;
-            finals.push_back(partial_ref(ci, agg.return_type));
-        } else if (f == "count" || f == "count_star") {
-            // count partial -> sum of counts; the sum widens (BIGINT->HUGEINT), so
-            // cast back to the original count type in the post-projection.
-            partials.push_back({f, agg.return_type, agg.arguments});
-            uint32_t pi = pcol++;
-            combines.push_back({"sum", kHugeint, {partial_ref(pi, agg.return_type)}});
-            uint32_t ci = ccol++;
-            finals.push_back(expr::ExprNode::Cast(partial_ref(ci, kHugeint), agg.return_type, /*try_cast=*/false));
-            need_projection = true;
-        } else { 
-            // avg = sum / count. avg is floating, so sum the argument as DOUBLE
-            // (also sidesteps DuckDB's unbound decimal-sum return type).
-            ExprNode arg_as_double = expr::ExprNode::Cast(agg.arguments.at(0), kDouble, /*try_cast=*/false);
-            partials.push_back({"sum", kDouble, {std::move(arg_as_double)}});
-            uint32_t pi_sum = pcol++;
-            partials.push_back({"count", kInt64, agg.arguments});
-            uint32_t pi_cnt = pcol++;
-
-            combines.push_back({"sum", kDouble, {partial_ref(pi_sum, kDouble)}});
-            uint32_t ci_sum = ccol++;
-            combines.push_back({"sum", kHugeint, {partial_ref(pi_cnt, kInt64)}});
-            uint32_t ci_cnt = ccol++;
-
-            ExprNode den = expr::ExprNode::Cast(partial_ref(ci_cnt, kHugeint), kDouble, false);
-            ExprNode quotient =
-                expr::ExprNode::Function("/", kDouble, {partial_ref(ci_sum, kDouble), std::move(den)});
-            finals.push_back(agg.return_type.id == TypeId::DOUBLE ? std::move(quotient)
-                             : expr::ExprNode::Cast(std::move(quotient), agg.return_type, false));
-            need_projection = true;
-        }
-    }
-
-    // early aggregation node
-    auto partial = std::make_shared<exec::AggregateTemplate>(std::move(partials), std::move(groups));
-    Schema partial_out = exec::AggregateSchema(*partial, prev->output_schema);
-    PlanBuilder::SharedOpNode produced = builder_.After(std::move(prev), std::move(partial), partial_out);
-
-    // final aggregation node
-    std::vector<uint32_t> split_keys;
-    uint32_t partitions = 1;
-    if (num_groups > 0) {
-        split_keys.reserve(num_groups);
-        for (uint32_t i = 0; i < num_groups; i++) {
-            split_keys.push_back(i);
-        }
-        partitions = agg.has_estimated_cardinality ? SplitCount(agg.estimated_cardinality) : cfg_.max_splits;
-    }
-    std::vector<expr::ExprNode> final_group_keys;
-    final_group_keys.reserve(num_groups);
-    for (uint32_t i = 0; i < num_groups; i++) {
-        final_group_keys.push_back(expr::ExprNode::Reference(i, key_types[i]));
-    }
-    auto final_agg = std::make_shared<exec::AggregateTemplate>(std::move(combines), std::move(final_group_keys));
-    Schema final_out = exec::AggregateSchema(*final_agg, partial_out);
-    PlanBuilder::SharedOpNode cur = builder_.Shuffle(
-        std::move(produced), std::move(final_agg), final_out, std::move(split_keys), partitions);
-
-    if (need_projection) {
-        auto proj = std::make_shared<exec::ProjectionTemplate>();
-        for (uint32_t i = 0; i < num_groups; i++) {
-            proj->projections.push_back(expr::ExprNode::Reference(i, key_types[i]));
-        }
-        for (auto &fe : finals) {
-            proj->projections.push_back(std::move(fe));
-        }
-        cur = builder_.After(std::move(cur), std::move(proj), desired);
-    }
-    return cur;
-}
-
-Result<PlanBuilder::SharedOpNode> Converter::BuildDistinct(PlanBuilder::SharedOpNode child, 
-        const std::vector<uint32_t> &cols, uint64_t card) {
-    auto t = std::make_shared<exec::AggregateTemplate>();
-    t->group_keys.reserve(cols.size());
-    for (uint32_t c : cols) {
-        const Column &col = child->output_schema.columns[c];
-        t->group_keys.push_back(expr::ExprNode::Reference(c, col.type));
-    }
-    // No aggregate expressions: the output is just the distinct group keys.
-    Schema out = exec::AggregateSchema(*t, child->output_schema);
-    return builder_.Shuffle(std::move(child), std::move(t), std::move(out), std::move(cols), SplitCount(card));
-}
-
-Result<PlanBuilder::SharedOpNode> Converter::BuildMaterializedCTE(duckdb::LogicalMaterializedCTE &cte) {
-    TRY(auto def, Build(*cte.children[0]));
-    cte_subs_[cte.table_index] = std::move(def);
-    auto body = Build(*cte.children[1]);
-    cte_subs_.erase(cte.table_index);
-    return body;
+    auto source = CreateTableSource(table_name, schema);
+    source->cardinality_total = 0;
+    return builder_.Scan(std::move(source), schema, nullptr, nullptr);
 }
 
 Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode left, 
@@ -595,8 +681,10 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
     uint32_t left_size_orig = static_cast<uint32_t>(left->output_schema.columns.size());
     uint32_t right_size_orig = static_cast<uint32_t>(right->output_schema.columns.size());
 
+    // convert join conditions
     std::vector<uint32_t> left_keys;
     std::vector<uint32_t> right_keys;
+    std::vector<bool> keys_match_null; // IS NOT DISTINCT FROM
     std::vector<const duckdb::JoinCondition *> residual_conditions;
     left_keys.reserve(join.conditions.size());
     right_keys.reserve(join.conditions.size());
@@ -606,28 +694,31 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
             continue;
         }
         uint32_t lk;
-        if (cond.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-            lk = static_cast<uint32_t>(cond.left->Cast<duckdb::BoundReferenceExpression>().index);
+        if (cond.GetLHS().GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+            lk = static_cast<uint32_t>(cond.GetLHS().Cast<duckdb::BoundReferenceExpression>().Index());
         } else {
-            TRY(auto value, TranslateExpression(*cond.left));
+            TRY(auto value, TranslateExpression(cond.GetLHS()));
             auto type = value.return_type;
-            std::tie(left, lk) = AppendColumn(builder_, std::move(left), std::move(value), type);
+            std::tie(left, lk) = builder_.AppendColumn(std::move(left), std::move(value), type);
         }
         uint32_t rk;
-        if (cond.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-            rk = static_cast<uint32_t>(cond.right->Cast<duckdb::BoundReferenceExpression>().index);
+        if (cond.GetRHS().GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+            rk = static_cast<uint32_t>(cond.GetRHS().Cast<duckdb::BoundReferenceExpression>().Index());
         } else {
-            TRY(auto value, TranslateExpression(*cond.right));
+            TRY(auto value, TranslateExpression(cond.GetRHS()));
             auto type = value.return_type;
-            std::tie(right, rk) = AppendColumn(builder_, std::move(right), std::move(value), type);
+            std::tie(right, rk) = builder_.AppendColumn(std::move(right), std::move(value), type);
         }
         left_keys.push_back(lk);
         right_keys.push_back(rk);
+        keys_match_null.push_back(cond.GetComparisonType() == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
     }
+    const bool has_equi_keys = !left_keys.empty();
 
+    // FIXME: this works but is not the ideal way to do it in Dandelion
     bool is_broadcast_join = false;
     bool duck_swapped = false;
-    if (left_keys.empty()) {
+    if (!has_equi_keys) {
         is_broadcast_join = kind == exec::JoinKind::INNER;
         duck_swapped = is_broadcast_join && right_card > left_card;
         if (duck_swapped) {
@@ -638,56 +729,74 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildJoin(PlanBuilder::SharedOpNode
 
         const auto broadcast_type = ColumnType{TypeId::INT32};
         uint32_t lk, rk;
-        std::tie(left, lk) = AppendColumn(builder_, std::move(left),
+        std::tie(left, lk) = builder_.AppendColumn(std::move(left),
             expr::ExprNode::Constant(duckdb::Value::INTEGER(0), broadcast_type), broadcast_type);
-        std::tie(right, rk) = AppendColumn(builder_, std::move(right),
+        std::tie(right, rk) = builder_.AppendColumn(std::move(right),
             expr::ExprNode::Constant(duckdb::Value::INTEGER(0), broadcast_type), broadcast_type);
         left_keys.push_back(lk);
         right_keys.push_back(rk);
     }
 
+    // build template
     auto t = std::make_shared<exec::JoinTemplate>(left_keys, right_keys, right->output_schema, kind);
     const uint32_t left_size = static_cast<uint32_t>(left->output_schema.columns.size());
     const uint32_t right_size = static_cast<uint32_t>(right->output_schema.columns.size());
-
     if (!residual_conditions.empty()) {
         std::vector<expr::ExprNode> preds;
         preds.reserve(residual_conditions.size());
+        // Before any swap, the DuckDB left child had this many columns.
+        const uint32_t duck_left_size = duck_swapped ? right_size_orig : left_size_orig;
         for (auto *cond : residual_conditions) {
-            TRY(auto lhs, TranslateExpression(*cond->left));
-            TRY(auto rhs, TranslateExpression(*cond->right));
-            OffsetReferences(duck_swapped ? lhs : rhs, left_size);
-            preds.push_back(expr::ExprNode::Comparison(cond->comparison, std::move(lhs), std::move(rhs)));
+            if (!cond->IsComparison()) {
+                // Since DuckDB v2 a join condition can be an arbitrary expression over
+                // `duck_left ++ duck_right`; remap it onto Plume's `left ++ right`.
+                TRY(auto pred, TranslateExpression(cond->GetJoinExpression()));
+                RemapCombinedJoinRefs(pred, duck_left_size, duck_swapped, left_size);
+                preds.push_back(std::move(pred));
+                continue;
+            }
+            TRY(auto lhs, TranslateExpression(cond->GetLHS()));
+            TRY(auto rhs, TranslateExpression(cond->GetRHS()));
+            expr::OffsetReferences(duck_swapped ? lhs : rhs, left_size);
+            preds.push_back(expr::ExprNode::Comparison(cond->GetComparisonType(), std::move(lhs), std::move(rhs)));
         }
         t->has_residual = true;
         t->residual = preds.size() == 1 ? std::move(preds[0])
             : expr::ExprNode::Conjunction(duckdb::ExpressionType::CONJUNCTION_AND, std::move(preds));
     }
 
-    uint32_t partitions;
+    // compute partitions
+    uint32_t probe_partitions;
     uint32_t build_partitions;
     std::vector<uint32_t> probe_split_columns;
     std::vector<uint32_t> build_split_columns;
     if (is_broadcast_join) {
-        partitions = SplitCount(left_card);
+        probe_partitions = SplitCount(left_card);
         build_partitions = 1;
         probe_split_columns.resize(left_size_orig);
         std::iota(probe_split_columns.begin(), probe_split_columns.end(), 0);
     } else {
-        partitions = SplitCount(std::max(left_card, right_card));
-        build_partitions = partitions;
+        probe_partitions = SplitCount(std::max(left_card, right_card));
+        build_partitions = probe_partitions;
         probe_split_columns = left_keys;
         build_split_columns = right_keys;
     }
     Schema natural = exec::JoinSchema(*t, left->output_schema); // the kind's natural layout
     PlanBuilder::SharedOpNode cur = builder_.Join(left, right, std::move(t), natural,
-        std::move(probe_split_columns), std::move(build_split_columns), partitions, build_partitions);
+        std::move(probe_split_columns), std::move(build_split_columns), probe_partitions, build_partitions);
+    
+    // record the join for dynamic filter planning once the graph is built
+    if (cfg_.dynamic_filter && has_equi_keys) {
+        dyn_filter_ctx_.join_index[cur.get()] = dyn_filter_ctx_.joins.size();
+        dyn_filter_ctx_.joins.push_back(EquiJoin{left, right, kind, left_keys, right_keys, keys_match_null});
+    }
 
     const bool has_left = kind != exec::JoinKind::RIGHT_SEMI && kind != exec::JoinKind::RIGHT_ANTI;
     const bool has_right = kind != exec::JoinKind::SEMI && kind != exec::JoinKind::ANTI &&
                            kind != exec::JoinKind::MARK;
     const bool has_mark = kind == exec::JoinKind::MARK;
 
+    // removed unused columns
     if (!join.left_projection_map.empty() || !join.right_projection_map.empty() ||
         left_size != left_size_orig || right_size != right_size_orig) {
         auto t2 = std::make_shared<exec::ProjectionTemplate>();
@@ -744,19 +853,29 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildDelimJoin(duckdb::LogicalCompa
     const size_t delim_idx = join.delim_flipped ? 1 : 0;
     const size_t other_idx = 1 - delim_idx;
 
+    // build delim side
     TRY(auto delim_side, Build(*join.children[delim_idx]));
 
+    // build distinct aggregate
     std::vector<uint32_t> delim_cols;
+    auto delim_templ = std::make_shared<exec::AggregateTemplate>();
     delim_cols.reserve(join.duplicate_eliminated_columns.size());
+    delim_templ->group_keys.reserve(delim_cols.size());
     for (auto &e : join.duplicate_eliminated_columns) {
         TRY(auto idx, JoinKeyIndex(*e)); // BoundReference into the delim side's output
         delim_cols.push_back(idx);
+        const Column &col = delim_side->output_schema.columns[idx];
+        delim_templ->group_keys.push_back(expr::ExprNode::Reference(idx, col.type));
     }
     if (delim_cols.empty()) {
         return Error("DELIM join without duplicate-eliminated columns.", ErrorKind::NotImplemented);
     }
+    Schema delim_schema = exec::AggregateSchema(*delim_templ, delim_side->output_schema);
+    auto delim_splits = SplitCount(join.children[delim_idx]->estimated_cardinality);
+    PlanBuilder::SharedOpNode delim = builder_.Shuffle(
+        delim_side, std::move(delim_templ), std::move(delim_schema), delim_cols, delim_splits);
 
-    TRY(auto delim, BuildDistinct(delim_side, delim_cols, join.children[delim_idx]->estimated_cardinality));
+    // build other side
     delim_stack_.push_back(std::move(delim));
     auto other_result = Build(*join.children[other_idx]); // a DELIM_GET inside resolves to the delim set
     delim_stack_.pop_back();
@@ -790,9 +909,9 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildCrossProduct(duckdb::LogicalCr
 
     const auto broadcast_type = ColumnType{TypeId::INT32};
     uint32_t lk, rk;
-    std::tie(left, lk) = AppendColumn(builder_, std::move(left),
+    std::tie(left, lk) = builder_.AppendColumn(std::move(left),
         expr::ExprNode::Constant(duckdb::Value::INTEGER(0), broadcast_type), broadcast_type);
-    std::tie(right, rk) = AppendColumn(builder_, std::move(right),
+    std::tie(right, rk) = builder_.AppendColumn(std::move(right),
         expr::ExprNode::Constant(duckdb::Value::INTEGER(0), broadcast_type), broadcast_type);
 
     auto t = std::make_shared<exec::JoinTemplate>(std::vector<uint32_t>{lk}, std::vector<uint32_t>{rk},
@@ -819,162 +938,101 @@ Result<PlanBuilder::SharedOpNode> Converter::BuildCrossProduct(duckdb::LogicalCr
     return builder_.After(std::move(cur), std::move(t2), std::move(out));
 }
 
+Result<PlanBuilder::SharedOpNode> Converter::BuildMaterializedCTE(duckdb::LogicalMaterializedCTE &cte) {
+    TRY(auto def, Build(*cte.children[0]));
+    cte_subs_[cte.table_index.index] = std::move(def);
+    auto body = Build(*cte.children[1]);
+    cte_subs_.erase(cte.table_index.index);
+    return body;
+}
+
 Result<PlanBuilder::SharedOpNode> Converter::Build(duckdb::LogicalOperator &op) {
+    Result<PlanBuilder::SharedOpNode> built = PlanBuilder::SharedOpNode{};
     switch (op.type) {
+    case LogicalOperatorType::LOGICAL_PROJECTION:
+        built = BuildProjection(op);
+        break;
+
+    case LogicalOperatorType::LOGICAL_FILTER:
+        built = BuildFilter(op.Cast<duckdb::LogicalFilter>());
+        break;
+
+    case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+        built = BuildAggregate(op.Cast<duckdb::LogicalAggregate>());
+        break;
+
+    case LogicalOperatorType::LOGICAL_LIMIT:
+        built = BuildLimit(op.Cast<duckdb::LogicalLimit>());
+        break;
+
+    case LogicalOperatorType::LOGICAL_ORDER_BY:
+        built = BuildOrder(op.Cast<duckdb::LogicalOrder>());
+        break;
+
+    case LogicalOperatorType::LOGICAL_TOP_N:
+        built = BuildTopN(op.Cast<duckdb::LogicalTopN>());
+        break;
+
     case LogicalOperatorType::LOGICAL_GET:
-        return BuildGet(op.Cast<duckdb::LogicalGet>());
+        built = BuildGet(op.Cast<duckdb::LogicalGet>());
+        break;
 
     case LogicalOperatorType::LOGICAL_CHUNK_GET:
-        return BuildChunkGet(op.Cast<duckdb::LogicalColumnDataGet>());
+        built = BuildChunkGet(op.Cast<duckdb::LogicalColumnDataGet>());
+        break;
 
-    case LogicalOperatorType::LOGICAL_PROJECTION: {
-        TRY(auto prev, Build(*op.children[0]));
-        auto t = std::make_shared<exec::ProjectionTemplate>();
-        t->projections.reserve(op.expressions.size());
-        for (auto &e : op.expressions) {
-            TRY(auto proj, TranslateExpression(*e));
-            t->projections.push_back(std::move(proj));
+    case LogicalOperatorType::LOGICAL_DELIM_GET:
+        if (delim_stack_.empty()) {
+            return Error("DELIM_GET outside of a DELIM join.", ErrorKind::NotImplemented);
         }
-        Schema out = exec::ProjectionSchema(t->projections, prev->output_schema);
-        return builder_.After(std::move(prev), std::move(t), std::move(out));
-    }
+        built = delim_stack_.back();
+        break;
 
-    case LogicalOperatorType::LOGICAL_FILTER: {
-        auto &filter = op.Cast<duckdb::LogicalFilter>();
-        TRY(auto prev, Build(*op.children[0]));
-        TRY(auto filter_expr, CombinePredicates(op.expressions));
-        auto t = std::make_shared<exec::FilterTemplate>(filter_expr);
-        Schema out = prev->output_schema; // filter preserves schema
-        PlanBuilder::SharedOpNode cur = builder_.After(std::move(prev), std::move(t), std::move(out));
-
-        if (!filter.projection_map.empty()) {
-            auto t2 = std::make_shared<exec::ProjectionTemplate>();
-            Schema pruned;
-            for (auto idx : filter.projection_map) {
-                const Column &col = cur->output_schema.columns[idx];
-                t2->projections.push_back(expr::ExprNode::Reference(static_cast<uint32_t>(idx), col.type));
-                pruned.columns.push_back(col);
-            }
-            cur = builder_.After(std::move(cur), std::move(t2), std::move(pruned));
-        }
-        return cur;
-    }
-
-    case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
-        auto &agg = op.Cast<duckdb::LogicalAggregate>();
-        if (agg.grouping_sets.size() > 1) {
-            return Error("GROUPING SETS / ROLLUP / CUBE not supported.", ErrorKind::NotImplemented);
-        }
-        TRY(auto prev, Build(*op.children[0]));
-        return BuildAggregate(agg, std::move(prev));
-    }
-
-    case LogicalOperatorType::LOGICAL_ORDER_BY: {
-        auto &order = op.Cast<duckdb::LogicalOrder>();
-        if (!order.projection_map.empty()) {
-            return Error("Order projection_map is not supported.", ErrorKind::NotImplemented);
-        }
-        TRY(auto prev, Build(*op.children[0]));
-        std::vector<exec::SortKey> sort_keys;
-        sort_keys.reserve(order.orders.size());
-        for (auto &o : order.orders) {
-            exec::SortKey key;
-            TRY(key.expr, TranslateExpression(*o.expression));
-            key.order = (o.type == duckdb::OrderType::DESCENDING) ? exec::SortOrder::DESCENDING
-                                                                  : exec::SortOrder::ASCENDING;
-            key.null_order = (o.null_order == duckdb::OrderByNullType::NULLS_FIRST)
-                                 ? exec::NullOrder::NULLS_FIRST
-                                 : exec::NullOrder::NULLS_LAST;
-            sort_keys.push_back(std::move(key));
-        }
-        auto t = std::make_shared<exec::SortTemplate>(std::move(sort_keys));
-        Schema out = prev->output_schema; // sort preserves schema
-        // A global sort is blocking: shuffle so the ordering operator sees all rows.
-        return builder_.Shuffle(std::move(prev), std::move(t), std::move(out), {}, 1);
-    }
-
-    case LogicalOperatorType::LOGICAL_LIMIT: {
-        auto &limit = op.Cast<duckdb::LogicalLimit>();
-        TRY(auto prev, Build(*op.children[0]));
-        
-        auto t = std::make_shared<exec::LimitTemplate>();
-        if (limit.limit_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
-            t->has_limit = true;
-            t->limit = limit.limit_val.GetConstantValue();
-        } else if (limit.limit_val.Type() != duckdb::LimitNodeType::UNSET) {
-            return Error("Only constant LIMIT is supported.", ErrorKind::NotImplemented);
-        }
-        if (limit.offset_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
-            t->offset = limit.offset_val.GetConstantValue();
-        } else if (limit.offset_val.Type() != duckdb::LimitNodeType::UNSET) {
-            return Error("Only constant OFFSET is supported.", ErrorKind::NotImplemented);
-        }
-        Schema out = prev->output_schema; // limit preserves schema
-        // A global limit is blocking: shuffle so the limit applies over all rows.
-        return builder_.Shuffle(std::move(prev), std::move(t), std::move(out), {}, 1);
-    }
-
-    case LogicalOperatorType::LOGICAL_TOP_N: {
-        auto &top = op.Cast<duckdb::LogicalTopN>();
-        TRY(auto prev, Build(*op.children[0]));
-        Schema schema = prev->output_schema; // top-n preserves schema
-
-        auto t = std::make_shared<exec::TopNTemplate>();
-        t->sort_keys.reserve(top.orders.size());
-        for (auto &o : top.orders) {
-            exec::SortKey key;
-            TRY(key.expr, TranslateExpression(*o.expression));
-            key.order = (o.type == duckdb::OrderType::DESCENDING) ? exec::SortOrder::DESCENDING
-                                                                   : exec::SortOrder::ASCENDING;
-            key.null_order = (o.null_order == duckdb::OrderByNullType::NULLS_FIRST)
-                                 ? exec::NullOrder::NULLS_FIRST
-                                 : exec::NullOrder::NULLS_LAST;
-            t->sort_keys.push_back(std::move(key));
-        }
-        t->limit = top.limit;
-        t->offset = top.offset;
-        // A top-k is blocking (a global operation over all rows): shuffle so it sees all rows.
-        return builder_.Shuffle(std::move(prev), std::move(t), std::move(schema), {}, 1);
-    }
-
-    case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-        return BuildComparisonJoin(op.Cast<duckdb::LogicalComparisonJoin>());
-
-    case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-        return BuildDelimJoin(op.Cast<duckdb::LogicalComparisonJoin>());
-
-    case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-        return BuildCrossProduct(op.Cast<duckdb::LogicalCrossProduct>());
-
-    case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-        return BuildMaterializedCTE(op.Cast<duckdb::LogicalMaterializedCTE>());
+    case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+        built = BuildEmptyResult(op.Cast<duckdb::LogicalEmptyResult>());
+        break;
 
     case LogicalOperatorType::LOGICAL_CTE_REF: {
         auto &ref = op.Cast<duckdb::LogicalCTERef>();
-        auto it = cte_subs_.find(ref.cte_index);
+        auto it = cte_subs_.find(ref.cte_index.index);
         if (it == cte_subs_.end()) {
             return Error("Reference to a non-materialized CTE is not supported.",
                          ErrorKind::NotImplemented);
         }
-        return it->second;
+        built = it->second;
+        break;
     }
 
-    case LogicalOperatorType::LOGICAL_DELIM_GET: {
-        if (delim_stack_.empty()) {
-            return Error("DELIM_GET outside of a DELIM join.", ErrorKind::NotImplemented);
-        }
-        return delim_stack_.back();
-    }
+    case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+        built = BuildDelimJoin(op.Cast<duckdb::LogicalComparisonJoin>());
+        break;
+
+    case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+        built = BuildComparisonJoin(op.Cast<duckdb::LogicalComparisonJoin>());
+        break;
+
+    case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+        built = BuildCrossProduct(op.Cast<duckdb::LogicalCrossProduct>());
+        break;
+
+    case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+        built = BuildMaterializedCTE(op.Cast<duckdb::LogicalMaterializedCTE>());
+        break;
 
     default:
         return Error("Unsupported logical operator '" + op.GetName() + "'.",
                      ErrorKind::NotImplemented);
     }
+
+    TRY(auto node, std::move(built));
+    if (cfg_.dynamic_filter && op.has_estimated_cardinality) {
+        dyn_filter_ctx_.node_card.try_emplace(node.get(), op.estimated_cardinality);
+    }
+    return node;
 }
 
 namespace {
 
-// Best-effort result column names from the SQL select list.
 void NameOutputColumns(duckdb::LogicalOperator &root, Schema &schema) {
     duckdb::LogicalOperator *node = &root;
     while (node->type != LogicalOperatorType::LOGICAL_PROJECTION) {
@@ -989,8 +1047,9 @@ void NameOutputColumns(duckdb::LogicalOperator &root, Schema &schema) {
         }
     }
     for (size_t i = 0; i < node->expressions.size() && i < schema.columns.size(); i++) {
-        if (!node->expressions[i]->GetName().empty())
-            schema.columns[i].name = node->expressions[i]->GetName();
+        const auto &name = node->expressions[i]->GetName().GetIdentifierName();
+        if (!name.empty())
+            schema.columns[i].name = name;
     }
 }
 

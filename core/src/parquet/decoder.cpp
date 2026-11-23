@@ -4,6 +4,8 @@
 
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 #include "snappy.h"
 
@@ -682,19 +684,28 @@ ColumnChunkReader::ColumnChunkReader(const uint8_t *data, size_t size, const Col
     // Header-only prescan: sum every data page's num_values so callers know the
     // row count up front without decoding page bodies.
     size_t p = 0;
+    bool dict_first = false;
+    bool data_all_dict = true;
     while (p < size_) {
         CompactReader reader(data_ + p, size_ - p);
         PageHeader ph = ParsePageHeader(reader);
         const size_t header_len = reader.Consumed();
         const size_t comp = static_cast<size_t>(ph.compressed_size);
         if (p + header_len + comp > size_) {
+            data_all_dict = false;
             break; // truncated tail; stop counting
+        }
+        if (p == 0) {
+            dict_first = ph.type == PAGE_DICTIONARY;
         }
         p += header_len + comp;
         if (ph.type == PAGE_DATA || ph.type == PAGE_DATA_V2) {
             total_rows_ += static_cast<size_t>(ph.num_values);
+            data_all_dict = data_all_dict &&
+                (ph.encoding == ENC_PLAIN_DICTIONARY || ph.encoding == ENC_RLE_DICTIONARY);
         }
     }
+    all_dict_ = dict_first && data_all_dict;
 }
 
 void ColumnChunkReader::SetupDictionaryPage(const uint8_t *page, size_t comp_size, size_t uncomp_size,
@@ -831,30 +842,31 @@ ColumnChunkReader &ColumnChunkReader::operator=(ColumnChunkReader &&) noexcept =
 // values are copied in bulk (dict_raw_ is already native layout); VARCHAR values
 // are copied into the vector's string heap exactly dict_size_ times (vs once per
 // row in the gather path). Index dict_size_ is an invalid null sentinel.
-void ColumnChunkReader::EnsureDictVector(const duckdb::Vector &like) {
+void ColumnChunkReader::EnsureDictVector(const duckdb::LogicalType &type) {
     using duckdb::FlatVector;
     using duckdb::string_t;
     using duckdb::StringVector;
     if (dict_vec_built_) {
         return;
     }
-    dict_vec_ = std::make_unique<duckdb::Vector>(like.GetType(), dict_size_ + 1);
+    dict_vec_ = std::make_unique<duckdb::Vector>(type, dict_size_ + 1);
     if (is_varchar_) {
-        auto *d = FlatVector::GetData<string_t>(*dict_vec_);
+        auto *d = FlatVector::GetDataMutable<string_t>(*dict_vec_);
         for (size_t i = 0; i < dict_size_; i++) {
             d[i] = StringVector::AddString(*dict_vec_, dict_views_[i].ptr, dict_views_[i].len);
         }
     } else {
-        std::memcpy(FlatVector::GetData(*dict_vec_), dict_raw_.data(), dict_size_ * stride_);
+        std::memcpy(FlatVector::GetDataMutable(*dict_vec_), dict_raw_.data(), dict_size_ * stride_);
     }
-    FlatVector::Validity(*dict_vec_).SetInvalid(dict_size_); // null sentinel
+    FlatVector::ValidityMutable(*dict_vec_).SetInvalid(dict_size_); // null sentinel
+    FlatVector::SetSize(*dict_vec_, dict_size_ + 1);
     dict_vec_built_ = true;
 }
 
 // Emit `m` rows of the current dictionary-encoded page as a DICTIONARY_VECTOR that
 // references the shared dictionary via a selection vector — no per-row value copy.
 void ColumnChunkReader::EmitDictVector(duckdb::Vector &vec, size_t m) {
-    EnsureDictVector(vec);
+    EnsureDictVector(vec.GetType());
     duckdb::SelectionVector sel(m); // owned SelectionData; shared into the dict buffer
     if (!page_has_nulls_) {
         for (size_t i = 0; i < m; i++) {
@@ -879,6 +891,27 @@ void ColumnChunkReader::EmitDictVector(duckdb::Vector &vec, size_t m) {
         }
     }
     vec.Dictionary(*dict_vec_, dict_size_ + 1, sel, m);
+}
+
+const duckdb::Vector *ColumnChunkReader::Dictionary(const duckdb::LogicalType &type) {
+    if (!all_dict_ || emitted_ > 0 || page_rows_ > 0) {
+        return nullptr;
+    }
+    if (!has_dict_) {
+        // The dictionary page leads the chunk (checked by the prescan).
+        CompactReader reader(data_ + pos_, size_ - pos_);
+        PageHeader ph = ParsePageHeader(reader);
+        const size_t header_len = reader.Consumed();
+        const size_t comp_size = static_cast<size_t>(ph.compressed_size);
+        if (ph.type != PAGE_DICTIONARY || pos_ + header_len + comp_size > size_) {
+            return nullptr;
+        }
+        SetupDictionaryPage(data_ + pos_ + header_len, comp_size, static_cast<size_t>(ph.uncompressed_size),
+                            static_cast<size_t>(ph.num_values));
+        pos_ += header_len + comp_size;
+    }
+    EnsureDictVector(type);
+    return dict_vec_.get();
 }
 
 bool ColumnChunkReader::EnterNextDataPage() {
@@ -975,8 +1008,8 @@ void ColumnChunkReader::EmitFromPage(duckdb::Vector &vec, size_t dst_off, size_t
     using duckdb::StringVector;
 
     if (is_varchar_) {
-        auto *dst = FlatVector::GetData<string_t>(vec);
-        auto &validity = FlatVector::Validity(vec);
+        auto *dst = FlatVector::GetDataMutable<string_t>(vec);
+        auto &validity = FlatVector::ValidityMutable(vec);
         for (size_t i = 0; i < m; i++) {
             if (page_has_nulls_ && page_def_[page_cursor_ + i] == 0) {
                 validity.SetInvalid(dst_off + i);
@@ -994,7 +1027,7 @@ void ColumnChunkReader::EmitFromPage(duckdb::Vector &vec, size_t dst_off, size_t
     // fully regardless of `keep` and let the caller's Slice compact.
     (void)keep;
 
-    auto *base = FlatVector::GetData(vec);
+    auto *base = FlatVector::GetDataMutable(vec);
     if (!page_has_nulls_) {
         EmitFixedNonNull(base + dst_off * stride_, m);
         return;
@@ -1002,7 +1035,7 @@ void ColumnChunkReader::EmitFromPage(duckdb::Vector &vec, size_t dst_off, size_t
 
     // Nullable: decode the run's non-null values contiguously, then scatter them
     // into the vector's row slots, marking the gaps invalid.
-    auto &validity = FlatVector::Validity(vec);
+    auto &validity = FlatVector::ValidityMutable(vec);
     size_t nn = 0;
     for (size_t i = 0; i < m; i++) {
         nn += (page_def_[page_cursor_ + i] != 0);
@@ -1051,6 +1084,9 @@ size_t ColumnChunkReader::ReadInto(duckdb::Vector &vec, size_t n, const uint8_t 
         EmitFromPage(vec, produced, m, keep);
         produced += m;
         page_cursor_ += m;
+    }
+    if (produced > 0) {
+        duckdb::FlatVector::SetSize(vec, produced);
     }
     emitted_ += produced;
     return produced;

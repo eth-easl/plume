@@ -1,13 +1,14 @@
 #include "plume/parser/physical_plan.hpp"
 
-#include "plume/common/result.hpp"
 #include "plume/execution/operators/aggregate.hpp"
+#include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
 #include "plume/execution/operators/join.hpp"
 #include "plume/execution/operators/limit.hpp"
 #include "plume/execution/operators/projection.hpp"
 #include "plume/execution/operators/sort.hpp"
 
+#include <algorithm>
 #include <sstream>
 
 namespace plume::parser {
@@ -245,6 +246,13 @@ static void PrintOperators(std::ostream &out, const exec::PipelineTemplate &pipe
             out << " ] }";
             break;
         }
+        case exec::OpType::DYNAMIC_FILTER_BUILD: {
+            const auto *d = static_cast<const exec::DynamicFilterBuildTemplate*>(op.get());
+            out << "DYNAMIC_FILTER_BUILD { filter: " << d->filter_id << ", column: "
+                << (d->column < s->columns.size() ? s->columns[d->column].name : "#" + std::to_string(d->column))
+                << ", max_values: " << d->max_values << ", bloom_bits: " << d->bloom_bits << " }";
+            break;
+        }
         default:
             out << "OP(" << static_cast<int>(op->type) << ")";
         }
@@ -291,17 +299,17 @@ static void PrintStageTree(std::ostream &out, const PhysicalPlan &plan, size_t i
     // header line
     const std::string connector = indent.empty() ? "" : (is_last ? "└─ " : "├─ ");
     out << indent << connector << "Stage #" << idx << "  ["
-        << (stage.is_leaf() ? DataSourceTypeName(static_cast<const LeafStage &>(stage).data_source->type) : "STAGE")
+        << (stage.IsLeaf() ? DataSourceTypeName(static_cast<const LeafStage &>(stage).data_source->type) : "STAGE")
         << "]";
     if (!label.empty()) out << " " << label;
-    if (stage.leads_with_join()) out << "  (join)";
+    if (stage.LeadsWithJoin()) out << "  (join)";
     out << std::endl;
 
     const std::string child_ident = indent + (is_last || indent.empty() ? "   " : "│  ");
     const std::string body_ident = child_ident + (stage.input_stages.empty() ? "  " : "│ ");
 
     // stage information (resolved from the leaf stage's data source)
-    if (stage.is_leaf()) {
+    if (stage.IsLeaf()) {
         const auto &leaf = static_cast<const LeafStage &>(stage);
         const auto &src = *leaf.data_source;
         if (leaf.data_source->type == DataSourceType::LOCAL_TABLE) {
@@ -311,7 +319,7 @@ static void PrintStageTree(std::ostream &out, const PhysicalPlan &plan, size_t i
         }
         out << body_ident << "source_splits: " << leaf.source_splits << std::endl;
     }
-    if (stage.leads_with_join()) {
+    if (stage.LeadsWithJoin()) {
         auto join = std::static_pointer_cast<exec::JoinTemplate>(stage.pipeline.operators[0]);
         out << body_ident << "input:  left ->  " << FormatSchema(stage.pipeline.input_schema) << std::endl;
         out << body_ident << "input:  right -> " << FormatSchema(join->right_schema) << std::endl;
@@ -328,6 +336,29 @@ static void PrintStageTree(std::ostream &out, const PhysicalPlan &plan, size_t i
         out << ")" << std::endl;
     }
 
+    // dynamic filters (the filter graph isn't part of the stage tree, so name both ends)
+    const auto &in_cols = stage.pipeline.input_schema.columns;
+    for (const auto &in : stage.dynamic_filter_inputs) {
+        out << body_ident << "dynfilter #" << in.filter_id << ": "
+            << (in.scan_column < in_cols.size() ? in_cols[in.scan_column].name : "#" + std::to_string(in.scan_column))
+            << " (file column " << in.file_column << ") <- Stage #" << in.source_stage
+            << (in.prune ? "  (prune)" : "  (probe)") << std::endl;
+    }
+    for (uint32_t f : stage.dynamic_filter_outputs) {
+        out << body_ident << "dynfilter #" << f << " -> ";
+        bool first = true;
+        for (const auto &consumer : plan.stages) {
+            for (const auto &in : consumer->dynamic_filter_inputs) {
+                if (in.filter_id == f && in.source_stage == idx) {
+                    out << (first ? "" : ", ") << "Stage #" << consumer->idx;
+                    first = false;
+                    break;
+                }
+            }
+        }
+        out << std::endl;
+    }
+
     // stage operators
     PrintOperators(out, stage.pipeline, body_ident);
 
@@ -337,7 +368,7 @@ static void PrintStageTree(std::ostream &out, const PhysicalPlan &plan, size_t i
         for (size_t i = 0; i < stage.input_stages.size(); i++) {
             bool child_last = (i + 1 == stage.input_stages.size());
             std::string child_label;
-            if (stage.leads_with_join() && stage.input_stages.size() == 2)
+            if (stage.LeadsWithJoin() && stage.input_stages.size() == 2)
                 child_label = (i == 0) ? "← probe" : "← build";
             PrintStageTree(out, plan, stage.input_stages[i], child_ident, child_last, child_label);
             if (!child_last) out << child_ident << "│" << std::endl;
@@ -351,12 +382,29 @@ static void PrintStageTree(std::ostream &out, const PhysicalPlan &plan, size_t i
 // Stage
 //===----------------------------------------------------------------------===//
 
+bool Stage::PrunesByDynFilter() const {
+    return std::any_of(dynamic_filter_inputs.begin(), dynamic_filter_inputs.end(),
+                       [](const DynamicFilterInput &in) { return in.prune; });
+}
+
+std::vector<uint32_t> Stage::DynFilterSourceStages(bool prune_only) const {
+    std::vector<uint32_t> out;
+    for (const auto &in : dynamic_filter_inputs) {
+        if (!prune_only || in.prune) {
+            out.push_back(in.source_stage);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 std::string Stage::ToString() const {
     std::ostringstream out;
     out << "Stage " << idx << "  ["
-        << (is_leaf() ? DataSourceTypeName(static_cast<const LeafStage &>(*this).data_source->type) : "STAGE")
+        << (IsLeaf() ? DataSourceTypeName(static_cast<const LeafStage &>(*this).data_source->type) : "STAGE")
         << "]";
-    if (leads_with_join()) out << "  (join)";
+    if (LeadsWithJoin()) out << "  (join)";
     out << std::endl;
 
     const std::string body = "   ";
@@ -369,8 +417,18 @@ std::string Stage::ToString() const {
         }
         out << std::endl;
     }
-    if (is_leaf())
-        out << body << "source: " << static_cast<const LeafStage &>(*this).data_source->name << std::endl;
+    if (IsLeaf()) {
+        auto &leaf = static_cast<const LeafStage &>(*this);
+        out << body << "source: " << leaf.data_source->name << std::endl;
+    }
+    for (const auto &in : dynamic_filter_inputs) {
+        out << body << "dynamic filter " << in.filter_id << ": column " << in.scan_column << " (file column "
+            << in.file_column << ") <- Stage " << in.source_stage << (in.prune ? " (prune)" : " (probe)")
+            << std::endl;
+    }
+    for (uint32_t f : dynamic_filter_outputs) {
+        out << body << "emits dynamic filter " << f << std::endl;
+    }
 
     PrintOperators(out, pipeline, body);
 

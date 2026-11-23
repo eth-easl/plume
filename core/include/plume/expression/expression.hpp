@@ -122,6 +122,9 @@ struct ExprNode {
     }
 };
 
+// Adds `delta` to the index of every column reference in `node`.
+void OffsetReferences(ExprNode &node, uint32_t delta);
+
 } // namespace expr
 
 using Expression = expr::ExprNode;

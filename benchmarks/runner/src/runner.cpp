@@ -102,6 +102,15 @@ Result<void> Runner::Run() {
         checksum_file_ = std::move(cf);
         LogInfo("Loaded checksums from '", config_.checksum_path, "'");
     }
+    if (!config_.dandelion_url.empty()) {
+        auto collector = DandelionTraceCollector::Init(config_.dandelion_url);
+        if (collector.is_ok()) {
+            traces_ = std::move(collector).unwrap();
+            LogDebug("Dandelion reports ", traces_->TimestampNames().size(), " timestamps");
+        } else {
+            std::cerr << "warning: not collecting dandelion traces: " << collector.error().message() << "\n";
+        }
+    }
 
     Result<void> status = Ok();
     switch (config_.type) {
@@ -140,21 +149,20 @@ Result<size_t> Runner::BuildInvocation(const std::string &key, const std::string
     auto start = std::chrono::steady_clock::now();
     TRY(auto compiled,
         parser::CompileQuery(con_, *catalog_, sql, key, config_.converter_config, config_.fetcher_threads));
-    TRY(auto body, dandelion::InvocationBody(compiled.composition, compiled.table_blocks,
-                                             compiled.remote_info, compiled.remote_requests,
-                                             /*is_registered=*/false));
+    TRY(auto body, dandelion::InvocationBody(compiled.composition, /*is_registered=*/false));
 
     auto now = std::chrono::steady_clock::now();
     int64_t planning_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
 
-    if (config_.debug_prints) {
-        LogDebug("   compiled physical plan:\n===== PHYSICAL PLAN =====\n", 
-                 compiled.plan->ToString(), "===== PHYSICAL PLAN =====");
-    }
+    LogDebug("   compiled physical plan:\n===== PHYSICAL PLAN =====\n", 
+             compiled.plan->ToString(), "===== PHYSICAL PLAN =====");
+    LogDebug("   dandelion composition:\n===== DANDELION COMPOSITION =====\n", 
+             compiled.composition.dsl, "===== DANDELION COMPOSITION =====");
 
     Invocation inv;
     inv.name = key;
     inv.body = std::move(body);
+    inv.composition_dsl = std::move(compiled.composition.dsl);
     inv.planning_ms = planning_ms;
     if (checksum_file_) {
         inv.expected_checksum = checksum_file_->Find(checksum_query, checksum_scale_factor);
@@ -175,18 +183,20 @@ Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp, std::
         return Error("dandelion request failed: " + resp.error.message, ErrorKind::Generic);
     }
     if (resp.status_code < 200 || resp.status_code >= 300) {
-        return Error("dandelion returned HTTP " + std::to_string(resp.status_code) + ": " + resp.text,
+        auto status_msg_res = dandelion::ParseStatusBody(dandelion::BinaryData(resp.text.begin(), resp.text.end()));
+        const std::string status_msg = status_msg_res.is_ok() ? std::move(status_msg_res).unwrap() : resp.text;
+        return Error("dandelion returned HTTP " + std::to_string(resp.status_code) + ": " + status_msg,
                      ErrorKind::Generic);
     }
     Invocation &inv = invocations_[idx];
 
     dandelion::BinaryData resp_body(resp.text.begin(), resp.text.end());
-    std::string timestamps;
+    std::string trace;
     if (resp_string) {
         TRY(*resp_string, dandelion::ParseAndRenderResponseBody(resp_body, inv.out_schema));
     }
 
-    TRY(auto sets, dandelion::ParseResponseBody(resp_body, &timestamps));
+    TRY(auto sets, dandelion::ParseResponseBody(resp_body, &trace));
     if (inv.expected_checksum) {
         TRY(auto actual, ComputeChecksum(sets));
         if (!(actual == *inv.expected_checksum)) {
@@ -197,7 +207,12 @@ Result<void> Runner::HandleResponse(size_t idx, const cpr::Response &resp, std::
     }
 
     inv.latencies_ms.push_back(static_cast<int64_t>(resp.elapsed * 1000.0));
-    inv.timestamps.push_back(std::move(timestamps));
+    if (traces_) {
+        auto status = traces_->AddTrace(inv.name, trace);
+        if (status.is_error()) {
+            std::cerr << "warning: dropping trace of '" << inv.name << "': " << status.error().message() << "\n";
+        }
+    }
     return Ok();
 }
 
@@ -548,20 +563,24 @@ Result<void> Runner::ExportResults() {
         }
     }
 
-    // timestamps.txt
-    {
-        std::ofstream f(config_.results_prefix + "/timestamps.txt", std::ios::trunc);
-        for (const auto &inv : invocations_) {
-            f << "Query " << inv.name << ":\n[\n";
-            for (const auto &ts : inv.timestamps) {
-                f << ts << ",\n";
-            }
-            f.seekp(-2, f.cur); // remove last ',\n'
-            f << "\n]\n";
-        }
-    }
+    LogInfo("Wrote timings.txt, planning.txt to ", config_.results_prefix);
 
-    LogInfo("Wrote timings.txt, planning.txt, timestamps.txt to ", config_.results_prefix);
+    // <name>.ddsl (a file per invocation containing the dandelion composition)
+    for (const auto &inv : invocations_) {
+        const std::string path = config_.results_prefix + "/" + inv.name + ".ddsl";
+        std::ofstream f(path, std::ios::trunc);
+        if (!f) {
+            return Error("Could not write composition file '" + path + "'");
+        }
+        f << inv.composition_dsl;
+    }
+    LogInfo("Wrote ", invocations_.size(), " composition(s) (.ddsl) to ", config_.results_prefix);
+
+    // traces.plmt.gz (only if dandelion returned traces)
+    if (traces_ && !traces_->Empty()) {
+        TRYV(traces_->ExportToFile(config_.results_prefix + "/traces.plmt.gz"));
+        LogInfo("Wrote ", traces_->Len(), " traces to traces.plmt.gz");
+    }
     return Ok();
 }
 

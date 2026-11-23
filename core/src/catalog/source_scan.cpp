@@ -155,11 +155,11 @@ std::pair<std::string, std::vector<FileRef>> RewriteSources(const std::string &s
         if (LooksLikeUrl(primary)) {
             std::string text = "plume_remote(";
             if (paths.size() == 1) {
-                text += duckdb::KeywordHelper::WriteQuoted(primary, '\'');
+                text += duckdb::SQLString::ToString(primary);
             } else {
                 text += "[";
                 for (size_t i = 0; i < paths.size(); i++) {
-                    text += (i ? ", " : "") + duckdb::KeywordHelper::WriteQuoted(paths[i], '\'');
+                    text += (i ? ", " : "") + duckdb::SQLString::ToString(paths[i]);
                 }
                 text += "]";
             }
@@ -178,7 +178,7 @@ std::pair<std::string, std::vector<FileRef>> RewriteSources(const std::string &s
             it = local_by_path.emplace(primary, locals.size()).first;
             locals.push_back(FileRef{unique, std::move(paths), /*is_remote=*/false});
         }
-        repls.push_back({b, e, duckdb::KeywordHelper::WriteQuoted(locals[it->second].alias, '"')});
+        repls.push_back({b, e, duckdb::SQLQuotedIdentifier::ToString(locals[it->second].alias)});
     };
     // Try to read a bracket-list of quoted paths/urls: ['url1', 'url2', ...].
     // If found at `i` (pointing at '['), records the multi-file source and returns

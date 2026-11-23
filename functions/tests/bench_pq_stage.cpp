@@ -2,7 +2,8 @@
 #include "plume/common/types.hpp"
 #include "plume/execution/operator.hpp"
 #include "plume/execution/pipeline.hpp"
-#include "plume/functions/output_split.hpp"
+#include "plume/util/output_split.hpp"
+#include "split_output.hpp"
 #include "plume/memory/adapter.hpp"
 #include "plume/memory/allocator.hpp"
 #include "plume/parquet/decoder.hpp"
@@ -75,7 +76,7 @@ struct OldBuilder {
     const duckdb::vector<LogicalType> *types = nullptr;
     const Schema *schema = nullptr;
     memory::Allocator *alloc = nullptr;
-    size_t target = fn::kSplitMaxBytes;
+    size_t target = util::kSplitMaxBytes;
     size_t base_overhead = 0, per_row_fixed = 0, num_nullable = 0;
 
     std::vector<std::unique_ptr<DataChunk>> pending;
@@ -102,9 +103,9 @@ struct OldBuilder {
                     pending_heap += s.size();
                 }
             }
-            dst.SetValue(col, cur, std::move(v));
+            dst.data[col].SetValue(cur, std::move(v));
         }
-        dst.SetCardinality(++cur);
+        dst.SetChildCardinality(++cur);
         pending_rows++;
         if (Estimate() >= target) {
             Flush();
@@ -150,7 +151,7 @@ void SplitOld(const exec::OutputSplit &split, const Schema &schema, const exec::
     }
     std::vector<OldBuilder> b(n);
     for (uint32_t p = 0; p < n; p++) {
-        b[p] = {&types, &schema, &alloc, fn::kSplitMaxBytes, base, per_row, nullable, {}, 0, 0, 0, 0, 0};
+        b[p] = {&types, &schema, &alloc, util::kSplitMaxBytes, base, per_row, nullable, {}, 0, 0, 0, 0, 0};
     }
     for (auto &cptr : chunks) {
         if (!cptr) {
@@ -231,7 +232,7 @@ int main(int argc, char **argv) {
             for (size_t c = 0; c < ncol; c++) {
                 readers[c].ReadInto(chunk->data[c], n);
             }
-            chunk->SetCardinality(n);
+            chunk->SetChildCardinality(n);
             rows += n;
             chunks.push_back(std::move(chunk));
         }
@@ -251,7 +252,7 @@ int main(int argc, char **argv) {
     size_t new_bytes = 0, new_blocks = 0;
     for (int rep = 0; rep < reps; rep++) {
         auto t0 = std::chrono::steady_clock::now();
-        auto parts = fn::SplitOutput(split, schema, chunks).unwrap();
+        auto parts = plume_test::SplitOutput(split, schema, chunks).unwrap();
         double ms = MsSince(t0);
         new_best = std::min(new_best, ms);
         new_bytes = 0;

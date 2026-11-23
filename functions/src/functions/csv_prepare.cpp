@@ -9,17 +9,17 @@
 #include <string>
 #include <vector>
 
-/// The first input set (index 0) should have one item containing the csv reading configuration.
+// The first input set (index 0) should have one item containing the csv reading configuration.
 #define SET_IDX_IN_CONFIG 0
-/// The second input set (index 1) should have one item containing the csv header which is expected 
-/// to contain the entire header column of the csv.
+// The second input set (index 1) should have one item containing the csv header which is expected 
+// to contain the entire header column of the csv.
 #define SET_IDX_IN_HEADER 1
-/// The third input set (index 2) should have one item containing url of the csv.
+// The third input set (index 2) should have one item containing url of the csv.
 #define SET_IDX_IN_URL 2
 
-/// The first output set (index 0) contains the csv chunk infos.
+// The first output set (index 0) contains the csv chunk infos.
 #define SET_IDX_OUT_CHUNK_INFO 0
-/// The second output set (index 1) contains the csv chunk requests to load the data.
+// The second output set (index 1) contains the csv chunk requests to load the data.
 #define SET_IDX_OUT_CHUNK_REQ 1
 
 namespace plume::fn {
