@@ -42,7 +42,7 @@ option(PLUME_BUILD_CLIENT     "Build the plume client (client)"                O
 option(PLUME_BUILD_BENCHMARKS "Build the benchmark harness"                    OFF)
 option(PLUME_BUILD_UBENCH     "Build the ubench micro-benchmark tool"          OFF)
 option(PLUME_WITH_TESTS       "Build the test suites"                          OFF)
-option(PLUME_INCLUDES         "Include additional cmake files"                 OFF)
+option(PLUME_INCLUDES         "Include additional cmake files"                 ON)
 
 # internals
 option(PLUME_RECYCLING_ALLOCATOR "Recycle small/short-lived allocations through a per-thread free-list pool instead of malloc/free" ON)
