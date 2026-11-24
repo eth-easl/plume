@@ -43,7 +43,7 @@ Executor::Executor(Allocator &alloc) : alloc_(alloc) {
     alloc_.InstallAsDuckDBDefault();
 }
 
-Result<void> Executor::Build(const PipelineTemplate &pipeline, std::unique_ptr<PartitionSink> sink) {
+Result<void> Executor::Build(const PipelineTemplate &pipeline, std::unique_ptr<Sink> sink) {
     Schema cur_schema = pipeline.input_schema;
 
     // A join may only lead the pipeline -> pull it out as the two-input source.

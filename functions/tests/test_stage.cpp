@@ -7,6 +7,7 @@
 #include "plume/common/serial.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
+#include "plume/execution/operators/output.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/expression/expression.hpp"
 #include "split_output.hpp"
@@ -58,7 +59,7 @@ DataBuffer MakeBlock(Allocator &alloc, const std::vector<int32_t> &region, const
 }
 
 uint32_t ExpectedPartition(int32_t region, uint32_t n) {
-    return static_cast<uint32_t>(Value::INTEGER(region).Hash() % n);
+    return exec::PartitionOf(Value::INTEGER(region).Hash(), n);
 }
 
 } // namespace
@@ -103,7 +104,7 @@ TEST_CASE("plume_stage: filter + hash-partitioned output") {
                 int32_t region = c->GetValue(0, r).GetValue<int32_t>();
                 int32_t amount = c->GetValue(1, r).GetValue<int32_t>();
                 CHECK(amount > 0);                                  // filter applied
-                CHECK(out->key == ExpectedPartition(region, N));    // routed to hash(region)%N
+                CHECK(out->key == ExpectedPartition(region, N));    // routed by hash(region)
                 total++;
             }
         }
@@ -223,7 +224,7 @@ TEST_CASE("SplitOutput: hash round-trip preserves rows and routes by key") {
             for (idx_t r = 0; r < c->size(); r++) {
                 int32_t region = c->GetValue(0, r).GetValue<int32_t>();
                 int32_t amount = c->GetValue(1, r).GetValue<int32_t>();
-                CHECK(sb.key == ExpectedPartition(region, N)); // routed to hash(region)%N
+                CHECK(sb.key == ExpectedPartition(region, N)); // routed by hash(region)
                 got.insert({region, amount});
             }
         }

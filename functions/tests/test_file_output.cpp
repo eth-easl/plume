@@ -1,4 +1,4 @@
-// File output: run plume_stage (passthrough pipeline) with output_sink set to CSV
+// File output: run plume_stage (passthrough pipeline) with output_config set to CSV
 // and to PARQUET, and verify the emitted host files. CSV is checked as text and
 // re-parsed via csv::ParseCSVChunk; parquet is round-tripped through Plume's own
 // reader (parquet::ParseFooter + DecodeColumnChunk).
@@ -49,13 +49,13 @@ duckdb::vector<LogicalType> MixedTypes() {
     return {LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER};
 }
 
-// Serialize a passthrough pipeline (no operators) with the given output sink.
-std::vector<uint8_t> PassthroughTemplate(const OutputSink &sink, uint32_t partitions = 1) {
+// Serialize a passthrough pipeline (no operators) with the given output config.
+std::vector<uint8_t> PassthroughTemplate(const OutputConfig &config, uint32_t partitions = 1) {
     PipelineTemplate desc;
     desc.input_schema = MixedSchema();
     desc.output_split.key_columns = {0};
     desc.output_split.partitions = partitions;
-    desc.output_sink = sink;
+    desc.output_config = config;
     return plume::SerializePipeline(desc);
 }
 
@@ -94,11 +94,11 @@ void SetStageInputs(const std::vector<uint8_t> &blob, DataBuffer block) {
 
 TEST_CASE("file output: CSV (header, quoting, nulls) via plume_stage") {
     Allocator alloc;
-    OutputSink sink;
-    sink.format = OutputFormat::CSV;
-    sink.csv.has_header = true;
-    sink.csv.delimiter = ',';
-    auto blob = PassthroughTemplate(sink);
+    OutputConfig config;
+    config.format = OutputFormat::CSV;
+    config.csv.has_header = true;
+    config.csv.delimiter = ',';
+    auto blob = PassthroughTemplate(config);
 
     // Row 1 has a name needing quoting ("a,b"); row 2 has NULL name + NULL amount.
     SetStageInputs(blob, MakeBlock(alloc, {1, 2}, {"a,b", ""}, {100, INT32_MIN}));
@@ -112,7 +112,7 @@ TEST_CASE("file output: CSV (header, quoting, nulls) via plume_stage") {
     // Re-parse the emitted CSV to round-trip back to rows.
     csv::CSVRegionInfo info;
     info.schema = MixedSchema();
-    info.options = sink.csv;
+    info.options = config.csv;
     info.logical_end = outs[0]->buffer.size();
     // ParseCSVChunk skips the first line as a partial record, so it naturally drops
     // the header row here.
@@ -130,10 +130,10 @@ TEST_CASE("file output: CSV (header, quoting, nulls) via plume_stage") {
 
 TEST_CASE("file output: CSV partitions -> one file per partition") {
     Allocator alloc;
-    OutputSink sink;
-    sink.format = OutputFormat::CSV;
-    sink.csv.has_header = false;
-    auto blob = PassthroughTemplate(sink, /*partitions=*/3);
+    OutputConfig config;
+    config.format = OutputFormat::CSV;
+    config.csv.has_header = false;
+    auto blob = PassthroughTemplate(config, /*partitions=*/3);
 
     SetStageInputs(blob, MakeBlock(alloc, {1, 2, 3, 4, 5, 6}, {"a", "b", "c", "d", "e", "f"},
                                    {10, 20, 30, 40, 50, 60}));
@@ -158,10 +158,10 @@ namespace {
 // through Plume's own reader and verify the known rows (incl. preserved nulls).
 void RunParquetAndVerify(int32_t codec) {
     Allocator alloc;
-    OutputSink sink;
-    sink.format = OutputFormat::PARQUET;
-    sink.parquet_codec = codec;
-    auto blob = PassthroughTemplate(sink);
+    OutputConfig config;
+    config.format = OutputFormat::PARQUET;
+    config.parquet_codec = codec;
+    auto blob = PassthroughTemplate(config);
 
     SetStageInputs(blob, MakeBlock(alloc, {1, 2, 3}, {"x", "", "zz"}, {10, 20, INT32_MIN}));
     CHECK(fn::RunStage().is_ok());

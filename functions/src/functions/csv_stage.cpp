@@ -35,7 +35,7 @@ Result<void> RunCSVStage() {
     exec::Executor executor(alloc);
     {
         PLUME_TRACE_STAGE(trace::Phase::SETUP);
-        TRYV(executor.Build(desc, util::MakeSink(desc.output_sink, abi::AddOutput)));
+        TRYV(executor.Build(desc, util::MakeSink(desc.output_config, abi::AddOutput)));
     }
 
     TRY(auto chunk_info_itms, abi::GetInputSet(SET_IDX_IN_CHUNK_INFO));

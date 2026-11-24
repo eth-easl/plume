@@ -200,7 +200,7 @@ Result<void> RunParquetStage() {
     exec::Executor executor(alloc);
     {
         PLUME_TRACE_STAGE(trace::Phase::SETUP);
-        TRYV(executor.Build(desc, util::MakeSink(desc.output_sink, abi::AddOutput)));
+        TRYV(executor.Build(desc, util::MakeSink(desc.output_config, abi::AddOutput)));
     }
 
     TRY(auto region_itms, abi::GetInputSet(SET_IDX_IN_REGION_INFO));

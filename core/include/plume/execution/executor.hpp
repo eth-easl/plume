@@ -20,7 +20,7 @@ public:
 
     // Builds the operator chain from the pipeline template and attaches `sink` as the streaming 
     // output terminal.
-    Result<void> Build(const PipelineTemplate &pipeline, std::unique_ptr<PartitionSink> sink);
+    Result<void> Build(const PipelineTemplate &pipeline, std::unique_ptr<Sink> sink);
 
     // Builds the operator chain from the pipeline template and attaches a BlockSink using `emit` 
     // to emit blocks.

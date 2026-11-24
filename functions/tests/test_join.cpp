@@ -5,6 +5,7 @@
 #include "test_util.hpp"
 
 #include "plume/execution/operators/join.hpp"
+#include "plume/execution/operators/output.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/functions/stage.hpp"
 #include "plume/memory/adapter.hpp"
@@ -107,7 +108,7 @@ TEST_CASE("plume_stage: inner hash join + partitioned output") {
                 int32_t rcust = c->GetValue(2, r).GetValue<int32_t>();
                 int32_t region = c->GetValue(3, r).GetValue<int32_t>();
                 CHECK(lcust == rcust);                                               // join key equality
-                CHECK(out->key == static_cast<uint32_t>(Value::INTEGER(region).Hash() % N)); // split by region
+                CHECK(out->key == exec::PartitionOf(Value::INTEGER(region).Hash(), N)); // split by region
                 got[order_id] = region;
             }
         }

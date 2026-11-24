@@ -29,21 +29,21 @@ OutputSplit OutputSplit::Deserialize(duckdb::Deserializer &d) {
 }
 
 //===----------------------------------------------------------------------===//
-// OutputSink
+// OutputConfig
 //===----------------------------------------------------------------------===//
 
-void OutputSink::Serialize(duckdb::Serializer &s) const {
+void OutputConfig::Serialize(duckdb::Serializer &s) const {
     s.WriteProperty(100, "format", static_cast<uint8_t>(format));
     s.WriteProperty(101, "csv", csv);
     s.WriteProperty(102, "parquet_codec", parquet_codec);
 }
 
-OutputSink OutputSink::Deserialize(duckdb::Deserializer &d) {
-    OutputSink sink;
-    sink.format = static_cast<OutputFormat>(d.ReadProperty<uint8_t>(100, "format"));
-    sink.csv = d.ReadProperty<csv::CSVOptions>(101, "csv");
-    sink.parquet_codec = d.ReadProperty<int32_t>(102, "parquet_codec");
-    return sink;
+OutputConfig OutputConfig::Deserialize(duckdb::Deserializer &d) {
+    OutputConfig config;
+    config.format = static_cast<OutputFormat>(d.ReadProperty<uint8_t>(100, "format"));
+    config.csv = d.ReadProperty<csv::CSVOptions>(101, "csv");
+    config.parquet_codec = d.ReadProperty<int32_t>(102, "parquet_codec");
+    return config;
 }
 
 //===----------------------------------------------------------------------===//
@@ -75,7 +75,7 @@ void PipelineTemplate::Serialize(duckdb::Serializer &s) const {
         });
     });
     s.WriteProperty(102, "output_split", output_split);
-    s.WriteProperty(103, "output_sink", output_sink);
+    s.WriteProperty(103, "output_sink", output_config);
     s.WritePropertyWithDefault(104, "dynamic_filter_probes",
         duckdb::vector<DynamicFilterProbeSpec>(dynamic_filter_probes.begin(), dynamic_filter_probes.end()));
 }
@@ -90,7 +90,7 @@ PipelineTemplate PipelineTemplate::Deserialize(duckdb::Deserializer &d) {
         });
     });
     pt.output_split = d.ReadProperty<OutputSplit>(102, "output_split");
-    pt.output_sink = d.ReadPropertyWithExplicitDefault<OutputSink>(103, "output_sink", OutputSink{});
+    pt.output_config = d.ReadPropertyWithExplicitDefault<OutputConfig>(103, "output_sink", OutputConfig{});
     auto probes = d.ReadPropertyWithDefault<duckdb::vector<DynamicFilterProbeSpec>>(104, "dynamic_filter_probes");
     pt.dynamic_filter_probes.assign(probes.begin(), probes.end());
     return pt;
