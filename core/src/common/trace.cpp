@@ -28,7 +28,7 @@ namespace {
 // dense slot: stage phases (op_index = -1) map to slot 0, operator `i` phase `p`
 // to a slot past that. We keep it simple with a flat vector indexed by
 // (op_index+1) * kNumPhases + phase.
-constexpr int kNumPhases = 4;
+constexpr int kNumPhases = 6;
 
 struct Slot {
     uint64_t total_ns = 0;

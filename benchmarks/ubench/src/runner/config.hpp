@@ -20,6 +20,7 @@ struct RunConfig {
     uint32_t repartition = 0; // override every shuffle stage's fan-out (0 -> unchanged)
     uint32_t reps = 1;       // repeat the run this many times, reporting each wall time
     bool quiet = false;      // suppress the per-rep progress prints
+    bool track_memory = false; // record each invocation's heap peak (accurate with threads = 1)
 
     // url-prefix substitutions for local fetch resolution (FROM -> TO).
     std::vector<std::pair<std::string, std::string>> rewrites;

@@ -1,0 +1,214 @@
+diff --git a/extension/core_functions/aggregate/algebraic/avg.cpp b/extension/core_functions/aggregate/algebraic/avg.cpp
+index 2b776804..bcf6e93b 100644
+--- a/extension/core_functions/aggregate/algebraic/avg.cpp
++++ b/extension/core_functions/aggregate/algebraic/avg.cpp
+@@ -5,6 +5,7 @@
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/function/function_set.hpp"
+ #include "duckdb/planner/expression.hpp"
++#include "duckdb/function/aggregate/contextless_aggregate.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -318,10 +319,9 @@ AggregateFunction GetAverageAggregate(PhysicalType type) {
+ 	}
+ }
+ 
+-unique_ptr<FunctionData> BindDecimalAvg(BindAggregateFunctionInput &input) {
+-	auto &function = input.GetBoundFunction();
+-	auto &arguments = input.GetArguments();
+-	auto decimal_type = arguments[0]->GetReturnType();
++// plume extraction patch #7: shared by BindDecimalAvg and GetContextlessDecimalAvg
++unique_ptr<FunctionData> BindDecimalAvgImplementation(BoundAggregateFunction &function,
++                                                      const LogicalType &decimal_type) {
+ 	function.ReplaceImplementation(GetAverageAggregate(decimal_type.InternalType()));
+ 	function.SetName("avg");
+ 	function.GetArguments()[0] = decimal_type;
+@@ -330,8 +330,19 @@ unique_ptr<FunctionData> BindDecimalAvg(BindAggregateFunctionInput &input) {
+ 	    Hugeint::Cast<double>(Hugeint::POWERS_OF_TEN[DecimalType::GetScale(decimal_type)]));
+ }
+ 
++unique_ptr<FunctionData> BindDecimalAvg(BindAggregateFunctionInput &input) {
++	return BindDecimalAvgImplementation(input.GetBoundFunction(), input.GetArguments()[0]->GetReturnType());
++}
++
+ } // namespace
+ 
++BoundAggregateFunction GetContextlessDecimalAvg(const LogicalType &decimal_type,
++                                                unique_ptr<FunctionData> &bind_data) {
++	BoundAggregateFunction function(GetAverageAggregate(decimal_type.InternalType()));
++	bind_data = BindDecimalAvgImplementation(function, decimal_type);
++	return function;
++}
++
+ AggregateFunctionSet AvgFun::GetFunctions() {
+ 	AggregateFunctionSet avg;
+ 
+diff --git a/extension/core_functions/aggregate/distributive/sum.cpp b/extension/core_functions/aggregate/distributive/sum.cpp
+index bcb7594c..2ec97a03 100644
+--- a/extension/core_functions/aggregate/distributive/sum.cpp
++++ b/extension/core_functions/aggregate/distributive/sum.cpp
+@@ -9,6 +9,7 @@
+ #include "duckdb/catalog/catalog.hpp"
+ #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+ #include "duckdb/function/function_binder.hpp"
++#include "duckdb/function/aggregate/contextless_aggregate.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -478,15 +479,17 @@ AggregateFunction GetDecimalSumAggregate(PhysicalType type) {
+ 	}
+ }
+ 
+-unique_ptr<FunctionData> BindDecimalSum(BindAggregateFunctionInput &input) {
+-	auto &function = input.GetBoundFunction();
+-	auto &arguments = input.GetArguments();
+-	auto decimal_type = arguments[0]->GetReturnType();
++// plume extraction patch #7: shared by BindDecimalSum and GetContextlessDecimalSum
++void BindDecimalSumImplementation(BoundAggregateFunction &function, const LogicalType &decimal_type) {
+ 	function.ReplaceImplementation(GetDecimalSumAggregate(decimal_type.InternalType()));
+ 	function.SetName("sum");
+ 	function.GetArguments()[0] = decimal_type;
+ 	function.SetReturnType(LogicalType::DECIMAL(Decimal::MAX_WIDTH_DECIMAL, DecimalType::GetScale(decimal_type)));
+ 	function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
++}
++
++unique_ptr<FunctionData> BindDecimalSum(BindAggregateFunctionInput &input) {
++	BindDecimalSumImplementation(input.GetBoundFunction(), input.GetArguments()[0]->GetReturnType());
+ 	return nullptr;
+ }
+ 
+@@ -542,6 +545,16 @@ struct BignumOperation {
+ 
+ } // namespace
+ 
++BoundAggregateFunction GetContextlessDecimalSum(const LogicalType &decimal_type) {
++	BoundAggregateFunction function(GetDecimalSumAggregate(decimal_type.InternalType()));
++	BindDecimalSumImplementation(function, decimal_type);
++	return function;
++}
++
++BoundAggregateFunction GetContextlessSumNoOverflow(const LogicalType &input_type) {
++	return BoundAggregateFunction(GetSumAggregateNoOverflow(input_type.InternalType()));
++}
++
+ AggregateFunctionSet SumFun::GetFunctions() {
+ 	AggregateFunctionSet sum;
+ 	// decimal
+diff --git a/src/function/aggregate/distributive/minmax.cpp b/src/function/aggregate/distributive/minmax.cpp
+index eaca13d6..cfeb38e6 100644
+--- a/src/function/aggregate/distributive/minmax.cpp
++++ b/src/function/aggregate/distributive/minmax.cpp
+@@ -18,6 +18,7 @@
+ #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+ #include "duckdb/planner/expression_binder.hpp"
+ #include "duckdb/main/settings.hpp"
++#include "duckdb/function/aggregate/contextless_aggregate.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -369,6 +370,18 @@ static bool MinMaxUsesCollation(ClientContext &context, const LogicalType &input
+ 	       input_type.id() == LogicalTypeId::VARIANT || varchar_collation || nested_collation;
+ }
+ 
++// plume extraction patch #7: shared by BindMinMax and GetContextlessMinMax
++template <class OP, class OP_STRING, class OP_VECTOR>
++AggregateFunction GetMinMaxImplementation(Identifier name, const LogicalType &input_type) {
++	auto minmax_func = GetMinMaxOperator<OP, OP_STRING, OP_VECTOR>(input_type);
++	minmax_func.SetName(std::move(name));
++	minmax_func.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
++	minmax_func.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
++	minmax_func.SetSingleValueIdentity(true);
++	minmax_func.SetStatisticsCallback(AggregateFunction::PropagateInputValueStats);
++	return minmax_func;
++}
++
+ template <class OP, class OP_STRING, class OP_VECTOR>
+ unique_ptr<FunctionData> BindMinMax(BindAggregateFunctionInput &input) {
+ 	auto &context = input.GetClientContext();
+@@ -396,19 +409,12 @@ unique_ptr<FunctionData> BindMinMax(BindAggregateFunctionInput &input) {
+ 	if (input_type.id() == LogicalTypeId::UNKNOWN) {
+ 		throw ParameterNotResolvedException();
+ 	}
+-	auto name = function.GetName();
+-
+ 	auto state_export_type = function.GetStateTypeCallback();
+-	auto minmax_func = GetMinMaxOperator<OP, OP_STRING, OP_VECTOR>(input_type);
++	auto minmax_func = GetMinMaxImplementation<OP, OP_STRING, OP_VECTOR>(function.GetName(), input_type);
+ 
+ 	if (state_export_type) {
+ 		minmax_func.SetStructStateExport(state_export_type);
+ 	}
+-	minmax_func.SetName(std::move(name));
+-	minmax_func.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+-	minmax_func.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
+-	minmax_func.SetSingleValueIdentity(true);
+-	minmax_func.SetStatisticsCallback(AggregateFunction::PropagateInputValueStats);
+ 
+ 	auto expr = minmax_func.Bind(context, std::move(arguments));
+ 	arguments = std::move(expr->GetChildrenMutable());
+@@ -441,6 +447,21 @@ AggregateFunction GetMinMaxOperator(const string &name) {
+ 
+ } // namespace
+ 
++BoundAggregateFunction GetContextlessMinMax(const string &name, const LogicalType &input_type) {
++	if (name != "min" && name != "max") {
++		throw InternalException("GetContextlessMinMax: expected min or max, got %s", name);
++	}
++	BoundAggregateFunction function(
++	    name == "min"
++	        ? GetMinMaxImplementation<MinOperation, MinOperationString, MinOperationVector>(Identifier(name), input_type)
++	        : GetMinMaxImplementation<MaxOperation, MaxOperationString, MaxOperationVector>(Identifier(name),
++	                                                                                         input_type));
++	// binding without casts (and OP_VECTOR::Bind) leaves the input type as argument and result type
++	function.GetArguments()[0] = input_type;
++	function.SetReturnType(input_type);
++	return function;
++}
++
+ AggregateFunction MinFunction::GetFunction() {
+ 	return GetMinMaxOperator<MinOperation, MinOperationString, MinOperationVector>("min");
+ }
+diff --git a/src/include/duckdb/function/aggregate/contextless_aggregate.hpp b/src/include/duckdb/function/aggregate/contextless_aggregate.hpp
+new file mode 100644
+index 00000000..339c7cb8
+--- /dev/null
++++ b/src/include/duckdb/function/aggregate/contextless_aggregate.hpp
+@@ -0,0 +1,37 @@
++//===----------------------------------------------------------------------===//
++//                         DuckDB
++//
++// duckdb/function/aggregate/contextless_aggregate.hpp
++//
++//===----------------------------------------------------------------------===//
++
++// plume extraction patch #7: contextless aggregate binding.
++//
++// Several aggregate overloads (min/max, sum/avg over DECIMAL) carry no kernel of their own, only a bind
++// callback that picks a type-specialized implementation, and statistics propagation can swap sum for
++// sum_no_overflow. Those callbacks take a ClientContext, which plume's function binaries do not have (they
++// run with no DuckDB instance by design), and the factories they call are file-local. These entry points
++// make the same choices without a context: each shares its code with the corresponding bind callback and
++// returns the bound function (arguments and return type set as the bind leaves them).
++
++#pragma once
++
++#include "duckdb/function/aggregate_function.hpp"
++
++namespace duckdb {
++
++//! What BindMinMax binds `name` ("min" or "max") to for an input type without a collation. No bind data.
++DUCKDB_API BoundAggregateFunction GetContextlessMinMax(const string &name, const LogicalType &input_type);
++
++//! What BindDecimalSum binds sum(decimal_type) to. No bind data.
++DUCKDB_API BoundAggregateFunction GetContextlessDecimalSum(const LogicalType &decimal_type);
++
++//! What SumPropagateStats swaps a sum over an INT32/INT64-backed input (integer or DECIMAL) for when the
++//! sum provably fits in an int64. No bind data.
++DUCKDB_API BoundAggregateFunction GetContextlessSumNoOverflow(const LogicalType &input_type);
++
++//! What BindDecimalAvg binds avg(decimal_type) to; `bind_data` receives its bind data (the decimal's scale).
++DUCKDB_API BoundAggregateFunction GetContextlessDecimalAvg(const LogicalType &decimal_type,
++                                                           unique_ptr<FunctionData> &bind_data);
++
++} // namespace duckdb

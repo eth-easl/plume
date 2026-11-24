@@ -72,6 +72,10 @@ std::shared_ptr<OperatorTemplate> OperatorTemplate::DeserializeOperator(OpType t
         if (t->has_residual) {
             t->residual = d.ReadProperty<expr::ExprNode>(106, "residual");
         }
+        const auto match_null_mask = d.ReadPropertyWithExplicitDefault<uint64_t>(107, "keys_match_null", 0);
+        for (size_t i = 0; i < t->left_keys.size(); i++) {
+            t->keys_match_null.push_back(i < 64 && ((match_null_mask >> i) & 1));
+        }
         return t;
     }
     case OpType::TOP_N: {

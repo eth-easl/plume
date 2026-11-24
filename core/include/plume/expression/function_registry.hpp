@@ -18,8 +18,14 @@ Result<duckdb::ScalarFunction> ResolveScalarFunction(const std::string &name,
 
 bool HasScalarFunction(const std::string &name);
 
-// Resolves an aggregate function by name and concrete argument types.
-Result<duckdb::AggregateFunction> ResolveAggregateFunction(
+// The type-specialized aggregate kernel + the bind data its callback expects.
+struct ResolvedAggregate {
+    duckdb::BoundAggregateFunction function;
+    duckdb::unique_ptr<duckdb::FunctionData> bind_data;
+};
+
+// Resolves an aggregate by its bound name and concrete argument types.
+Result<ResolvedAggregate> ResolveAggregateFunction(
     const std::string &name, const std::vector<duckdb::LogicalType> &arguments);
 
 } // namespace plume::expr

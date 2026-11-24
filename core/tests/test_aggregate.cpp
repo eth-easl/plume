@@ -5,6 +5,7 @@
 #include "plume/execution/operators/aggregate.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/expression/expression.hpp"
+#include "plume/expression/function_registry.hpp"
 #include "plume/memory/adapter.hpp"
 #include "plume/memory/allocator.hpp"
 
@@ -316,4 +317,86 @@ TEST_CASE("grouped aggregation: many groups force rehash + multi-chunk accumulat
 
 int main() {
     return plume_test::RunAll();
+}
+
+// Overloads that only carry a DuckDB bind callback (min/max, sum/avg over DECIMAL) and the
+// statistics-chosen sum_no_overflow are rebound without a ClientContext, with the types (and bind
+// data) DuckDB's binder would produce.
+TEST_CASE("resolve: bind-only aggregates rebind without an instance") {
+    const auto dec = LogicalType::DECIMAL(15, 2);
+    for (const char *name : {"min", "max"}) {
+        for (const auto &type : std::vector<LogicalType> {LogicalType::VARCHAR, dec, LogicalType::DATE, LogicalType::DOUBLE}) {
+            auto r = ResolveAggregateFunction(name, {type});
+            CHECK(r.is_ok());
+            CHECK(r.unwrap().function.GetReturnType() == type);
+            CHECK(r.unwrap().bind_data == nullptr);
+        }
+    }
+
+    auto sum = ResolveAggregateFunction("sum", {dec});
+    CHECK(sum.is_ok());
+    CHECK(sum.unwrap().function.GetReturnType() == LogicalType::DECIMAL(38, 2));
+
+    auto avg = ResolveAggregateFunction("avg", {dec});
+    CHECK(avg.is_ok());
+    CHECK(avg.unwrap().function.GetReturnType() == LogicalType::DOUBLE);
+    CHECK(avg.unwrap().bind_data != nullptr); // the scale avg descales by
+
+    CHECK(ResolveAggregateFunction("sum_no_overflow", {LogicalType::INTEGER}).is_ok());
+    CHECK(ResolveAggregateFunction("sum_no_overflow", {LogicalType::DECIMAL(18, 2)}).is_ok());
+    CHECK(ResolveAggregateFunction("sum_no_overflow", {LogicalType::HUGEINT}).is_error());
+
+    CHECK(ResolveAggregateFunction("min", {LogicalType::VARCHAR_COLLATION("nocase")}).is_error());
+}
+
+TEST_CASE("grouped aggregation: decimal avg descales via its bind data, min/max over VARCHAR") {
+    Allocator alloc;
+    const ColumnType dec{TypeId::DECIMAL, 15, 2};
+    Schema schema;
+    schema.columns = {{"g", I32(), false}, {"d", dec, false}, {"s", {TypeId::VARCHAR}, false}};
+    duckdb::vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::DECIMAL(15, 2), LogicalType::VARCHAR};
+    DataChunk chunk;
+    chunk.Initialize(alloc.Get(), types);
+    const std::vector<int32_t> g = {1, 1, 2, 1};
+    const std::vector<double> d = {17.50, 22.00, 5.00, 8.25};
+    const std::vector<std::string> s = {"pear", "a rather long string value", "fig", "zucchini squash"};
+    for (idx_t r = 0; r < g.size(); r++) {
+        chunk.data[0].SetValue(r, Value::INTEGER(g[r]));
+        chunk.data[1].SetValue(r, Value::DOUBLE(d[r]).DefaultCastAs(LogicalType::DECIMAL(15, 2)));
+        chunk.data[2].SetValue(r, Value(s[r]));
+    }
+    chunk.SetChildCardinality(g.size());
+    auto blk = ExportChunk(schema, chunk, alloc).unwrap();
+
+    PipelineTemplate desc;
+    desc.input_schema = schema;
+    auto agg = std::make_shared<AggregateTemplate>();
+    agg->group_keys = {RefI32(0)};
+    agg->aggregates = {
+        Agg("avg", F64(), {ExprNode::Reference(1, dec)}),
+        Agg("min", {TypeId::VARCHAR}, {ExprNode::Reference(2, {TypeId::VARCHAR})}),
+        Agg("max", {TypeId::VARCHAR}, {ExprNode::Reference(2, {TypeId::VARCHAR})}),
+    };
+    desc.operators = {agg};
+
+    Executor exec(alloc);
+    auto out = plume_test::RunBlocks(exec, desc, {{blk.data, blk.size}}, alloc);
+    CHECK(out.size() == 1);
+    DataChunk c;
+    Schema os;
+    ImportBlock(out[0].data, out[0].size, c, os).unwrap();
+    CHECK(c.size() == 2);
+    for (idx_t r = 0; r < c.size(); r++) {
+        if (c.GetValue(0, r).GetValue<int32_t>() == 1) {
+            CHECK(c.GetValue(1, r).GetValue<double>() == 47.75 / 3);
+            CHECK(c.GetValue(2, r).ToString() == "a rather long string value");
+            CHECK(c.GetValue(3, r).ToString() == "zucchini squash");
+        } else {
+            CHECK(c.GetValue(1, r).GetValue<double>() == 5.0);
+            CHECK(c.GetValue(2, r).ToString() == "fig");
+            CHECK(c.GetValue(3, r).ToString() == "fig");
+        }
+    }
+    alloc.Free(out[0].data, out[0].size);
+    alloc.Free(blk.data, blk.size);
 }

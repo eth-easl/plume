@@ -46,8 +46,7 @@ inline plume::Result<std::vector<SplitBlock>> SplitOutput(const plume::exec::Out
     for (auto &c : schema.columns) {
         types.push_back(ToLogicalType(c.type));
     }
-    // Push a zero-copy reference of each borrowed chunk so `chunks` is not consumed
-    // (the operator retains the reference until the partition flushes).
+    // Push a zero-copy reference of each borrowed chunk so `chunks` is not consumed.
     for (auto &c : chunks) {
         if (!c || c->size() == 0) {
             continue;

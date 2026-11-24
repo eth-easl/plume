@@ -69,6 +69,7 @@ The runner is configured entirely by a JSON file (see
 |-------|---------|
 | `plan` | the compiled `.ub` file to replay (**required**) |
 | `threads` | worker threads, each pinned to a core (default/`0`: hw concurrency). An **execution-resource** knob — independent of the plan's fan-out. |
+| `track_memory` | record each invocation's heap peak and input bytes in the trace (`summarize_trace.py` prints a per-stage memory table). Counts every malloc in the process, so use `"threads": 1` for exact per-invocation numbers; adds a little allocation overhead. |
 | `coreOffset` | first core to pin to (default 0) |
 | `repartition` | override the fan-out of every data-parallel (shuffle) stage to this value; gather stages (already single-partition) stay 1. Rewrites both the stage record and its pipeline template's `OutputSplit`, so use it to sweep parallelism for a fixed query. `0` (default) leaves the plan unchanged. |
 | `rewrites` | object of `FROM: TO` url-prefix substitutions for local fetch resolution |

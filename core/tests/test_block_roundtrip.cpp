@@ -1,5 +1,7 @@
 #include "test_util.hpp"
 
+#include "plume/execution/operators/output.hpp"
+#include "plume/execution/sink.hpp"
 #include "plume/memory/adapter.hpp"
 #include "plume/memory/allocator.hpp"
 #include "plume/memory/block.hpp"
@@ -10,7 +12,11 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 
+#include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <set>
+#include <string>
 
 using namespace plume;
 using namespace plume::memory;
@@ -183,6 +189,207 @@ TEST_CASE("all-valid non-nullable columns store no validity mask") {
     auto *descs = reinterpret_cast<const ColumnDescriptor *>(b.data + sizeof(BlockHeader));
     CHECK_MSG(descs[0].validity_offset == 0, "non-nullable column should have no validity region");
     alloc.Free(b.data, b.size);
+}
+
+namespace {
+
+std::string RenderRow(DataChunk &chunk, idx_t r) {
+    std::string s;
+    for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+        auto v = chunk.GetValue(c, r);
+        s += (v.IsNull() ? std::string("NULL") : v.ToString()) + "|";
+    }
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("split output: flat/dictionary/constant inputs, NULLs and long strings, 1..64 partitions") {
+    Allocator alloc;
+    Schema schema;
+    schema.columns = {{"k", {TypeId::INT64}, false},
+                      {"i", {TypeId::INT32}, true},
+                      {"s", {TypeId::VARCHAR}, true},
+                      {"h", {TypeId::HUGEINT}, true},
+                      {"b", {TypeId::BOOLEAN}, true}};
+    const duckdb::vector<LogicalType> types = {LogicalType::BIGINT, LogicalType::INTEGER, LogicalType::VARCHAR,
+                                               LogicalType::HUGEINT, LogicalType::BOOLEAN};
+    auto flat = [&](idx_t rows, int64_t seed) {
+        auto chunk = std::make_unique<DataChunk>();
+        chunk->Initialize(alloc.Get(), types, rows);
+        for (idx_t r = 0; r < rows; r++) {
+            const int64_t v = seed + int64_t(r);
+            chunk->data[0].SetValue(r, Value::BIGINT(v * 7919 % 1000));
+            chunk->data[1].SetValue(r, v % 5 == 0 ? Value(LogicalType::INTEGER) : Value::INTEGER(int32_t(v)));
+            chunk->data[2].SetValue(r, v % 7 == 0   ? Value(LogicalType::VARCHAR)
+                                       : v % 2 == 0 ? Value("s" + std::to_string(v))
+                                                    : Value("a long string that is not inlined " + std::to_string(v)));
+            chunk->data[3].SetValue(r, v % 3 == 0 ? Value(LogicalType::HUGEINT) : Value::HUGEINT(hugeint_t(v) * 1000003));
+            chunk->data[4].SetValue(r, v % 11 == 0 ? Value(LogicalType::BOOLEAN) : Value::BOOLEAN(v % 2 == 0));
+        }
+        chunk->SetChildCardinality(rows);
+        return chunk;
+    };
+    // Each generator makes a fresh input chunk (pushing consumes it).
+    std::vector<std::function<std::unique_ptr<DataChunk>()>> inputs = {
+        [&] { return flat(5000, 0); }, // larger than a vector
+        [&] {                          // every column a dictionary (every third row, reversed)
+            auto chunk = flat(STANDARD_VECTOR_SIZE, 10000);
+            duckdb::SelectionVector sel(STANDARD_VECTOR_SIZE);
+            idx_t n = 0;
+            for (idx_t r = STANDARD_VECTOR_SIZE; r-- > 0;) {
+                if (r % 3 == 0) {
+                    sel.set_index(n++, r);
+                }
+            }
+            chunk->Slice(sel, n);
+            return chunk;
+        },
+        [&] { // constant payload columns
+            auto chunk = flat(1000, 20000);
+            chunk->data[1].Reference(Value::INTEGER(7), duckdb::count_t(1000));
+            chunk->data[2].Reference(Value("a constant string too long to be inlined"), duckdb::count_t(1000));
+            chunk->data[3].Reference(Value(LogicalType::HUGEINT), duckdb::count_t(1000));
+            chunk->data[4].Reference(Value::BOOLEAN(true), duckdb::count_t(1000));
+            return chunk;
+        },
+        [&] { // constant key: a single partition gets the whole chunk
+            auto chunk = flat(777, 30000);
+            chunk->data[0].Reference(Value::BIGINT(42), duckdb::count_t(777));
+            return chunk;
+        },
+        [&] { return flat(63, 40000); }, // a row count off the validity word size
+    };
+    std::multiset<std::string> expected;
+    for (auto &make : inputs) {
+        auto chunk = make();
+        for (idx_t r = 0; r < chunk->size(); r++) {
+            expected.insert(RenderRow(*chunk, r));
+        }
+    }
+
+    for (uint32_t partitions : {1u, 7u, 64u}) {
+        std::vector<std::pair<size_t, DataBuffer>> out;
+        auto sink = std::make_unique<exec::BlockSink>(
+            [&](const std::string &, size_t, DataBuffer buf, size_t key) { out.emplace_back(key, std::move(buf)); },
+            16u << 10); // small blocks: several flushes per partition
+        auto op = exec::MakeOutputOperator(schema, {0}, partitions, std::move(sink));
+        for (auto &make : inputs) {
+            op->Push(make()).unwrap();
+        }
+        op->Finish().unwrap();
+
+        std::multiset<std::string> got;
+        for (auto &[key, buf] : out) {
+            DataChunk chunk;
+            Schema parsed;
+            ImportBlock(buf.mutable_data(), buf.size(), chunk, parsed).unwrap();
+            CHECK(parsed.size() == schema.size());
+            for (idx_t r = 0; r < chunk.size(); r++) {
+                got.insert(RenderRow(chunk, r));
+                if (partitions > 1) {
+                    CHECK(key == exec::PartitionOf(chunk.GetValue(0, r).Hash(), partitions));
+                }
+            }
+        }
+        CHECK_MSG(got == expected, "split output rows differ from the input at " + std::to_string(partitions) +
+                                       " partitions");
+    }
+}
+
+TEST_CASE("export zeroes every byte outside the written regions") {
+    Allocator alloc;
+    Schema s;
+    s.columns = {{"a", {TypeId::INT8}, true}, {"b", {TypeId::VARCHAR}, true}, {"c", {TypeId::INT32}, true}};
+    duckdb::vector<LogicalType> types = {LogicalType::TINYINT, LogicalType::VARCHAR, LogicalType::INTEGER};
+    DataChunk c;
+    c.Initialize(alloc.Get(), types);
+    for (idx_t r = 0; r < 13; r++) {
+        c.data[0].SetValue(r, Value::TINYINT(int8_t(r)));
+        c.data[1].SetValue(r, Value("string number " + std::to_string(r)));
+        c.data[2].SetValue(r, Value::INTEGER(int32_t(r)));
+    }
+    c.SetChildCardinality(13);
+    // Export again right after freeing a junk-filled buffer of the same size, which malloc will
+    // likely hand back: the bytes must still match the first export.
+    OwnedBlock clean = ExportChunk(s, c, alloc).unwrap();
+    std::vector<ChunkSelection> parts = {{&c, nullptr, 13}};
+    void *junk = std::malloc(clean.size);
+    std::memset(junk, 0xAB, clean.size);
+    std::free(junk);
+    DataBuffer dirty = ExportSelection(s, parts).unwrap();
+    CHECK(dirty.size() == clean.size);
+    CHECK_MSG(std::memcmp(dirty.data(), clean.data, clean.size) == 0, "export left stale bytes in the block");
+    alloc.Free(clean.data, clean.size);
+}
+
+TEST_CASE("BlockWriter: growing, full, heap-limited, oversized-row and partial blocks match the reference export") {
+    Allocator alloc;
+    for (auto [max_bytes, total] : std::vector<std::pair<size_t, int>> {{8u << 10, 3000}, {256u << 10, 30000}}) {
+        Schema schema;
+        schema.columns = {{"a", {TypeId::INT8}, true}, {"s", {TypeId::VARCHAR}, true}, {"b", {TypeId::INT64}, false}};
+        const duckdb::vector<LogicalType> types = {LogicalType::TINYINT, LogicalType::VARCHAR, LogicalType::BIGINT};
+        // Short strings first (the heap estimate starts low), then long ones (the heap fills before the
+        // row capacity), one string larger than a whole block, then short ones again.
+        std::vector<std::string> strs;
+        for (int i = 0; i < total; i++) {
+            strs.push_back(i < total / 3 ? "s" + std::to_string(i)
+                                    : (i == 2001 ? std::string(20000, 'z') : std::string(i % 2 ? 40 : 3, 'x') + std::to_string(i)));
+        }
+        memory::BlockWriter writer(schema, max_bytes);
+        std::vector<DataBuffer> blocks;
+        std::multiset<std::string> expected;
+        for (idx_t begin = 0; begin < strs.size(); begin += 700) {
+            const idx_t n = std::min<idx_t>(700, strs.size() - begin);
+            DataChunk chunk;
+            chunk.Initialize(alloc.Get(), types, n);
+            for (idx_t r = 0; r < n; r++) {
+                const idx_t i = begin + r;
+                chunk.data[0].SetValue(r, i % 9 == 0 ? Value(LogicalType::TINYINT) : Value::TINYINT(int8_t(i % 100)));
+                chunk.data[1].SetValue(r, i % 13 == 0 ? Value(LogicalType::VARCHAR) : Value(strs[i]));
+                chunk.data[2].SetValue(r, Value::BIGINT(int64_t(i)));
+            }
+            chunk.SetChildCardinality(n);
+            // Append every other row through a selection, starting at odd offsets.
+            std::vector<duckdb::sel_t> sel;
+            for (idx_t r = 1; r < n; r += 2) {
+                sel.push_back(duckdb::sel_t(r));
+                expected.insert(RenderRow(chunk, r));
+            }
+            duckdb::UnifiedVectorFormat formats[3];
+            for (idx_t c = 0; c < 3; c++) {
+                chunk.data[c].ToUnifiedFormat(formats[c]);
+            }
+            for (idx_t done = 0; done < sel.size();) {
+                done += writer.Append(formats, sel.data(), done, sel.size() - done);
+                if (done < sel.size()) {
+                    blocks.push_back(writer.Finish());
+                }
+            }
+        }
+        blocks.push_back(writer.Finish());
+        CHECK(blocks.size() > 3);
+
+        std::multiset<std::string> got;
+        for (auto &block : blocks) {
+            auto *h = reinterpret_cast<const BlockHeader *>(block.data());
+            CHECK(h->total_size == block.size());
+            CHECK_MSG(block.size() <= max_bytes || h->row_count == 1, "block over the cap with more than one row");
+            std::vector<uint8_t> pristine(block.data(), block.data() + block.size());
+            DataChunk chunk;
+            Schema parsed;
+            ImportBlock(block.mutable_data(), block.size(), chunk, parsed).unwrap();
+            for (idx_t r = 0; r < chunk.size(); r++) {
+                got.insert(RenderRow(chunk, r));
+            }
+            OwnedBlock again = ExportChunk(parsed, chunk, alloc).unwrap();
+            CHECK(again.size == pristine.size());
+            CHECK_MSG(again.size == pristine.size() && std::memcmp(again.data, pristine.data(), again.size) == 0,
+                      "BlockWriter block differs from the reference export of its rows");
+            alloc.Free(again.data, again.size);
+        }
+        CHECK_MSG(got == expected, "BlockWriter lost or changed rows");
+    }
 }
 
 int main() {

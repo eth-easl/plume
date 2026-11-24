@@ -23,60 +23,13 @@ namespace {
 constexpr int64_t kFooterProbe = 256 << 10; // 256 KiB
 constexpr int64_t kMaxPageIndexBytes = 16 << 20; // fetch no more of a file's page indexes
 
-int64_t LE(const uint8_t *p, size_t n) {
-    uint64_t v = 0;
-    for (size_t i = 0; i < n; i++) {
-        v |= static_cast<uint64_t>(p[i]) << (8 * i);
+// A min/max statistic as a Value DuckDB's column statistics can carry. Strings are left out: their
+// parquet bounds may be truncated, and only numeric, temporal and decimal bounds are reported.
+std::optional<duckdb::Value> DecodeBound(const ColumnType &type, const std::vector<uint8_t> &bytes) {
+    if (type.id == TypeId::VARCHAR) {
+        return std::nullopt;
     }
-    return static_cast<int64_t>(v);
-}
-
-// Decode a parquet PLAIN-encoded min/max value into a typed duckdb Value plus a sort key for 
-// cross-row-group aggregation.
-// TODO: missing temporal/decimal/string min/max support
-bool DecodeNumeric(const ColumnType &t, const std::vector<uint8_t> &b, double &key, duckdb::Value &val) {
-    switch (t.id) {
-    case TypeId::INT8:
-        if (b.size() < 4) return false;
-        val = duckdb::Value::TINYINT(static_cast<int8_t>(LE(b.data(), 4)));
-        key = static_cast<double>(static_cast<int8_t>(LE(b.data(), 4)));
-        return true;
-    case TypeId::INT16:
-        if (b.size() < 4) return false;
-        val = duckdb::Value::SMALLINT(static_cast<int16_t>(LE(b.data(), 4)));
-        key = static_cast<double>(static_cast<int16_t>(LE(b.data(), 4)));
-        return true;
-    case TypeId::INT32:
-        if (b.size() < 4) return false;
-        val = duckdb::Value::INTEGER(static_cast<int32_t>(LE(b.data(), 4)));
-        key = static_cast<double>(static_cast<int32_t>(LE(b.data(), 4)));
-        return true;
-    case TypeId::INT64:
-        if (b.size() < 8) return false;
-        val = duckdb::Value::BIGINT(LE(b.data(), 8));
-        key = static_cast<double>(LE(b.data(), 8));
-        return true;
-    case TypeId::FLOAT: {
-        if (b.size() < 4) return false;
-        uint32_t bits = static_cast<uint32_t>(LE(b.data(), 4));
-        float f;
-        std::memcpy(&f, &bits, 4);
-        val = duckdb::Value::FLOAT(f);
-        key = f;
-        return true;
-    }
-    case TypeId::DOUBLE: {
-        if (b.size() < 8) return false;
-        uint64_t bits = static_cast<uint64_t>(LE(b.data(), 8));
-        double d;
-        std::memcpy(&d, &bits, 8);
-        val = duckdb::Value::DOUBLE(d);
-        key = d;
-        return true;
-    }
-    default:
-        return false; // BOOLEAN/VARCHAR/DECIMAL/DATE/TIME/HUGEINT: distinct+null only
-    }
+    return parquet::DecodeStat(bytes, type);
 }
 
 RemoteColumnStats AggregateColumnStats(const ColumnType &type,
@@ -91,20 +44,19 @@ RemoteColumnStats AggregateColumnStats(const ColumnType &type,
             min_known = max_known = all_have_null_count = false;
             continue;
         }
-        double k;
-        duckdb::Value v;
-        if (min_known && cs->has_min && DecodeNumeric(type, cs->min_value, k, v)) {
-            if (!out.has_min || v < out.min_value) {
+        std::optional<duckdb::Value> v;
+        if (min_known && cs->has_min && (v = DecodeBound(type, cs->min_value))) {
+            if (!out.has_min || *v < out.min_value) {
                 out.has_min = true;
-                out.min_value = std::move(v);
+                out.min_value = std::move(*v);
             }
         } else {
             min_known = false;
         }
-        if (max_known && cs->has_max && DecodeNumeric(type, cs->max_value, k, v)) {
-            if (!out.has_max || out.max_value < v) {
+        if (max_known && cs->has_max && (v = DecodeBound(type, cs->max_value))) {
+            if (!out.has_max || out.max_value < *v) {
                 out.has_max = true;
-                out.max_value = std::move(v);
+                out.max_value = std::move(*v);
             }
         } else {
             max_known = false;

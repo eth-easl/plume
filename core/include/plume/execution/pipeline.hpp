@@ -30,13 +30,13 @@ enum class OutputFormat : uint8_t {
     PARQUET = 2
 };
 
-struct OutputSink {
+struct OutputConfig {
     OutputFormat format = OutputFormat::PLUME_BLOCKS;
     csv::CSVOptions csv;        // CSV only
     int32_t parquet_codec = 0;  // PARQUET only (0 = UNCOMPRESSED)
 
     void Serialize(duckdb::Serializer &s) const;
-    static OutputSink Deserialize(duckdb::Deserializer &d);
+    static OutputConfig Deserialize(duckdb::Deserializer &d);
 };
 
 struct DynamicFilterProbeSpec {
@@ -52,7 +52,7 @@ struct PipelineTemplate {
     Schema input_schema;
     std::vector<std::shared_ptr<OperatorTemplate>> operators;
     OutputSplit output_split;
-    OutputSink output_sink;
+    OutputConfig output_config;
     std::vector<DynamicFilterProbeSpec> dynamic_filter_probes;
 
     void Serialize(duckdb::Serializer &s) const;
