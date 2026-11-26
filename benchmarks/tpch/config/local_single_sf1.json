@@ -7,13 +7,12 @@
 
     "tablePathPrefix": "http://127.0.0.1:7777/tpch1",
     "tablePathSuffix": ".parquet",
-    "tableNumFiles": { "lineitem": 1, "orders": 1, "partsupp": 1 },
     "scaleFactor": "sf1",
     "checksumFile": "~/plume/benchmarks/tpch/config/checksums.json",
 
     "dandelionUrl": "http://localhost:8080",
     "requestTimeout": 30,
-    "resultsPrefix": "~/plume_results/local_single_sf1",
+    "resultsPrefix": "~/plume_results/tpch_local_single_sf1",
     "debugPrints": false,
     "maxSplits": 12,
     "targetRowsPerSplit": 131072,

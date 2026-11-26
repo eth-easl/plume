@@ -5,17 +5,16 @@
                 "q16.sql", "q17.sql", "q18.sql", "q19.sql", "q20.sql", "q21.sql", "q22.sql"],
     "queryStoragePrefix": "~/plume/benchmarks/tpch/queries",
 
-    "tablePathPrefix": "https://tpc-h-sf-100-ireland.s3.eu-west-1.amazonaws.com",
+    "tablePathPrefix": "https://plume-exp-tpch.s3.eu-west-1.amazonaws.com/plume-tpch-sf100",
     "tablePathSuffix": ".parquet",
-    "tableNumFiles": { "lineitem": 16, "orders": 16, "partsupp": 16 },
     "scaleFactor": "sf100",
     "checksumFile": "~/plume/benchmarks/tpch/config/checksums.json",
 
     "dandelionUrl": "http://<dandelion_url>:8080",
     "requestTimeout": 60,
-    "resultsPrefix": "~/plume_results/aws_single_sf100",
+    "resultsPrefix": "~/plume_results/tpch_aws_single_sf100",
     "debugPrints": false,
-    "maxSplits": 180,
+    "maxSplits": 30,
     "targetRowsPerSplit": 131072,
     "dynamicFilter": true,
 

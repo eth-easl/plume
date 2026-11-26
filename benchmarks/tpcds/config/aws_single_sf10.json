@@ -12,9 +12,8 @@
                 "q91.sql", "q92.sql", "q93.sql", "q94.sql", "q95.sql", "q96.sql", "q97.sql", "q98.sql", "q99.sql"],
     "queryStoragePrefix": "~/plume/benchmarks/tpcds/queries",
 
-    "tablePathPrefix": "https://tpc-ds-sf-10-ireland.s3.eu-west-1.amazonaws.com",
+    "tablePathPrefix": "https://plume-exp-tpcds.s3.eu-west-1.amazonaws.com/plume-tpcds-sf10",
     "tablePathSuffix": ".parquet",
-    "tableNumFiles": { "store_sales": 2, "catalog_sales": 2, "web_sales": 2, "inventory": 2 },
     "scaleFactor": "sf10",
     "checksumFile": "~/plume/benchmarks/tpcds/config/checksums.json",
 

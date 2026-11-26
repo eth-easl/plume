@@ -14,13 +14,12 @@
 
     "tablePathPrefix": "http://127.0.0.1:7777/tpcds1",
     "tablePathSuffix": ".parquet",
-    "tableNumFiles": { "store_sales": 1, "catalog_sales": 1, "web_sales": 1, "inventory": 1 },
     "scaleFactor": "sf1",
     "checksumFile": "~/plume/benchmarks/tpcds/config/checksums.json",
 
     "dandelionUrl": "http://localhost:8080",
     "requestTimeout": 30,
-    "resultsPrefix": "~/plume_results/tpcds_local_sf1_single",
+    "resultsPrefix": "~/plume_results/tpcds_local_single_sf1",
     "debugPrints": false,
     "maxSplits": 12,
     "targetRowsPerSplit": 131072,

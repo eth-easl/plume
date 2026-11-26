@@ -1,0 +1,21 @@
+{
+    "benchmarkType": "single",
+    "queries": ["q1.sql", "q2.sql", "q3.sql", "q4.sql", "q5.sql", "q6.sql", "q7.sql", "q8.sql",
+                "q9.sql", "q10.sql", "q11.sql", "q12.sql", "q13.sql", "q14.sql", "q15.sql",
+                "q16.sql", "q17.sql", "q18.sql", "q19.sql", "q20.sql", "q21.sql", "q22.sql"],
+    "queryStoragePrefix": "~/plume/benchmarks/tpch/queries",
+
+    "tablePathPrefix": "https://plume-exp-tpch.s3.eu-west-1.amazonaws.com/plume-tpch-sf1000",
+    "tablePathSuffix": ".parquet",
+    "scaleFactor": "sf1000",
+    "checksumFile": "~/plume/benchmarks/tpch/config/checksums.json",
+
+    "dandelionUrl": "http://<dandelion_url>:8080",
+    "requestTimeout": 300,
+    "resultsPrefix": "~/plume_results/tpch_aws_single_sf1000",
+    "debugPrints": false,
+    "maxSplits": 180,
+    "targetRowsPerSplit": 131072,
+
+    "benchmarkConfig": { "repetitions": 3 }
+}
