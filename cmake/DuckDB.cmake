@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-#  DuckDB v1.5.4 (pinned)
+#  DuckDB v2.0.0 (pinned)
 #   We link against the full duckdb_static archive; the linker selects only
 #   the translation units the kernels actually need. Exposed to the rest of the
 #   build as the INTERFACE target `plume_duckdb` (include dirs + archives).
@@ -18,19 +18,6 @@ set(DUCKDB_STATIC_LIB "${DUCKDB_BUILD_DIR}/src/libduckdb_static.a"
 set(DUCKDB_CORE_FUNCTIONS_LIB
     "${DUCKDB_BUILD_DIR}/extension/core_functions/libcore_functions_extension.a"
     CACHE FILEPATH "Prebuilt core_functions extension archive")
-# duckdb_static declares ExtensionHelper::LoadAllExtensions (called from every
-# DuckDB::DuckDB(...) construction) but does not define it -- DuckDB expects
-# consumers to link either its own real extension-loading glue or a stub.
-# This is the no-op stub (see external/duckdb/extension/loader/dummy_static_extension_loader.cpp),
-# for consumers that only need the statically-linked archives above and never
-# touch DuckDB's dynamic extension/catalog registration. The client links its
-# own real implementation instead (client/src/duckdb/duckdb_glue.cpp) because
-# it needs a live read_parquet, so this is NOT part of the shared
-# plume_duckdb interface below -- link it explicitly where needed.
-set(DUCKDB_DUMMY_EXTENSION_LOADER_LIB
-    "${DUCKDB_BUILD_DIR}/extension/libdummy_static_extension_loader.a"
-    CACHE FILEPATH "Prebuilt no-op ExtensionHelper::LoadAllExtensions stub")
-
 set(DUCKDB_INCLUDE_DIRS
   ${DUCKDB_DIR}/src/include
   ${DUCKDB_DIR}/extension/core_functions/include

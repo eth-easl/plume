@@ -44,8 +44,8 @@ ProjectionOperator::ProjectionOperator(duckdb::vector<unique_ptr<duckdb::Express
     : Operator(std::move(output_types)), expressions_(std::move(expressions)), alloc_(alloc) {
     references_only_ = true;
     for (auto &expr : expressions_) {
-        if (expr->type == duckdb::ExpressionType::BOUND_REF) {
-            ref_indices_.push_back(expr->Cast<duckdb::BoundReferenceExpression>().index);
+        if (expr->GetExpressionType() == duckdb::ExpressionType::BOUND_REF) {
+            ref_indices_.push_back(expr->Cast<duckdb::BoundReferenceExpression>().Index());
         } else {
             references_only_ = false;
         }
@@ -71,7 +71,7 @@ Result<void> ProjectionOperator::Push(std::unique_ptr<DataChunk> chunk) {
         for (size_t i = 0; i < ref_indices_.size(); i++) {
             result->data[i].Reference(chunk->data[ref_indices_[i]]);
         }
-        result->SetCardinality(chunk->size());
+        result->SetChildCardinality(chunk->size());
     } else {
         result->Initialize(alloc_.Get(), output_types_);
         executor_.Execute(*chunk, *result);
@@ -97,7 +97,7 @@ Result<std::unique_ptr<Operator>> BuildProjectionTemplate(std::shared_ptr<Projec
     exprs.reserve(templ->projections.size());
     for (auto &pe : templ->projections) {
         TRY(auto built, BuildExpression(pe));
-        out_types.push_back(built->return_type);
+        out_types.push_back(built->GetReturnType());
         exprs.push_back(std::move(built));
     }
     return std::unique_ptr<Operator>(std::make_unique<ProjectionOperator>(std::move(exprs), out_types, alloc));

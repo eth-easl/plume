@@ -1,14 +1,14 @@
 #pragma once
 
 #include "plume/common/result.hpp"
+#include "plume/execution/group_table.hpp"
 #include "plume/execution/operator.hpp"
 #include "plume/expression/expression.hpp"
+#include "plume/expression/function_registry.hpp"
 #include "plume/memory/allocator.hpp"
 
-#include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/storage/arena_allocator.hpp"
 
-#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -39,23 +39,20 @@ struct AggregateTemplate : OperatorTemplate {
 };
 
 struct AggregateBuild {
-    AggregateBuild(std::string func_name_p, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments_p,
-                   duckdb::LogicalType return_type_p,
-                   std::unique_ptr<duckdb::AggregateFunction> function_p = nullptr, bool distinct_p = false)
-        : func_name(std::move(func_name_p)), arguments(std::move(arguments_p)),
-          return_type(std::move(return_type_p)), function(std::move(function_p)), distinct(distinct_p) {}
+    AggregateBuild(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments_p,
+                   duckdb::LogicalType return_type_p, expr::ResolvedAggregate aggregate_p, bool distinct_p = false)
+        : arguments(std::move(arguments_p)), return_type(std::move(return_type_p)),
+          aggregate(std::move(aggregate_p)), distinct(distinct_p) {}
 
-    // Move-only (arguments hold unique_ptrs); deleting copy forces std::vector to use the move 
-    // path on reallocation.
+    // Move-only (arguments hold unique_ptrs)
     AggregateBuild(AggregateBuild &&) = default;
     AggregateBuild &operator=(AggregateBuild &&) = default;
     AggregateBuild(const AggregateBuild &) = delete;
     AggregateBuild &operator=(const AggregateBuild &) = delete;
 
-    std::string func_name;
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> arguments;
     duckdb::LogicalType return_type;
-    std::unique_ptr<duckdb::AggregateFunction> function; // resolved kernel; null for min/max
+    expr::ResolvedAggregate aggregate; // bound kernel + bind data
     bool distinct = false;
 };
 
@@ -73,23 +70,11 @@ public:
     Result<void> Finish() override;
 
 private:
-    // Precomputed per-chunk accessor for one group-key column (built once per
-    // chunk, not re-derived per row — the old EncodeCell hot path). Public so the
-    // key-encode helper in the .cpp can name it.
-    struct KeyCol {
-        duckdb::Vector *vec = nullptr;
-        const uint8_t *raw = nullptr; // FlatVector::GetData(*vec)
-        uint32_t width = 0;           // physical width; 0 for VARCHAR
-        bool is_varchar = false;
-    };
-
     struct AggImpl;
 
-    void EncodeCell(std::string &key, const KeyCol &col, duckdb::idx_t row);
-    void RehashGroups();
-    void AddGroupSlots();
-
-    duckdb::idx_t ProbeOrInsert(duckdb::DataChunk &keys, const std::vector<KeyCol> &cols, duckdb::idx_t row);
+    duckdb::data_ptr_t GroupPayload(duckdb::idx_t group) const;
+    void InitializeStates(const duckdb::data_ptr_t *payloads, duckdb::idx_t count);
+    void EnsureUngroupedState();
 
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> group_exprs_;
     std::unique_ptr<duckdb::ExpressionExecutor> group_executor_;
@@ -97,20 +82,20 @@ private:
     duckdb::vector<duckdb::LogicalType> key_types_;
 
     std::vector<std::unique_ptr<AggImpl>> aggs_;
+    duckdb::idx_t payload_size_ = 0; // all aggregates' states of one group
 
     memory::Allocator alloc_;
-    duckdb::ArenaAllocator arena_; // backs aggregate states + AggregateInputData
+    duckdb::ArenaAllocator arena_; // backs AggregateInputData + the ungrouped payload
 
-    std::vector<int32_t> group_slots_;        // slot -> group index, or -1 if empty
-    uint64_t group_mask_ = 0;                 // group_slots_.size() - 1 (a power of two)
-    std::vector<char> group_key_store_;       // all groups' encoded key bytes, concatenated
-    std::vector<uint32_t> group_key_off_;     // size ngroups+1: group g spans [off[g], off[g+1])
-    std::vector<uint64_t> group_hashes_;      // per-group key hash
-    std::string key_scratch_;                 // reused per-row key-encode buffer
-    std::vector<duckdb::idx_t> group_of_row_; // reused per-chunk row->group mapping
-
-    std::vector<std::vector<duckdb::Value>> group_key_values_; // representative keys per group
+    std::unique_ptr<GroupTable> table_;              // grouped: key -> payload
+    duckdb::data_ptr_t ungrouped_payload_ = nullptr; // ungrouped: the single payload
     bool ungrouped_;
+
+    // Per-chunk scratch (STANDARD_VECTOR_SIZE).
+    std::vector<duckdb::data_ptr_t> payloads_;     // each row's group payload
+    std::vector<duckdb::data_ptr_t> new_payloads_; // payloads of the groups a chunk created
+    std::vector<duckdb::data_ptr_t> state_ptrs_;
+    duckdb::SelectionVector new_groups_;
 };
 
 Result<std::unique_ptr<Operator>> BuildAggregateTemplate(std::shared_ptr<AggregateTemplate> templ,

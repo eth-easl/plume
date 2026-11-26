@@ -2,8 +2,9 @@
 
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/constant_vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
 #include <cstdint>
@@ -15,7 +16,6 @@ using duckdb::DataChunk;
 using duckdb::hash_t;
 using duckdb::idx_t;
 using duckdb::LogicalType;
-using duckdb::SelectionVector;
 using duckdb::Vector;
 using duckdb::VectorOperations;
 
@@ -30,117 +30,88 @@ duckdb::vector<LogicalType> SchemaTypes(const Schema &schema) {
     return types;
 }
 
-std::vector<uint32_t> RoutePartitionIds(DataChunk &chunk, const std::vector<uint32_t> &key_columns, 
-                                        uint32_t n, idx_t count) {
-    std::vector<uint32_t> pid(count, 0);
-    if (n <= 1 || key_columns.empty()) {
-        return pid;
-    }
-    Vector hashes(LogicalType::HASH);
-    VectorOperations::Hash(chunk.data[key_columns[0]], hashes, count);
-    for (size_t k = 1; k < key_columns.size(); k++) {
-        VectorOperations::CombineHash(hashes, chunk.data[key_columns[k]], count);
-    }
-    hashes.Flatten(count);
-    auto *hd = duckdb::FlatVector::GetData<hash_t>(hashes);
-    for (idx_t r = 0; r < count; r++) {
-        pid[r] = static_cast<uint32_t>(hd[r] % n);
-    }
-    return pid;
-}
-
 } // namespace
 
-//===----------------------------------------------------------------------===//
-// SingleOutputOperator
-//===----------------------------------------------------------------------===//
-
-Result<void> SingleOutputOperator::Push(std::unique_ptr<DataChunk> chunk) {
-    PLUME_TRACE_OP(trace::Phase::PUSH);
-    if (!chunk || chunk->size() == 0) {
-        return Ok();
-    }
-    std::shared_ptr<DataChunk> sc = std::move(chunk);
-    const idx_t count = sc->size();
-    return sink_->Accept(0, std::move(sc), nullptr, count);
+OutputOperator::OutputOperator(const Schema &schema, std::unique_ptr<Sink> sink,
+                               std::vector<uint32_t> key_columns, uint32_t partitions)
+    : Operator(SchemaTypes(schema)), sink_(std::move(sink)), key_columns_(std::move(key_columns)),
+      partitions_(partitions == 0 ? 1 : partitions), formats_(schema.size()) {
+    sink_->Bind(schema, partitions_);
 }
 
-//===----------------------------------------------------------------------===//
-// SplitOutputOperator
-//===----------------------------------------------------------------------===//
-
-SplitOutputOperator::SplitOutputOperator(duckdb::vector<LogicalType> output_types, std::unique_ptr<PartitionSink> sink,
-                                         std::vector<uint32_t> key_columns, uint32_t partitions)
-    : OutputOperatorBase(std::move(output_types), std::move(sink)), key_columns_(std::move(key_columns)),
-      partitions_(partitions == 0 ? 1 : partitions) {}
-
-Result<void> SplitOutputOperator::Push(std::unique_ptr<DataChunk> chunk) {
+Result<void> OutputOperator::Push(std::unique_ptr<DataChunk> chunk) {
     PLUME_TRACE_OP(trace::Phase::PUSH);
     if (!chunk || chunk->size() == 0) {
         return Ok();
     }
 
-    const idx_t chunk_size = chunk->size();
-    std::shared_ptr<DataChunk> shared_chunk = std::move(chunk);
-    shared_chunk->Flatten(); // TODO: check if this flatten is needed
-    
-    auto selection = std::make_shared<SelectionVector>(chunk_size);
-    if (partitions_ <= 1 || key_columns_.empty()) {
-        for (idx_t i = 0; i < chunk_size; i++) {
-            selection->set_index(i, i);
-        }
-        auto view = std::make_unique<SelectionVector>(selection->data());
-        TRYV(sink_->Accept(0, shared_chunk, std::move(view), chunk_size, selection));
+    for (idx_t c = 0; c < formats_.size(); c++) {
+        chunk->data[c].ToUnifiedFormat(formats_[c]);
     }
 
-    Vector hashes(LogicalType::HASH);
-    VectorOperations::Hash(shared_chunk->data[key_columns_[0]], hashes, chunk_size);
+    if (partitions_ <= 1 || key_columns_.empty()) {
+        return sink_->Append(0, {*chunk, formats_.data(), nullptr, chunk->size()});
+    }
+    return Route(*chunk);
+}
+
+Result<void> OutputOperator::Finish() {
+    PLUME_TRACE_OP(trace::Phase::FINISH);
+    return sink_->Finish();
+}
+
+Result<void> OutputOperator::Route(const DataChunk &chunk) {
+    const idx_t count = chunk.size();
+
+    // Hash key columns.
+    Vector hashes(LogicalType::HASH, count);
+    VectorOperations::Hash(chunk.data[key_columns_[0]], hashes, count);
     for (size_t k = 1; k < key_columns_.size(); k++) {
-        VectorOperations::CombineHash(hashes, shared_chunk->data[key_columns_[k]], chunk_size);
+        VectorOperations::CombineHash(hashes, chunk.data[key_columns_[k]], count);
     }
-    hashes.Flatten(chunk_size);
-    
-    std::vector<uint32_t> partition_id(chunk_size, 0);
-    std::vector<idx_t> offsets(partitions_, 0);
-    auto *hd = duckdb::FlatVector::GetData<hash_t>(hashes);
-    for (idx_t i = 0; i < chunk_size; i++) {
-        partition_id[i] = static_cast<uint32_t>(hd[i] % partitions_);
-        offsets[partition_id[i]]++;
+    if (hashes.GetVectorType() == duckdb::VectorType::CONSTANT_VECTOR) {
+        return sink_->Append(
+            PartitionOf(*duckdb::ConstantVector::GetData<hash_t>(hashes), partitions_), 
+            {chunk, formats_.data(), nullptr, count}
+        );
     }
-    idx_t acc = 0;
-    for (uint32_t i = 0; i < partitions_; i++) {
-        const idx_t c = offsets[i];
-        offsets[i] = acc;
-        acc += c;
+    hashes.Flatten();
+    const auto *hash_data = duckdb::FlatVector::GetData<hash_t>(hashes);
+
+    // Assign partitions and compute prefix-sum offsets to scatter row indices into a per-partition 
+    // selection vector.
+    partition_ids_.resize(count);
+    offsets_.assign(partitions_ + 1, 0);
+    for (idx_t i = 0; i < count; i++) {
+        const uint32_t p = PartitionOf(hash_data[i], partitions_);
+        partition_ids_[i] = p;
+        offsets_[p + 1]++;
     }
-    std::vector<idx_t> fill(offsets.begin(), offsets.end());
-    for (idx_t r = 0; r < chunk_size; r++) {
-        selection->set_index(fill[partition_id[r]]++, r);
+    if (offsets_[partition_ids_[0] + 1] == count) { // a single partition: no selection needed
+        return sink_->Append(partition_ids_[0], {chunk, formats_.data(), nullptr, count});
     }
-    for (uint32_t i = 0; i < partitions_; i++) {
-        const idx_t count = fill[i] - offsets[i];
-        if (count == 0) {
-            continue;
+    for (uint32_t p = 0; p < partitions_; p++) {
+        offsets_[p + 1] += offsets_[p];
+    }
+    fill_.assign(offsets_.begin(), offsets_.end() - 1);
+    sel_.resize(count);
+    for (idx_t i = 0; i < count; i++) {
+        sel_[fill_[partition_ids_[i]]++] = static_cast<duckdb::sel_t>(i);
+    }
+
+    for (uint32_t p = 0; p < partitions_; p++) {
+        const idx_t n = offsets_[p + 1] - offsets_[p];
+        if (n != 0) {
+            const duckdb::SelectionVector run(sel_.data() + offsets_[p], n);
+            TRYV(sink_->Append(p, {chunk, formats_.data(), &run, n}));
         }
-        auto view = std::make_unique<SelectionVector>(selection->data() + offsets[i]);
-        TRYV(sink_->Accept(i, shared_chunk, std::move(view), count, selection));
     }
     return Ok();
 }
 
-//===----------------------------------------------------------------------===//
-// Build
-//===----------------------------------------------------------------------===//
-
 std::unique_ptr<Operator> MakeOutputOperator(const Schema &schema, std::vector<uint32_t> key_columns,
-                                             uint32_t partitions, std::unique_ptr<PartitionSink> sink) {
-    const uint32_t n = partitions == 0 ? 1 : partitions;
-    sink->Bind(schema, n);
-    auto types = SchemaTypes(schema);
-    if (n <= 1) {
-        return std::make_unique<SingleOutputOperator>(std::move(types), std::move(sink));
-    }
-    return std::make_unique<SplitOutputOperator>(std::move(types), std::move(sink), std::move(key_columns), n);
+                                             uint32_t partitions, std::unique_ptr<Sink> sink) {
+    return std::make_unique<OutputOperator>(schema, std::move(sink), std::move(key_columns), partitions);
 }
 
 } // namespace plume::exec

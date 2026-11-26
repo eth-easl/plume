@@ -60,6 +60,9 @@ Result<RunConfig> RunConfig::FromJsonFile(const std::string &path) {
         if (data.contains("reps")) {
             cfg.reps = data.at("reps").get<uint32_t>();
         }
+        if (data.contains("track_memory")) {
+            cfg.track_memory = data.at("track_memory").get<bool>();
+        }
         if (data.contains("quiet")) {
             cfg.quiet = data.at("quiet").get<bool>();
         }

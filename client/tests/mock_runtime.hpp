@@ -49,6 +49,9 @@ private:
     std::vector<size_t> ExecutionOrder() const;
     // Captures the current invocation's dynamic filter items (output set 1) for `stage`.
     void CaptureDynamicFilters(const parser::Stage &stage);
+    // Replaces the dynamic filter items of a stage that ran as several instances by one merged
+    // item per filter id, via plume_df_combine (as the composition does for parallel producers).
+    void CombineDynamicFilters(const parser::Stage &stage);
     // Wires the dynamic filter items of the given producer stages as input set 3.
     void FeedDynamicFilters(const std::vector<uint32_t> &source_stages);
 

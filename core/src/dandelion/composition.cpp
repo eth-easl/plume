@@ -7,11 +7,8 @@
 #include "plume/common/result.hpp"
 #include "plume/dandelion/api.hpp"
 #include "plume/execution/operators/join.hpp"
-#include "plume/memory/adapter.hpp"
 #include "plume/parser/converter.hpp"
 #include "plume/parser/physical_plan.hpp"
-
-#include <nlohmann/json.hpp>
 
 #include <memory>
 #include <sstream>
@@ -36,10 +33,6 @@ using parser::ConverterConfig;
 using parser::LeafStage;
 using parser::PhysicalPlan;
 
-//===----------------------------------------------------------------------===//
-// Composition building
-//===----------------------------------------------------------------------===//
-
 namespace {
 
 std::string StageTemplVar(int stage) { return "st_" + std::to_string(stage); }
@@ -48,24 +41,50 @@ std::string RemoteInfoVar(int stage) { return "info_" + std::to_string(stage); }
 std::string RemoteReqVar(int stage) { return "req_" + std::to_string(stage); }
 std::string OutVar(int stage) { return "out_" + std::to_string(stage); }
 std::string DynFilterVar(int stage) { return "dfltr_" + std::to_string(stage); }
+std::string CombinedDynFilterVar(int stage) { return "dfltrc_" + std::to_string(stage); }
 
-std::string DynFilterBinding(const std::vector<uint32_t> &stages) {
+bool MayRunParallel(const PhysicalPlan &plan, const parser::Stage &stage, const ConverterConfig &config) {
+    if (stage.IsLeaf()) {
+        const auto &leaf = static_cast<const LeafStage &>(stage);
+        switch (leaf.data_source->type) {
+        case DataSourceType::LOCAL_TABLE:
+            return false; // every materialized block has key 0 -> a single keyed instance
+        case DataSourceType::REMOTE_PARQUET:
+        case DataSourceType::REMOTE_CSV:
+            // One instance per region: at least one per file, max_region_bytes can add more.
+            return leaf.source_splits > 1 || leaf.data_source->paths.size() > 1 || config.max_region_bytes > 0;
+        }
+        return true;
+    }
+    for (size_t in : stage.input_stages) {
+        if (plan.stages[in]->pipeline.output_split.partitions > 1) {
+            return true; // keyed input -> one instance per partition
+        }
+    }
+    return false;
+}
+
+std::string DynFilterBinding(const std::vector<uint32_t> &stages, const std::vector<bool> &combined) {
+    auto var = [&combined](uint32_t stage) {
+        return combined[stage] ? CombinedDynFilterVar(static_cast<int>(stage)) : DynFilterVar(static_cast<int>(stage));
+    };
     if (stages.size() == 1) {
-        return "all " + DynFilterVar(static_cast<int>(stages[0]));
+        return "all " + var(stages[0]);
     }
     std::string out = "all {";
     for (size_t i = 0; i < stages.size(); i++) {
-        out += (i ? ", " : "") + DynFilterVar(static_cast<int>(stages[i]));
+        out += (i ? ", " : "") + var(stages[i]);
     }
     return out + "}";
 }
 
 struct DeclarationTracker {
-    bool using_http = false;    // -> the runtime-provided HTTP function (file fetches)
-    bool using_stage = false;   // -> plume_stage (BLOCKS / join / compute stages)
-    bool using_csv = false;     // -> plume_csv_stage
-    bool using_pq_prep = false; // -> plume_pq_prepare
-    bool using_pq = false;      // -> plume_pq_stage
+    bool using_http = false;       // -> the runtime-provided HTTP function (file fetches)
+    bool using_stage = false;      // -> plume_stage (BLOCKS / join / compute stages)
+    bool using_csv = false;        // -> plume_csv_stage
+    bool using_pq_prep = false;    // -> plume_pq_prepare
+    bool using_pq = false;         // -> plume_pq_stage
+    bool using_df_combine = false; // -> plume_df_combine
 
     void AppendDeclarations(std::ostringstream &out) const {
         if (using_http) {
@@ -82,6 +101,9 @@ struct DeclarationTracker {
         }
         if (using_pq) {
             out << "function plume_pq_stage (template, regionInfo, inBuffers, dynFilter) => (outData, dynFilter" EXTRA_OUT_SET ");\n";
+        }
+        if (using_df_combine) {
+            out << "function plume_df_combine (dynFilter) => (combDynFilter" EXTRA_OUT_SET ");\n";
         }
     }
 };
@@ -103,6 +125,15 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
     auto dyn_filter_output = [](const parser::Stage &s) -> std::string {
         return s.ProducesDynFilter() ? ", " + DynFilterVar(static_cast<int>(s.idx)) + " = dynFilter" : "";
     };
+    std::vector<bool> combined(plan.stages.size(), false);
+    for (const auto &stage : plan.stages) {
+        if (stage->ProducesDynFilter() && MayRunParallel(plan, *stage, config)) {
+            combined[stage->idx] = true;
+            dt.using_df_combine = true;
+            fappls << "  plume_df_combine (dynFilter = all " << DynFilterVar(static_cast<int>(stage->idx))
+                   << ") => (" << CombinedDynFilterVar(static_cast<int>(stage->idx)) << " = combDynFilter);\n";
+        }
+    }
     for (const auto &stage : plan.stages) {
         std::string st_var = StageTemplVar(stage->idx);
         comp_input << st_var << ", ";
@@ -144,7 +175,7 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
                     // evaluates every filter (pruning or probe-only) on the rows.
                     std::string stage_dyn_filter;
                     if (leaf_stage->ConsumesDynFilter()) {
-                        stage_dyn_filter = ", dynFilter = " + DynFilterBinding(leaf_stage->DynFilterSourceStages());
+                        stage_dyn_filter = ", dynFilter = " + DynFilterBinding(leaf_stage->DynFilterSourceStages(), combined);
                     }
                     if (leaf_stage->PrunesByDynFilter()) {
                         std::vector<exec::DynamicFilterProbeSpec> prune_filters;
@@ -167,7 +198,7 @@ Result<DandelionComposition> BuildDandelionComposition(duckdb::Connection &con,
                         fappls << "  plume_pq_prepare (config = all " << cfg_var
                               << ", footer = anyKeyed " << footer_var
                               << ", url = anyKeyed " << url_var << ", dynFilter = "
-                              << DynFilterBinding(leaf_stage->DynFilterSourceStages(/*prune_only=*/true))
+                              << DynFilterBinding(leaf_stage->DynFilterSourceStages(/*prune_only=*/true), combined)
                               << ") => (" << info_var << " = region, " 
                               << req_var << " = chunkReq) by footer inner url;\n";
                     } else {
@@ -289,153 +320,6 @@ Result<std::vector<std::string>> ParseCompositionInputNames(const DandelionCompo
         pos = comma + 1;
     }
     return names;
-}
-
-//===----------------------------------------------------------------------===//
-// Composition execution
-//===----------------------------------------------------------------------===//
-
-using json = nlohmann::json;
-
-namespace {
-
-// Build a json set (identifier + items) from precomputed keyed source items.
-json SourceItemSet(const std::string& var, const DataItemVec& items) {
-    json json_items;
-    for (const auto& itm : items) {
-        json_items.push_back(json{
-            {"identifier", itm.identifier},
-            {"key", itm.key},
-            {"data", json::binary(itm.data)}
-        });
-    }
-    return json{{"items", json_items}};
-}
-
-} // namespace
-
-BinaryData RegistrationBody(const DandelionComposition& comp) {
-    json body;
-    body["composition"] = comp.dsl;
-    return json::to_bson(body);
-}
-
-Result<BinaryData> InvocationBody(const DandelionComposition& comp, bool is_registered) {
-    json sets;
-    for (const auto &set : comp.in_sets) {
-        sets.push_back(SourceItemSet("", set));
-    }
-
-    json body;
-    if (is_registered) {
-        body["name"] = comp.name;
-    } else {
-        body["composition"] = comp.dsl;
-    }
-    body["sets"] = sets;
-    return json::to_bson(body);
-}
-
-Result<DataSetVec> ParseResponseBody(const BinaryData& body, std::string* timestamps) {
-    json body_json;
-    try {
-        body_json= json::from_bson(body);
-    } catch (const json::parse_error& e) {
-        return Error("Parse error: " + std::string(e.what()));
-    } catch (const json::exception& e) {
-       return Error("JSON exception: " + std::string(e.what()));
-    } catch (const std::exception& e) {
-        return Error("Standard exception: " + std::string(e.what()));
-    } catch (...) {
-        return Error("Unexpected error while parsing bson");
-    }
-
-    DataSetVec out_sets;
-    if (body_json.contains("sets") && body_json["sets"].is_array()) {
-        out_sets.reserve(body_json["sets"].size());
-        for (const auto& set : body_json["sets"]) {
-            DataItemVec out_items;
-            if (set.contains("items") && set["items"].is_array()) {
-                out_items.reserve(set["items"].size());
-                for (const auto& item : set["items"]) {
-                    if (!item.contains("data") || !item["data"].is_binary()) {
-                        return Error("Item is missing required binary 'data' field.");
-                    }
-                    out_items.push_back({
-                        (item.contains("key") && item["key"].is_number_integer()) ? static_cast<uint64_t>(item["key"]) : 0,
-                        (item.contains("identifier") && item["identifier"].is_string()) ? item["identifier"].get<std::string>() : "",
-                        item["data"].get<nlohmann::json::binary_t>()
-                    });
-                }
-                out_sets.push_back(out_items);
-            } else {
-                return Error("Set does not contain array field called 'items'.");
-            }
-        }
-    } else {
-        return Error("Body does not contain array field called 'sets'.");
-    }
-
-    if (timestamps) {
-        if (body_json.contains("timestamps")) {
-            *timestamps = body_json["timestamps"].get<std::string>();
-        } else {
-            *timestamps = "";
-        }
-    }
-
-    return out_sets;
-}
-
-namespace {
-
-Result<std::string> RenderChunks(const std::vector<std::unique_ptr<duckdb::DataChunk>> &chunks,
-                                 const Schema &schema, bool write_header = true) {
-    std::ostringstream out;
-    if (write_header) {
-        std::string header;
-        for (size_t c = 0; c < schema.columns.size(); c++) {
-            if (c) out << "\t";
-            out << schema.columns[c].name;
-        }
-        out << "\n";
-    }
-
-    for (const auto &chunk : chunks) {
-        for (duckdb::idx_t r = 0; r < chunk->size(); r++) {
-            std::string row;
-            for (duckdb::idx_t c = 0; c < chunk->ColumnCount(); c++) {
-                if (c) out << "\t";
-                out << chunk->GetValue(c, r).ToString();
-            }
-            out << "\n";
-        }
-    }
-    return out.str();
-}
-
-} // namespace
-
-Result<std::string> ParseAndRenderResponseBody(const dandelion::BinaryData& data, const Schema &schema, 
-        std::string* timestamps) {
-    TRY(auto sets, dandelion::ParseResponseBody(data, timestamps));
-    if (sets.size() == 0) {
-        return "";
-    }
-
-    std::string out;
-    bool write_header = true;
-    for (auto &block : sets[0]) {
-        plume::Schema block_schema;
-        TRY(auto chunks, memory::ImportBlockChunks(block.data.data(), block.data.size(), block_schema));
-        if (block_schema.columns.size() != schema.columns.size()) {
-            return Error("Block schema does not match given schema.");
-        }
-        TRY(auto chunk_str, RenderChunks(chunks, schema, write_header));
-        out += chunk_str;
-        write_header = false;
-    }
-    return out;
 }
 
 } // namespace plume::dandelion

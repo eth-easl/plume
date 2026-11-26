@@ -7,6 +7,7 @@
 #include "plume/catalog/plume_remote.hpp"
 #include "plume/catalog/remote_resolver.hpp"
 #include "plume/dandelion/composition.hpp"
+#include "plume/execution/operators/aggregate.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/join.hpp"
 #include "plume/execution/pipeline.hpp"
@@ -18,6 +19,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include "duckdb/common/string_util.hpp"
+
 #include <filesystem>
 #include <map>
 #include <set>
@@ -325,11 +328,9 @@ TEST_CASE("structure: decimal aggregate decompositions build (pre-aggregate on a
 }
 
 // avg(DECIMAL) must come out correctly scaled even without pre-aggregation. The
-// single-phase aggregate resolves DuckDB's native decimal avg via the physical
-// storage-type fallback in ResolveAggregateFunction, which needs an
-// AverageDecimalBindData (the decimal's scale) at Finalize time; Plume's aggregate
-// operator never runs DuckDB's bind step (a null AggregateInputData), so without
-// special-casing this the result comes back unscaled (10^scale too large).
+// single-phase aggregate runs DuckDB's decimal avg, whose Finalize descales by the
+// AverageDecimalBindData that ResolveAggregateFunction builds through the contextless
+// bind; if that bind data were dropped the result would come back 10^scale too large.
 TEST_CASE("e2e: decimal avg (pre-aggregate on and off)") {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
@@ -894,6 +895,24 @@ TEST_CASE("e2e: correlated subquery over a join (DELIM join)") {
     ExpectMatch(con, sql, /*ordered=*/false, {}, /*pre_aggregate=*/false);
 }
 
+// An OR predicate spanning both join sides (TPC-H Q7/Q19-shaped). DuckDB v2
+// attaches it to the join as an expression condition over `left ++ right`,
+// which Plume evaluates as a residual next to the equi key.
+TEST_CASE("e2e: join with an OR condition spanning both sides") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeDb(db);
+    for (const char *sql :
+         {"SELECT o_id, c_id FROM orders o JOIN customers c ON o.cust = c.c_id "
+          "WHERE (o.region = 'east' AND c.tier = 1) OR (o.region = 'west' AND c.tier = 2)",
+          "SELECT o_id, name FROM customers c JOIN orders o ON o.cust = c.c_id "
+          "WHERE (c.name = 'carol' AND o.amount > 50) OR (c.tier = 2 AND o.region = 'west')",
+          // expression join keys: Plume appends computed key columns to both sides
+          "SELECT o_id, c_id FROM orders o JOIN customers c ON CAST(o.cust AS BIGINT) = CAST(c.c_id AS BIGINT) "
+          "WHERE (o.region = 'east' AND c.tier = 1) OR (o.region = 'west' AND c.tier = 2)"}) {
+        ExpectMatch(con, sql, /*ordered=*/false);
+    }
+}
+
 // The non-inner join kinds, each matched against DuckDB. The query syntax maps to
 // the join types DuckDB's planner/optimizer emits: FULL OUTER -> OUTER, EXISTS ->
 // RIGHT_SEMI, NOT EXISTS -> RIGHT_ANTI, IN -> SEMI, NOT IN -> MARK + filter. (A
@@ -1094,6 +1113,8 @@ TEST_CASE("dynamic filter: producing leaf stage's dynFilter output is actually b
     CHECK(Contains(comp.dsl, dyn_var + " = dynFilter"));
     // The function it's declared on must expose the output at all.
     CHECK(Contains(comp.dsl, "=> (outData, dynFilter"));
+    // A local-table leaf runs as one instance -> its single filter item needs no combination.
+    CHECK(!Contains(comp.dsl, "plume_df_combine"));
 }
 
 TEST_CASE("dynamic filter: probe column sorted in the files -> pq_prepare prunes before the fetch") {
@@ -1350,8 +1371,9 @@ struct DynFilterParquetDb {
 
     // Runs `sql` (over plume_remote('pq_orders')) through the mock runtime and checks the result
     // against DuckDB running it over read_parquet. Returns the plan and the runtime for inspection.
-    std::pair<std::unique_ptr<PhysicalPlan>, std::unique_ptr<MockRuntime>> ExpectMatch(const std::string &sql) {
-        auto plan = BuildPhysicalPlan(con, sql, *catalog, Cfg(true)).unwrap();
+    std::pair<std::unique_ptr<PhysicalPlan>, std::unique_ptr<MockRuntime>> ExpectMatch(
+            const std::string &sql, const ConverterConfig &cfg = Cfg(true)) {
+        auto plan = BuildPhysicalPlan(con, sql, *catalog, cfg).unwrap();
         auto runtime = std::make_unique<MockRuntime>(con);
         auto plume_rows = PlumeRows(runtime->Run(*plan));
         std::string duck_sql = sql;
@@ -1490,6 +1512,41 @@ TEST_CASE("dynamic filter e2e: a filtered scan passes the filter on through anot
     CHECK(RowCount(runtime->StageOutput(b->idx)) == 300);
     // a's own scan builds b's filter from the rows its probe keeps.
     CHECK(OnlyDynFilter(b).source_stage == a->idx);
+}
+
+TEST_CASE("dynamic filter e2e: a parallel producer's filter items are combined before the scan") {
+    DynFilterParquetDb t;
+    // The grouped aggregate over customers runs once per shuffle partition and taps its keys, so
+    // each instance emits a filter item: plume_df_combine merges them into one per filter id.
+    const std::string sql = "SELECT o.o_id, c.n FROM plume_remote('pq_orders') o "
+                            "JOIN (SELECT cust, count(*) AS n FROM customers GROUP BY cust) c ON o.cust = c.cust";
+    const auto cfg = Cfg(true, /*max_splits=*/4, /*target_rows_per_split=*/1);
+    auto [plan, runtime] = t.ExpectMatch(sql, cfg);
+    const LeafStage *orders = FindLeaf(*plan, "pq_orders");
+    const auto &in = OnlyDynFilter(orders);
+    const Stage &producer = *plan->stages[in.source_stage];
+    CHECK(!producer.IsLeaf());
+    CHECK(plan->stages[producer.input_stages.at(0)]->pipeline.output_split.partitions > 1);
+
+    // The scan gets the single combined item; cust 5, 100, 199 -> 300 rows of 20480.
+    CHECK(runtime->DynamicFilterOutputs(in.source_stage).size() == 1);
+    CHECK(runtime->DynamicFilterOutputs(in.source_stage)[0].identifier == exec::DynamicFilterIdent(in.filter_id));
+    CHECK(RowCount(runtime->StageOutput(orders->idx)) == 300);
+
+    auto comp = dandelion::BuildDandelionComposition(t.con, *plan, "DF", cfg).unwrap();
+    const std::string src = std::to_string(in.source_stage);
+    CHECK(Contains(comp.dsl, "function plume_df_combine (dynFilter) => (combDynFilter"));
+    CHECK(Contains(comp.dsl, "dfltr_" + src + " = dynFilter"));
+    CHECK(Contains(comp.dsl, "plume_df_combine (dynFilter = all dfltr_" + src + ") => (dfltrc_" + src +
+                                 " = combDynFilter);"));
+    // Every consumer binds the combined items: only the combiner reads the raw ones.
+    CHECK(Contains(comp.dsl, "inBuffers = keyed data_" + std::to_string(orders->idx) + ", dynFilter = all dfltrc_" + src));
+    size_t raw_reads = 0;
+    const std::string raw = "all dfltr_" + src;
+    for (size_t pos = comp.dsl.find(raw); pos != std::string::npos; pos = comp.dsl.find(raw, pos + 1)) {
+        raw_reads++;
+    }
+    CHECK(raw_reads == 1);
 }
 
 TEST_CASE("dynamic filter: dropped when the probe scan is shared with another consumer") {
@@ -1638,6 +1695,265 @@ TEST_CASE("ResolveAndRewriteSources: a source referenced twice is resolved once"
     CHECK(src->cardinality_total == 300);
     CHECK(src->cardinalities == std::vector<uint64_t>{300});
     fs::remove_all(dir);
+}
+
+// --- collapsed early aggregates (PlanBuilder::CollapseEarlyAggregates) --------------------
+
+namespace {
+
+// `l` has keys 1..20 (two rows each), `r` keys 1..5 and 30: most of `l` is unmatched, so a
+// grouping by `r.k` after an outer join has a NULL group whose rows come from every partition.
+duckdb::Connection MakeOuterJoinDb(duckdb::DuckDB &db) {
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE l(k INTEGER, v INTEGER)");
+    con.Query("INSERT INTO l SELECT i % 20 + 1, i FROM range(40) t(i)");
+    con.Query("CREATE TABLE r(k INTEGER, w INTEGER)");
+    con.Query("INSERT INTO r VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (30, 300)");
+    return con;
+}
+
+void ExpectMatchAllModes(duckdb::Connection &con, const std::string &sql) {
+    for (bool pre_aggregate : {true, false}) {
+        for (uint32_t splits : {1u, 4u}) {
+            ExpectMatch(con, sql, /*ordered=*/false, {}, pre_aggregate, splits, /*target_rows_per_split=*/1);
+        }
+    }
+}
+
+} // namespace
+
+TEST_CASE("structure: an aggregate over a keyed join on its group key is fused into the join stage") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeDb(db);
+    const char *sql = "SELECT c_id, count(*), sum(amount) FROM orders JOIN customers ON cust = c_id GROUP BY c_id";
+    auto plan = BuildPhysicalPlan(con, sql, {}, Cfg(true, /*max_splits=*/4, /*target_rows_per_split=*/1)).unwrap();
+
+    CHECK(CountOps(*plan, exec::OpType::AGGREGATE) == 1); // no partial + combine
+    size_t join_stages = 0;
+    for (const auto &s : plan->stages) {
+        if (!s->LeadsWithJoin()) {
+            continue;
+        }
+        join_stages++;
+        bool has_agg = false;
+        for (const auto &op : s->pipeline.operators) {
+            has_agg |= op->type == exec::OpType::AGGREGATE;
+        }
+        CHECK(has_agg);
+    }
+    CHECK(join_stages == 1);
+}
+
+TEST_CASE("e2e: aggregates over keyed joins on their group keys (pre-aggregate on and off)") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeDb(db);
+    for (const char *sql : {
+             "SELECT c_id, count(*), sum(amount), avg(amount) FROM orders JOIN customers ON cust = c_id GROUP BY c_id",
+             "SELECT cust, name, min(amount), max(amount) FROM orders JOIN customers ON cust = c_id GROUP BY cust, name",
+             "SELECT region, count(*) FROM orders JOIN customers ON cust = c_id GROUP BY region",
+         }) {
+        ExpectMatchAllModes(con, sql);
+    }
+}
+
+TEST_CASE("e2e: aggregates over outer joins group the NULL-extended keys correctly") {
+    duckdb::DuckDB db(nullptr);
+    auto con = MakeOuterJoinDb(db);
+    for (const char *sql : {
+             // grouped by the NULL-extended side: one NULL group across partitions
+             "SELECT r.k, count(*), sum(v) FROM l LEFT JOIN r ON l.k = r.k GROUP BY r.k",
+             "SELECT r.k, count(*), sum(v) FROM r RIGHT JOIN l ON l.k = r.k GROUP BY r.k",
+             "SELECT l.k, count(*), sum(w) FROM l RIGHT JOIN r ON l.k = r.k GROUP BY l.k",
+             "SELECT l.k, r.k, count(*) FROM l FULL OUTER JOIN r ON l.k = r.k GROUP BY l.k, r.k",
+             "SELECT r.k, count(*) FROM l FULL OUTER JOIN r ON l.k = r.k GROUP BY r.k",
+             // grouped by the preserved side
+             "SELECT l.k, count(*), sum(w) FROM l LEFT JOIN r ON l.k = r.k GROUP BY l.k",
+             "SELECT r.k, count(*), sum(v) FROM l RIGHT JOIN r ON l.k = r.k GROUP BY r.k",
+         }) {
+        ExpectMatchAllModes(con, sql);
+    }
+}
+
+// Aggregates DuckDB binds through a bind callback (min/max over every type, sum/avg over DECIMAL)
+// or swaps for sum_no_overflow from statistics run as the very kernels DuckDB would run, NULLs and
+// grouped + ungrouped included, with and without pre-aggregation.
+TEST_CASE("e2e: bound aggregates across types (pre-aggregate on and off)") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE t(g VARCHAR, i INTEGER, b BIGINT, d4 DECIMAL(9,2), d8 DECIMAL(18,3), "
+              "d16 DECIMAL(30,4), f DOUBLE, s VARCHAR, dt DATE)");
+    con.Query("INSERT INTO t VALUES "
+              "('x', 1, 10, 1.25, 100.125, 12345678901234.5678, 0.5, 'banana', DATE '2024-03-01'), "
+              "('x', -7, 20, 3.50, -2.500, -1.0001, 1.25, 'a long string that is not inlined', DATE '2023-12-31'), "
+              "('y', 4, NULL, NULL, 7.000, 3.3333, NULL, NULL, NULL), "
+              "('y', NULL, 40, 9.99, NULL, NULL, -3.0, 'cherry', DATE '2025-01-15'), "
+              "('z', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+    const std::string aggs = "min(i), max(i), sum(i), avg(i), min(b), max(b), sum(b), "
+                             "min(d4), max(d4), sum(d4), avg(d4), sum(d8), avg(d8), sum(d16), avg(d16), "
+                             "min(f), max(f), min(s), max(s), min(dt), max(dt), count(s)";
+    for (bool pa : {true, false}) {
+        ExpectMatch(con, "SELECT g, " + aggs + " FROM t GROUP BY g", /*ordered=*/false, {}, pa);
+        ExpectMatch(con, "SELECT " + aggs + " FROM t", /*ordered=*/false, {}, pa);
+    }
+}
+
+// Statistics on a local table prove sum(INTEGER) cannot overflow an int64, so DuckDB binds
+// sum_no_overflow; the plan keeps that name so the stage runs the int64 kernel too.
+TEST_CASE("structure: sum_no_overflow survives into the plan") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE t(g INTEGER, i INTEGER)");
+    con.Query("INSERT INTO t VALUES (1, 5), (1, 6), (2, 7)");
+    for (bool pa : {true, false}) {
+        auto plan = BuildPhysicalPlan(con, "SELECT g, sum(i) FROM t GROUP BY g", {}, Cfg(pa)).unwrap();
+        bool found = false;
+        for (const auto &stage : plan->stages) {
+            for (const auto &op : stage->pipeline.operators) {
+                if (op->type != exec::OpType::AGGREGATE) {
+                    continue;
+                }
+                for (const auto &spec : static_cast<const exec::AggregateTemplate &>(*op).aggregates) {
+                    found = found || spec.func_name == "sum_no_overflow";
+                }
+            }
+        }
+        CHECK(found);
+        ExpectMatch(con, "SELECT g, sum(i) FROM t GROUP BY g", /*ordered=*/false, {}, pa);
+    }
+}
+
+// A real parquet source's footer statistics (DECIMAL and DATE bounds included) and its exact row
+// count reach DuckDB's optimizer, so it proves the sums cannot overflow an int64 and binds
+// sum_no_overflow; the stages then run that kernel and the result still matches DuckDB.
+TEST_CASE("e2e: remote parquet stats enable sum_no_overflow") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "plume_test_remote_stats";
+    fs::create_directories(dir);
+    const std::string path = (dir / "t.parquet").string();
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    CHECK(!con.Query("COPY (SELECT (range % 7)::INTEGER AS g, (range - 500)::INTEGER AS i, "
+                     "((range % 1000) / 100)::DECIMAL(9,2) AS d9, (range * 1.25)::DECIMAL(18,2) AS d18, "
+                     "DATE '2024-01-01' + (range % 365)::INTEGER AS dt FROM range(5000)) TO '" + path +
+                     "' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)")->HasError());
+
+    auto src = CreateRemoteParquetSource("pq_stats", {"file://" + path});
+    RemoteResolver resolver(AutoFetcher(), 2);
+    CHECK(src->Resolve(resolver).is_ok());
+    CHECK(resolver.Execute().is_ok());
+    CHECK(src->col_stats.size() == 5);
+    CHECK(src->col_stats[2].has_min && src->col_stats[2].min_value == duckdb::Value::DECIMAL(0, 9, 2));
+    CHECK(src->col_stats[3].has_max && src->col_stats[3].max_value.type() == duckdb::LogicalType::DECIMAL(18, 2));
+    CHECK(src->col_stats[4].has_min && src->col_stats[4].min_value == duckdb::Value::DATE(2024, 1, 1));
+
+    auto catalog = std::make_shared<SourceCatalog>();
+    CHECK(catalog->Add(src).is_ok());
+    auto registry = duckdb::make_shared_ptr<PlumeRemoteInfo>();
+    registry->catalog = catalog;
+    RegisterPlumeRemote(con, std::move(registry));
+
+    const std::string body = "g, sum(i), sum(d9), sum(d18), avg(d18), min(dt), max(dt) FROM %s "
+                             "WHERE dt >= DATE '2024-03-01' GROUP BY g";
+    auto with = [&](const std::string &from) { return duckdb::StringUtil::Format("SELECT " + body, from); };
+    for (bool pa : {true, false}) {
+        auto plan = BuildPhysicalPlan(con, with("plume_remote('pq_stats')"), *catalog, Cfg(pa)).unwrap();
+        size_t no_overflow = 0;
+        for (const auto &stage : plan->stages) {
+            for (const auto &op : stage->pipeline.operators) {
+                if (op->type != exec::OpType::AGGREGATE) {
+                    continue;
+                }
+                for (const auto &spec : static_cast<const exec::AggregateTemplate &>(*op).aggregates) {
+                    no_overflow += spec.func_name == "sum_no_overflow";
+                }
+            }
+        }
+        CHECK(no_overflow == 3); // sum(i), sum(d9), sum(d18); avg's partial sum is Plume's own
+
+        MockRuntime runtime(con);
+        auto plume_rows = PlumeRows(runtime.Run(*plan));
+        auto duck_rows = DuckRows(con, with("read_parquet('" + path + "')"));
+        std::sort(plume_rows.begin(), plume_rows.end());
+        std::sort(duck_rows.begin(), duck_rows.end());
+        CHECK(plume_rows == duck_rows);
+    }
+    fs::remove_all(dir);
+}
+
+// Grouping by wide, mixed keys (long and short strings, NULLs, decimals, dates, -0.0 vs 0.0) into
+// more groups than one output chunk holds, single- and two-phase, with and without splits.
+TEST_CASE("e2e: group by wide mixed keys, many groups") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    con.Query("CREATE TABLE w AS SELECT i, "
+              "CASE WHEN i % 11 = 0 THEN NULL ELSE i % 3001 END AS k1, "
+              "CASE WHEN i % 13 = 0 THEN NULL ELSE 'customer#' || lpad((i % 3001)::VARCHAR, 9, '0') || "
+              "  repeat('x', (i % 3001) % 40) END AS name, "
+              "CASE WHEN i % 3 = 0 THEN 'ab' ELSE 'cd' END AS short, "
+              "((i % 3001) * 1.25)::DECIMAL(15,2) AS bal, DATE '2020-01-01' + (i % 7)::INTEGER AS dt, "
+              "CASE WHEN i % 2 = 0 THEN 0.0::DOUBLE ELSE -0.0::DOUBLE END AS z, "
+              "(i * 0.5)::DECIMAL(12,2) AS v FROM range(30000) t(i)");
+    for (const char *sql : {"SELECT k1, name, short, bal, dt, z, sum(v), count(*), min(name) FROM w "
+                            "GROUP BY k1, name, short, bal, dt, z",
+                            "SELECT name, count(*), max(v) FROM w GROUP BY name",
+                            "SELECT short, k1 IS NULL AS n, avg(v) FROM w GROUP BY short, n",
+                            // DISTINCT dedup over long/NULL strings, many values, per group and global
+                            "SELECT short, count(DISTINCT name), count(DISTINCT k1), sum(DISTINCT bal), count(*) "
+                            "FROM w GROUP BY short",
+                            "SELECT dt, count(DISTINCT z), count(DISTINCT name), sum(DISTINCT v) FROM w GROUP BY dt",
+                            "SELECT count(DISTINCT name), count(DISTINCT i), sum(DISTINCT bal) FROM w"}) {
+        for (bool pa : {true, false}) {
+            for (uint32_t splits : {1u, 4u}) {
+                ExpectMatch(con, sql, /*ordered=*/false, {}, pa, splits, /*target_rows_per_split=*/1 << 12);
+            }
+        }
+    }
+}
+
+TEST_CASE("e2e: hash join kinds over duplicate, NULL and long string keys") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    // b: key 0 has a chain longer than a vector (3000 rows), NULL keys, long string payloads/keys.
+    con.Query("CREATE TABLE b AS SELECT CASE WHEN i < 3000 THEN 0 WHEN i % 17 = 0 THEN NULL ELSE i % 700 END AS k, "
+              "'build-row-' || lpad(i::VARCHAR, 6, '0') || repeat('y', i % 30) AS s, i AS v, "
+              "CASE WHEN i % 5 = 0 THEN NULL ELSE 'key-' || (i % 50)::VARCHAR || repeat('z', 20) END AS sk "
+              "FROM range(6000) t(i)");
+    con.Query("CREATE TABLE p AS SELECT CASE WHEN i % 13 = 0 THEN NULL WHEN i < 3 THEN 0 ELSE i % 900 END AS k, "
+              "i * 3 AS v, CASE WHEN i % 7 = 0 THEN NULL ELSE 'key-' || (i % 60)::VARCHAR || repeat('z', 20) END AS sk "
+              "FROM range(5000) t(i)");
+    for (const char *sql : {
+             "SELECT p.k, p.v, b.s, b.v FROM p JOIN b ON p.k = b.k",
+             "SELECT p.k, p.v, b.s FROM p LEFT JOIN b ON p.k = b.k",
+             "SELECT p.k, p.v, b.s FROM p FULL OUTER JOIN b ON p.k = b.k",
+             "SELECT p.v, b.v FROM b RIGHT JOIN p ON p.k = b.k",
+             "SELECT p.v FROM p WHERE p.k IN (SELECT k FROM b)",
+             "SELECT p.v FROM p WHERE p.k NOT IN (SELECT k FROM b)",
+             "SELECT p.v FROM p WHERE p.k NOT IN (SELECT k FROM b WHERE k IS NOT NULL)",
+             "SELECT p.v FROM p WHERE p.k NOT IN (SELECT k FROM b WHERE v < 0)",       // empty build side
+             "SELECT p.v, p.k IN (SELECT k FROM b WHERE k IS NULL) FROM p",            // only NULL build keys
+             "SELECT p.v FROM p WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = p.k)",
+             "SELECT b.v FROM b WHERE EXISTS (SELECT 1 FROM p WHERE p.k = b.k)",
+             "SELECT b.v FROM b WHERE NOT EXISTS (SELECT 1 FROM p WHERE p.k = b.k)",
+             // residuals
+             "SELECT p.v, b.v FROM p JOIN b ON p.k = b.k AND b.v > p.v + 2000",
+             "SELECT p.v, b.v FROM p LEFT JOIN b ON p.k = b.k AND b.v < p.v",
+             "SELECT p.v, b.v FROM p FULL OUTER JOIN b ON p.k = b.k AND b.v < p.v",
+             "SELECT p.v FROM p WHERE EXISTS (SELECT 1 FROM b WHERE b.k = p.k AND b.v > p.v)",
+             "SELECT p.v FROM p WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = p.k AND b.v > p.v)",
+             // composite and string keys, NULL-matching keys
+             "SELECT p.v, b.v FROM p JOIN b ON p.sk = b.sk AND p.k = b.k",
+             "SELECT p.v, b.s FROM p LEFT JOIN b ON p.sk = b.sk",
+             "SELECT p.v, b.v FROM p JOIN b ON p.sk IS NOT DISTINCT FROM b.sk AND p.k = b.k",
+             // correlated subqueries (DELIM joins, NOT DISTINCT FROM on the correlated column)
+             "SELECT p.k, p.v, (SELECT count(*) FROM b WHERE b.k = p.k) FROM p",
+             "SELECT p.sk, (SELECT max(b.v) FROM b WHERE b.sk = p.sk) FROM p",
+             "SELECT p.v FROM p WHERE p.v > (SELECT avg(b.v) FROM b WHERE b.k = p.k)",
+         }) {
+        for (uint32_t splits : {1u, 4u}) {
+            ExpectMatch(con, sql, /*ordered=*/false, {}, /*pre_aggregate=*/true, splits,
+                        /*target_rows_per_split=*/1 << 11);
+        }
+    }
 }
 
 int main() { return plume_test::RunAll(); }

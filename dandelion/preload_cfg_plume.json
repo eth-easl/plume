@@ -2,7 +2,7 @@
     "functions": [{
         "name": "plume_csv_stage",
         "engineType": "Kvm",
-        "ctxSize": 1073741824,
+        "ctxSize": 8589934592,
         "binaryPath": "~/plume_functions/plume_csv_stage",
         "metadata": {
             "inputSets": ["template", "chunkInfo", "inBuffers"],
@@ -20,7 +20,7 @@
     },{
         "name": "plume_pq_stage",
         "engineType": "Kvm",
-        "ctxSize": 1073741824,
+        "ctxSize": 8589934592,
         "binaryPath": "~/plume_functions/plume_pq_stage",
         "metadata": {
             "inputSets": ["template", "regionInfo", "inBuffers", "dynFilter"],
@@ -29,11 +29,20 @@
     },{
         "name": "plume_stage",
         "engineType": "Kvm",
-        "ctxSize": 1073741824,
+        "ctxSize": 8589934592,
         "binaryPath": "~/plume_functions/plume_stage",
         "metadata": {
             "inputSets": ["template", "inData", "inData2"],
             "outputSets": ["outData", "dynFilter", "stdio"]
+        }
+    },{
+        "name": "plume_df_combine",
+        "engineType": "Kvm",
+        "ctxSize": 1073741824,
+        "binaryPath": "~/plume_functions/plume_df_combine",
+        "metadata": {
+            "inputSets": ["dynFilter"],
+            "outputSets": ["combDynFilter", "stdio"]
         }
     }],
     "compositions": []

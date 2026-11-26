@@ -7,6 +7,7 @@
 #include "plume/common/serial.hpp"
 #include "plume/execution/operators/dynamic_filter.hpp"
 #include "plume/execution/operators/filter.hpp"
+#include "plume/execution/operators/output.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/expression/expression.hpp"
 #include "split_output.hpp"
@@ -47,10 +48,10 @@ DataBuffer MakeBlock(Allocator &alloc, const std::vector<int32_t> &region, const
     DataChunk chunk;
     chunk.Initialize(alloc.Get(), {LogicalType::INTEGER, LogicalType::INTEGER});
     for (idx_t r = 0; r < region.size(); r++) {
-        chunk.SetValue(0, r, Value::INTEGER(region[r]));
-        chunk.SetValue(1, r, Value::INTEGER(amount[r]));
+        chunk.data[0].SetValue(r, Value::INTEGER(region[r]));
+        chunk.data[1].SetValue(r, Value::INTEGER(amount[r]));
     }
-    chunk.SetCardinality(region.size());
+    chunk.SetChildCardinality(region.size());
     auto block = ExportChunk(RegionAmount(), chunk, alloc).unwrap();
     auto buf = mock::MakeBuffer(block.data, block.size);
     alloc.Free(block.data, block.size);
@@ -58,7 +59,7 @@ DataBuffer MakeBlock(Allocator &alloc, const std::vector<int32_t> &region, const
 }
 
 uint32_t ExpectedPartition(int32_t region, uint32_t n) {
-    return static_cast<uint32_t>(Value::INTEGER(region).Hash() % n);
+    return exec::PartitionOf(Value::INTEGER(region).Hash(), n);
 }
 
 } // namespace
@@ -103,7 +104,7 @@ TEST_CASE("plume_stage: filter + hash-partitioned output") {
                 int32_t region = c->GetValue(0, r).GetValue<int32_t>();
                 int32_t amount = c->GetValue(1, r).GetValue<int32_t>();
                 CHECK(amount > 0);                                  // filter applied
-                CHECK(out->key == ExpectedPartition(region, N));    // routed to hash(region)%N
+                CHECK(out->key == ExpectedPartition(region, N));    // routed by hash(region)
                 total++;
             }
         }
@@ -123,10 +124,10 @@ ChunkList MakeChunks(Allocator &alloc, uint32_t n, int32_t region_val) {
         c->Initialize(alloc.Get(), {LogicalType::INTEGER, LogicalType::INTEGER});
         idx_t k = std::min<uint32_t>(STANDARD_VECTOR_SIZE, n - base);
         for (idx_t r = 0; r < k; r++) {
-            c->SetValue(0, r, Value::INTEGER(region_val));
-            c->SetValue(1, r, Value::INTEGER(static_cast<int32_t>(base + r)));
+            c->data[0].SetValue(r, Value::INTEGER(region_val));
+            c->data[1].SetValue(r, Value::INTEGER(static_cast<int32_t>(base + r)));
         }
-        c->SetCardinality(k);
+        c->SetChildCardinality(k);
         chunks.push_back(std::move(c));
     }
     return chunks;
@@ -206,11 +207,11 @@ TEST_CASE("SplitOutput: hash round-trip preserves rows and routes by key") {
         for (idx_t r = 0; r < k; r++) {
             int32_t region = static_cast<int32_t>((base + r) % 37);
             int32_t amount = static_cast<int32_t>(base + r);
-            c->SetValue(0, r, Value::INTEGER(region));
-            c->SetValue(1, r, Value::INTEGER(amount));
+            c->data[0].SetValue(r, Value::INTEGER(region));
+            c->data[1].SetValue(r, Value::INTEGER(amount));
             expected.insert({region, amount});
         }
-        c->SetCardinality(k);
+        c->SetChildCardinality(k);
         chunks.push_back(std::move(c));
     }
 
@@ -223,7 +224,7 @@ TEST_CASE("SplitOutput: hash round-trip preserves rows and routes by key") {
             for (idx_t r = 0; r < c->size(); r++) {
                 int32_t region = c->GetValue(0, r).GetValue<int32_t>();
                 int32_t amount = c->GetValue(1, r).GetValue<int32_t>();
-                CHECK(sb.key == ExpectedPartition(region, N)); // routed to hash(region)%N
+                CHECK(sb.key == ExpectedPartition(region, N)); // routed by hash(region)
                 got.insert({region, amount});
             }
         }
@@ -284,11 +285,11 @@ TEST_CASE("SplitOutput: varchar heap gather round-trips") {
         for (idx_t r = 0; r < k; r++) {
             int32_t region = static_cast<int32_t>((base + r) % 7);
             std::string s = mkstr(base + r);
-            c->SetValue(0, r, Value::INTEGER(region));
-            c->SetValue(1, r, Value(s));
+            c->data[0].SetValue(r, Value::INTEGER(region));
+            c->data[1].SetValue(r, Value(s));
             expected.insert({region, s});
         }
-        c->SetCardinality(k);
+        c->SetChildCardinality(k);
         chunks.push_back(std::move(c));
     }
 

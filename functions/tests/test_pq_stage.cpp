@@ -20,6 +20,8 @@
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -57,7 +59,7 @@ void CheckReaderMatches(const std::vector<uint8_t> &chunk, ColumnType type, bool
         CHECK(produced == n);
         // ReadInto may emit a DICTIONARY_VECTOR (dictionary fast path); flatten to
         // materialize, mirroring what ExportChunks does before serialization.
-        vec.Flatten(produced);
+        vec.Flatten();
         auto &validity = FlatVector::Validity(vec);
         for (size_t i = 0; i < produced; i++) {
             const bool ref_null = ref.IsNull(got + i);
@@ -740,7 +742,7 @@ TEST_CASE("decoder: Skip advances the cursor without materializing") {
         duckdb::Vector vec(lt);
         const size_t got = r.ReadInto(vec, n);
         CHECK(got == n);
-        vec.Flatten(got);
+        vec.Flatten();
         auto *d = FlatVector::GetData<int32_t>(vec);
         for (size_t i = 0; i < n; i++) {
             CHECK(d[i] == first + static_cast<int32_t>(i));
@@ -795,7 +797,7 @@ TEST_CASE("decoder: selective ReadInto materializes only kept rows") {
     duckdb::Vector vec(ToLogicalType(t));
     r.ReadInto(vec, 10, keep.data());
     vec.Slice(sel, sc);
-    vec.Flatten(sc);
+    vec.Flatten();
     auto *d = FlatVector::GetData<int32_t>(vec);
     CHECK(sc == 5);
     for (size_t i = 0; i < sc; i++) {

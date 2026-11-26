@@ -6,6 +6,7 @@
 #include "duckdb/common/operator/numeric_binary_operators.hpp"
 #include "duckdb/common/operator/subtract.hpp"
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
+#include "duckdb/function/aggregate/contextless_aggregate.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/scalar/generic_functions.hpp"
@@ -158,6 +159,17 @@ Result<void> EnsureKernel(const std::string &name, ScalarFunction &func, const L
     return Ok();
 }
 
+std::vector<LogicalType> PositionalArguments(const duckdb::SimpleFunction &func) {
+    std::vector<LogicalType> out;
+    for (auto &param : func.GetSignature().GetParameters()) {
+        if (param.GetKind() == duckdb::FunctionParameterKind::POSITIONAL_ONLY ||
+            param.GetKind() == duckdb::FunctionParameterKind::STANDARD) {
+            out.push_back(param.GetType());
+        }
+    }
+    return out;
+}
+
 bool ArgumentsMatch(const std::vector<LogicalType> &have, const std::vector<LogicalType> &want) {
     if (have.size() != want.size()) {
         return false;
@@ -188,8 +200,8 @@ Result<ScalarFunction> ResolveScalarFunction(const std::string &name, const std:
     }
     ScalarFunctionSet set = it->second();
     for (auto &candidate : set.functions) {
-        if (ArgumentsMatch(candidate.arguments, arguments)) {
-            ScalarFunction func = candidate;
+        if (ArgumentsMatch(PositionalArguments(*candidate), arguments)) {
+            ScalarFunction func = *candidate;
             TRYV(EnsureKernel(name, func, return_type));
             return func;
         }
@@ -205,85 +217,88 @@ namespace {
 
 using duckdb::AggregateFunction;
 using duckdb::AggregateFunctionSet;
-using AggSetFactory = std::function<AggregateFunctionSet()>;
+using duckdb::BoundAggregateFunction;
 
-const std::unordered_map<std::string, AggSetFactory> &AggregateRegistry() {
-    static const std::unordered_map<std::string, AggSetFactory> registry = {
-        {"count", duckdb::CountFun::GetFunctions},
-        {"min", duckdb::MinFun::GetFunctions},
-        {"max", duckdb::MaxFun::GetFunctions},
-        {"sum", duckdb::SumFun::GetFunctions},
-        {"avg", duckdb::AvgFun::GetFunctions},
+ResolvedAggregate Unbound(const AggregateFunction &function) {
+    return ResolvedAggregate{BoundAggregateFunction(function), nullptr};
+}
+
+using ContextlessBind = Result<ResolvedAggregate> (*)(const std::string &name, const LogicalType &arg);
+
+Result<ResolvedAggregate> BindFirst(const std::string &, const LogicalType &arg) {
+    return Unbound(duckdb::FirstFunctionGetter::GetFunction(arg));
+}
+
+Result<ResolvedAggregate> BindMinMax(const std::string &name, const LogicalType &arg) {
+    if (arg.id() == duckdb::LogicalTypeId::VARCHAR && !duckdb::StringType::GetCollation(arg).empty()) {
+        return Error("Aggregate '" + name + "' over a collated VARCHAR is not supported", ErrorKind::NotImplemented);
+    }
+    return ResolvedAggregate{duckdb::GetContextlessMinMax(name, arg), nullptr};
+}
+
+Result<ResolvedAggregate> BindDecimalSum(const std::string &, const LogicalType &arg) {
+    return ResolvedAggregate{duckdb::GetContextlessDecimalSum(arg), nullptr};
+}
+
+Result<ResolvedAggregate> BindSumNoOverflow(const std::string &, const LogicalType &arg) {
+    return ResolvedAggregate{duckdb::GetContextlessSumNoOverflow(arg), nullptr};
+}
+
+Result<ResolvedAggregate> BindDecimalAvg(const std::string &, const LogicalType &arg) {
+    duckdb::unique_ptr<duckdb::FunctionData> bind_data;
+    auto function = duckdb::GetContextlessDecimalAvg(arg, bind_data);
+    return ResolvedAggregate{std::move(function), std::move(bind_data)};
+}
+
+AggregateFunctionSet CountStarSet() {
+    return AggregateFunctionSet(duckdb::CountStarFun::GetFunction());
+}
+
+struct AggregateEntry {
+    AggregateFunctionSet (*overloads)(); // the catalog's overloads of the function
+    ContextlessBind bind;                // for the overloads with a bind callback (null: none)
+};
+
+const std::unordered_map<std::string, AggregateEntry> &AggregateRegistry() {
+    static const std::unordered_map<std::string, AggregateEntry> registry = {
+        {"count", {duckdb::CountFun::GetFunctions, nullptr}},
+        {"count_star", {CountStarSet, nullptr}},
+        // NOTE: `first` shows up in the scalar-subquery pattern DuckDB emits for
+        //       `HAVING x > (SELECT scalar)` / `WHERE x < (SELECT scalar)`.
+        {"first", {duckdb::FirstFun::GetFunctions, BindFirst}},
+        {"min", {duckdb::MinFun::GetFunctions, BindMinMax}},
+        {"max", {duckdb::MaxFun::GetFunctions, BindMinMax}},
+        {"sum", {duckdb::SumFun::GetFunctions, BindDecimalSum}},
+        {"sum_no_overflow", {duckdb::SumNoOverflowFun::GetFunctions, BindSumNoOverflow}},
+        {"avg", {duckdb::AvgFun::GetFunctions, BindDecimalAvg}},
     };
     return registry;
 }
 
-LogicalType DecimalStorageType(const LogicalType &decimal) {
-    switch (decimal.InternalType()) {
-    case duckdb::PhysicalType::INT16:  return LogicalType::SMALLINT;
-    case duckdb::PhysicalType::INT32:  return LogicalType::INTEGER;
-    case duckdb::PhysicalType::INT64:  return LogicalType::BIGINT;
-    case duckdb::PhysicalType::INT128: return LogicalType::HUGEINT;
-    default:                           return decimal;
-    }
-}
-
 } // namespace
 
-Result<duckdb::AggregateFunction> ResolveAggregateFunction(const std::string &name,
-                                                           const std::vector<LogicalType> &arguments) {
-    if (name == "count_star") {
-        return duckdb::CountStarFun::GetFunction();
-    }
-
-    // NOTE: `first` shows up in the scalar-subquery pattern DuckDB emits for 
-    //       `HAVING x > (SELECT scalar)` / `WHERE x < (SELECT scalar)`.
-    if (name == "first" && arguments.size() == 1) {
-        return duckdb::FirstFunctionGetter::GetFunction(arguments[0]);
-    }
+Result<ResolvedAggregate> ResolveAggregateFunction(const std::string &name,
+                                                   const std::vector<LogicalType> &arguments) {
     auto it = AggregateRegistry().find(name);
     if (it == AggregateRegistry().end()) {
         return Error("Aggregate function '" + name + "' is not registered", ErrorKind::NotImplemented);
     }
-    AggregateFunctionSet set = it->second();
-
-    // First, try to get an exact match.
+    const AggregateEntry &entry = it->second;
+    AggregateFunctionSet set = entry.overloads();
     for (auto &candidate : set.functions) {
-        if (!candidate.state_size) {
-            // overload requires a ClientContext bind step we cannot invoke
+        if (!ArgumentsMatch(PositionalArguments(*candidate), arguments)) {
             continue;
         }
-        if (ArgumentsMatch(candidate.arguments, arguments)) {
-            return candidate;
+        if (!candidate->GetCallbacks().HasBindCallback()) {
+            return Unbound(*candidate); // a concrete kernel
         }
+        if (!entry.bind || arguments.size() != 1) {
+            return Error("Aggregate '" + name + "' needs a bind step that requires an instance",
+                         ErrorKind::NotImplemented);
+        }
+        TRY(auto bound, TryCatch([&] { return entry.bind(name, arguments[0]); }));
+        return bound;
     }
-
-    // Second, for DECIMAL arguments, retry via the physical integer type.
-    bool has_decimal = false;
-    for (auto &arg : arguments) {
-        if (arg.id() == duckdb::LogicalTypeId::DECIMAL) {
-            has_decimal = true;
-            break;
-        }
-    }
-    if (has_decimal) {
-        // DuckDB's DECIMAL bind callbacks (BindDecimalSum, BindDecimalAvg, …) only dispatch to the 
-        // integer overload using InternalType() without needing a ClientContext.
-        std::vector<LogicalType> storage_args;
-        storage_args.reserve(arguments.size());
-        for (auto &arg : arguments) {
-            storage_args.push_back(arg.id() == duckdb::LogicalTypeId::DECIMAL ? DecimalStorageType(arg) : arg);
-        }
-        for (auto &candidate : set.functions) {
-            if (!candidate.state_size) {
-                continue;
-            }
-            if (ArgumentsMatch(candidate.arguments, storage_args)) {
-                return candidate;
-            }
-        }
-    }
-
     return Error("No overload of aggregate '" + name + "' matches the given argument types",
                  ErrorKind::NotImplemented);
 }

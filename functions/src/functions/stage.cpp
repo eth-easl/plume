@@ -35,7 +35,7 @@ Result<void> RunStage() {
     exec::Executor executor(alloc);
     {
         PLUME_TRACE_STAGE(trace::Phase::SETUP);
-        TRYV(executor.Build(desc, util::MakeSink(desc.output_sink, abi::AddOutput)));
+        TRYV(executor.Build(desc, util::MakeSink(desc.output_config, abi::AddOutput)));
     }
 
     TRY(auto inputs, abi::GetInputSet(SET_IDX_IN_DATA_CHUNKS));

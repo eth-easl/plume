@@ -59,7 +59,8 @@ offset size field       meaning
   2     u16  partition   the input partition this invocation processed
   4     u32  invocation  invocation index within the stage
   8     i16  op_index    operator index, or -1 for a stage-level phase
- 10     u8   phase       0 SETUP, 1 DESERIALIZE, 2 PUSH, 3 FINISH
+ 10     u8   phase       0 SETUP, 1 DESERIALIZE, 2 PUSH, 3 FINISH,
+                         4 MEMORY_PEAK, 5 INPUT_BYTES
  11     u8   (padding)
  12     u32  hits        number of scope entries aggregated into this record
  16     u64  total_ns    summed wall-clock nanoseconds
@@ -80,6 +81,16 @@ header's `op_types` describes:
   *exclusive* time of operator `i` is `push_ns[i] − push_ns[i+1]`.
 - **FINISH** — the operator flushing its buffered output at end of input
   (aggregate finalization, sort emit, the output operator's final serialize).
+
+With `track_memory` set in the run config, every invocation also gets two **stage-level**
+(`op_index == -1`) records whose `total_ns` field carries **bytes**, not time (`hits` = 1):
+
+- **MEMORY_PEAK** — the most heap memory the invocation had allocated at once beyond what was live
+  when it started (its input items are allocated by the runner beforehand, so this is the working
+  memory: operator state, intermediate chunks, the captured outputs). Counted for every
+  malloc-family call by usable size, so `std::` containers count too. The counter is process-wide,
+  so it is only exact with `"threads": 1`.
+- **INPUT_BYTES** — the summed size of the invocation's input items (template + data sets).
 
 Records are only present for `(stage, invocation, op, phase)` combinations that
 actually fired, so an operator never pushed produces no PUSH record.

@@ -5,6 +5,7 @@
 #include "test_util.hpp"
 
 #include "plume/execution/operators/join.hpp"
+#include "plume/execution/operators/output.hpp"
 #include "plume/execution/pipeline.hpp"
 #include "plume/functions/stage.hpp"
 #include "plume/memory/adapter.hpp"
@@ -39,10 +40,10 @@ DataBuffer Make2ColBlock(Allocator &alloc, const Schema &schema, const std::vect
     DataChunk chunk;
     chunk.Initialize(alloc.Get(), {LogicalType::INTEGER, LogicalType::INTEGER});
     for (idx_t r = 0; r < c0.size(); r++) {
-        chunk.SetValue(0, r, Value::INTEGER(c0[r]));
-        chunk.SetValue(1, r, Value::INTEGER(c1[r]));
+        chunk.data[0].SetValue(r, Value::INTEGER(c0[r]));
+        chunk.data[1].SetValue(r, Value::INTEGER(c1[r]));
     }
-    chunk.SetCardinality(c0.size());
+    chunk.SetChildCardinality(c0.size());
     auto block = ExportChunk(schema, chunk, alloc).unwrap();
     auto buf = mock::MakeBuffer(block.data, block.size);
     alloc.Free(block.data, block.size);
@@ -107,7 +108,7 @@ TEST_CASE("plume_stage: inner hash join + partitioned output") {
                 int32_t rcust = c->GetValue(2, r).GetValue<int32_t>();
                 int32_t region = c->GetValue(3, r).GetValue<int32_t>();
                 CHECK(lcust == rcust);                                               // join key equality
-                CHECK(out->key == static_cast<uint32_t>(Value::INTEGER(region).Hash() % N)); // split by region
+                CHECK(out->key == exec::PartitionOf(Value::INTEGER(region).Hash(), N)); // split by region
                 got[order_id] = region;
             }
         }

@@ -1,10 +1,10 @@
 diff --git a/src/main/client_context.cpp b/src/main/client_context.cpp
-index 765126f..74e849b 100644
+index 1631051f..65044a63 100644
 --- a/src/main/client_context.cpp
 +++ b/src/main/client_context.cpp
-@@ -746,11 +746,15 @@ unique_ptr<LogicalOperator> ClientContext::ExtractPlan(const string &query) {
- 			plan = optimizer.Optimize(std::move(plan));
- 		}
+@@ -490,11 +490,15 @@ unique_ptr<LogicalOperator> ClientContext::ExtractPlan(const string &query) {
+ 		Optimizer optimizer(*planner.binder, *this);
+ 		plan = optimizer.Optimize(std::move(plan));
  
 +		// Resolve operator types before resolving column bindings, matching the
 +		// order in PhysicalPlanGenerator::ResolveAndPlan. The reverse order (the
@@ -13,7 +13,7 @@ index 765126f..74e849b 100644
 +		plan->ResolveOperatorTypes();
 +
  		ColumnBindingResolver resolver;
- 		resolver.Verify(*plan);
+ 		LogicalPlanVerifier::Verify(*this, *plan);
  		resolver.VisitOperator(*plan);
 -
 -		plan->ResolveOperatorTypes();

@@ -1,5 +1,6 @@
 #include "stage_runner.hpp"
 #include "abi_ubench.hpp"
+#include "mem_tracker.hpp"
 
 #include "plume/common/trace.hpp"
 #include "plume/execution/pipeline.hpp"
@@ -7,6 +8,7 @@
 #include "plume/functions/parquet.hpp"
 #include "plume/functions/stage.hpp"
 
+#include <algorithm>
 #include <exception>
 
 namespace plume::ubench {
@@ -53,18 +55,38 @@ PartitionedBlocks InvokeOne(const std::vector<uint8_t> &templ, const std::vector
     }
 
     trace::BeginInvocation(stage_id, invocation, partition, num_ops);
+    const bool track_memory = mem::Enabled();
+    const int64_t mem_baseline = track_memory ? mem::ResetPeak() : 0;
+    auto record_memory = [&] {
+        if (!track_memory) {
+            return;
+        }
+        uint64_t input_bytes = templ.size();
+        for (auto &it : set1) {
+            input_bytes += it.size;
+        }
+        for (auto &it : set2) {
+            input_bytes += it.size;
+        }
+        trace::Record(trace::kStageOp, trace::Phase::MEMORY_PEAK,
+                      static_cast<uint64_t>(std::max<int64_t>(0, mem::Peak() - mem_baseline)));
+        trace::Record(trace::kStageOp, trace::Phase::INPUT_BYTES, input_bytes);
+    };
     Result<void> r = Ok();
     try {
         r = entry();
     } catch (const std::exception &e) {
         err = std::string("exception: ") + e.what();
+        record_memory();
         trace::EndInvocation();
         return {};
     } catch (...) {
         err = "unknown exception";
+        record_memory();
         trace::EndInvocation();
         return {};
     }
+    record_memory();
     trace::EndInvocation();
 
     if (r.is_error()) {

@@ -10,6 +10,9 @@ enum class Phase : uint8_t {
     DESERIALIZE = 1, // deserialize the pipeline template
     PUSH = 2,        // an operator consuming a chunk
     FINISH = 3,      // an operator flushing its buffered output
+    // Not timings (total_ns carries bytes): recorded once per invocation by ubench's memory tracking.
+    MEMORY_PEAK = 4, // heap bytes allocated at peak during the invocation, beyond its inputs
+    INPUT_BYTES = 5, // bytes of the invocation's input items
 };
 
 inline constexpr int kStageOp = -1;

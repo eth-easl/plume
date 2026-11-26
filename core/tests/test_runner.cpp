@@ -1,6 +1,3 @@
-// Milestone-6 host-boundary tests: the noexcept Runner returns status codes
-// instead of letting DuckDB exceptions escape (R6/D16).
-
 #include "runner.hpp"
 #include "test_util.hpp"
 
@@ -35,9 +32,9 @@ OwnedBlock MakeBlock(Allocator &alloc, const std::vector<int32_t> &a) {
     DataChunk chunk;
     chunk.Initialize(alloc.Get(), {LogicalType::INTEGER});
     for (idx_t r = 0; r < a.size(); r++) {
-        chunk.SetValue(0, r, Value::INTEGER(a[r]));
+        chunk.data[0].SetValue(r, Value::INTEGER(a[r]));
     }
-    chunk.SetCardinality(a.size());
+    chunk.SetChildCardinality(a.size());
     return plume::memory::ExportChunk(OneCol(), chunk, alloc).unwrap();
 }
 

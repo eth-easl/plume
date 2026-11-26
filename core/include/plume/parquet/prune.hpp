@@ -11,6 +11,10 @@
 
 namespace plume::parquet {
 
+// Decodes a parquet min/max statistic (plain encoding) as a Value of the column's type. Covers
+// BOOLEAN, INT8-64, DATE, TIME, FLOAT, DOUBLE, INT-backed DECIMAL and VARCHAR (bytewise order).
+std::optional<duckdb::Value> DecodeStat(const std::vector<uint8_t> &bytes, const ColumnType &ct);
+
 bool RowGroupMayMatch(const expr::ExprNode &pred, const RowGroupMeta &rgm, const Schema &file_schema);
 
 // The values cast to the column type and sorted, as RowGroupMayContainAny expects them. nullopt if

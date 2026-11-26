@@ -80,6 +80,7 @@ include(${CMAKE_SOURCE_DIR}/cmake/DuckDB.cmake)
 include(${CMAKE_SOURCE_DIR}/cmake/Json.cmake)
 if(PLUME_WITH_COMPILE_LAYER)
   include(${CMAKE_SOURCE_DIR}/cmake/Cpr.cmake)
+  include(${CMAKE_SOURCE_DIR}/cmake/Protobuf.cmake)
 endif()
 
 if(PLUME_WITH_TESTS)

@@ -200,7 +200,7 @@ Result<void> RunParquetStage() {
     exec::Executor executor(alloc);
     {
         PLUME_TRACE_STAGE(trace::Phase::SETUP);
-        TRYV(executor.Build(desc, util::MakeSink(desc.output_sink, abi::AddOutput)));
+        TRYV(executor.Build(desc, util::MakeSink(desc.output_config, abi::AddOutput)));
     }
 
     TRY(auto region_itms, abi::GetInputSet(SET_IDX_IN_REGION_INFO));
@@ -366,7 +366,7 @@ Result<void> RunParquetStage() {
                             for (size_t c = 0; c < ncol; c++) {
                                 readers[c].ReadInto(chunk->data[c], n);
                             }
-                            chunk->SetCardinality(n);
+                            chunk->SetChildCardinality(n);
                             return;
                         }
 
@@ -374,7 +374,7 @@ Result<void> RunParquetStage() {
                         for (auto c : late_mat.EarlyColumns()) {
                             readers[c].ReadInto(chunk->data[c], n);
                         }
-                        chunk->SetCardinality(n);
+                        chunk->SetChildCardinality(n);
                         duckdb::SelectionVector sel(n);
                         const idx_t sc = late_mat.Select(*chunk, n, sel);
                         if (sc == 0) {

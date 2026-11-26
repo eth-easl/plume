@@ -99,7 +99,7 @@ SortOperator::SortOperator(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>
     key_executor_ = std::make_unique<duckdb::ExpressionExecutor>();
     for (auto &e : key_exprs_) {
         key_executor_->AddExpression(*e);
-        key_types_.push_back(e->return_type);
+        key_types_.push_back(e->GetReturnType());
     }
 }
 
@@ -166,10 +166,10 @@ Result<void> SortOperator::Finish() {
         for (idx_t i = 0; i < batch; i++) {
             const RowRef &ref = rows[perm[base + i]];
             for (idx_t c = 0; c < n_cols; c++) {
-                result->SetValue(c, i, ref.chunk->GetValue(c, ref.row));
+                result->data[c].SetValue(i, ref.chunk->GetValue(c, ref.row));
             }
         }
-        result->SetCardinality(batch);
+        result->SetChildCardinality(batch);
         TRYV(next_->Push(std::move(result)));
     }
 
