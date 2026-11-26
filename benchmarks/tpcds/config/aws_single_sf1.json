@@ -19,7 +19,7 @@
 
     "dandelionUrl": "http://<dandelion_url>:8080",
     "requestTimeout": 5,
-    "resultsPrefix": "~/plume_results/tpcds_aws_single_sf1",
+    "resultsPrefix": "~/plume_results/tpcds/aws_single_sf1",
     "debugPrints": false,
     "maxSplits": 30,
     "targetRowsPerSplit": 131072,

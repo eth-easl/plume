@@ -12,7 +12,7 @@
 
     "dandelionUrl": "http://localhost:8080",
     "requestTimeout": 30,
-    "resultsPrefix": "~/plume_results/tpch_local_single_sf1",
+    "resultsPrefix": "~/plume_results/tpch/local_single_sf1",
     "debugPrints": false,
     "maxSplits": 12,
     "targetRowsPerSplit": 131072,

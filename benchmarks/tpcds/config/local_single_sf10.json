@@ -19,7 +19,7 @@
 
     "dandelionUrl": "http://localhost:8080",
     "requestTimeout": 30,
-    "resultsPrefix": "~/plume_results/tpcds_local_single_sf10",
+    "resultsPrefix": "~/plume_results/tpcds/local_single_sf10",
     "debugPrints": false,
     "maxSplits": 12,
     "targetRowsPerSplit": 131072,

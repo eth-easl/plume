@@ -4,7 +4,7 @@
 
     "dandelionUrl": "http://localhost:8080",
     "requestTimeout": 30,
-    "resultsPrefix": "~/plume_results/local_trace",
+    "resultsPrefix": "~/plume_results/tpch/local_trace",
     "debugPrints": false,
     "maxSplits": 12,
     "targetRowsPerSplit": 131072,
@@ -14,13 +14,11 @@
         "scaleFactors": {
             "sf1": {
                 "tablePathPrefix": "http://127.0.0.1:7777/tpch1",
-                "tablePathSuffix": ".parquet",
-                "tableNumFiles": { "lineitem": 1, "orders": 1, "partsupp": 1 }
+                "tablePathSuffix": ".parquet"
             },
             "sf10": {
                 "tablePathPrefix": "http://127.0.0.1:7777/tpch10",
-                "tablePathSuffix": ".parquet",
-                "tableNumFiles": { "lineitem": 2, "orders": 2, "partsupp": 2 }
+                "tablePathSuffix": ".parquet"
             }
         },
         "closedLoop": false

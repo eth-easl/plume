@@ -4,7 +4,7 @@
 
     "dandelionUrl": "http://<dandelion_url>:8080",
     "requestTimeout": 30,
-    "resultsPrefix": "~/plume_results/aws_trace",
+    "resultsPrefix": "~/plume_results/tpch_aws_trace",
     "debugPrints": false,
     "maxSplits": 30,
     "targetRowsPerSplit": 131072,
@@ -13,19 +13,16 @@
         "path": "~/plume/benchmarks/tpch/traces/redshift_1w.csv",
         "scaleFactors": {
             "sf1": {
-                "tablePathPrefix": "https://tpc-h-sf-1-ireland.s3.eu-west-1.amazonaws.com",
-                "tablePathSuffix": ".parquet",
-                "tableNumFiles": { "lineitem": 1, "orders": 1, "partsupp": 1 }
+                "tablePathPrefix": "https://plume-exp-tpch.s3.eu-west-1.amazonaws.com/plume-tpch-sf1",
+                "tablePathSuffix": ".parquet"
             },
             "sf10": {
-                "tablePathPrefix": "https://tpc-h-sf-10-ireland.s3.eu-west-1.amazonaws.com",
-                "tablePathSuffix": ".parquet",
-                "tableNumFiles": { "lineitem": 2, "orders": 2, "partsupp": 2 }
+                "tablePathPrefix": "https://plume-exp-tpch.s3.eu-west-1.amazonaws.com/plume-tpch-sf10",
+                "tablePathSuffix": ".parquet"
             },
             "sf100": {
-                "tablePathPrefix": "https://tpc-h-sf-100-ireland.s3.eu-west-1.amazonaws.com",
-                "tablePathSuffix": ".parquet",
-                "tableNumFiles": { "lineitem": 16, "orders": 16, "partsupp": 16 }
+                "tablePathPrefix": "https://plume-exp-tpch.s3.eu-west-1.amazonaws.com/plume-tpch-sf100",
+                "tablePathSuffix": ".parquet"
             }
         },
         "closedLoop": false
